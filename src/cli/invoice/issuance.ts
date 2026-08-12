@@ -35,6 +35,7 @@ import {
   repairUnlinkedIssuedInvoiceBooking,
 } from "../../core/invoice-booking";
 import { resolveInvoiceMasterData } from "../../core/master-data";
+import { loadBrand } from "../../core/brands";
 import { openCommandDb } from "../../cli-dispatch";
 import type { CommandDispatch } from "../../cli-dispatch";
 import { emitHumanReport, emitHumanWrite } from "../../cli-format";
@@ -171,6 +172,34 @@ export function registerIssuanceCommands(dispatch: CommandDispatch): void {
     if (buyerAddress) buyer.address = buyerAddress;
     if (buyerVat) buyer.vatOrCvr = buyerVat;
 
+    // #DLK-branding: --brand <key> picks a presentation identity from
+    // config/brands.json (name + contact line + header word-mark + morarente
+    // note). Explicit --seller-* flags still win over the brand's defaults.
+    // The invoice NUMBER is untouched — every brand shares one series.
+    const rootForBrand = ctx.companyRoot();
+    const brandArg = ctx.trimToNull(ctx.arg("--brand") ?? null);
+    let brandSeller: { name?: string; address?: string; vatOrCvr?: string; email?: string; phone?: string; web?: string } = {};
+    let brandLogoText: string | undefined;
+    let brandLatePaymentNote: string | undefined;
+    if (brandArg) {
+      const loaded = loadBrand(rootForBrand, brandArg);
+      if (!loaded.ok) {
+        ctx.emitResult({ ok: false, appliedRules: [], errors: [loaded.error] });
+        process.exit(1);
+      }
+      const b = loaded.resolved.brand;
+      brandSeller = {
+        name: b.name,
+        address: b.address,
+        vatOrCvr: b.vatOrCvr,
+        email: b.email,
+        phone: b.phone,
+        web: b.web,
+      };
+      brandLogoText = b.logoText ?? b.name;
+      brandLatePaymentNote = loaded.resolved.latePaymentNote;
+    }
+
     const payload: InvoicePayload = {
       invoiceType: "full",
       vatTreatment: "standard",
@@ -179,10 +208,15 @@ export function registerIssuanceCommands(dispatch: CommandDispatch): void {
         ? { invoiceNumber: ctx.trimToNull(ctx.arg("--invoice-number") ?? null)! }
         : {}),
       seller: {
-        name: ctx.trimToNull(ctx.arg("--seller-name") ?? null) ?? undefined,
-        address: ctx.trimToNull(ctx.arg("--seller-address") ?? null) ?? undefined,
-        vatOrCvr: ctx.trimToNull(ctx.arg("--seller-vat") ?? null) ?? undefined,
+        name: ctx.trimToNull(ctx.arg("--seller-name") ?? null) ?? brandSeller.name ?? undefined,
+        address: ctx.trimToNull(ctx.arg("--seller-address") ?? null) ?? brandSeller.address ?? undefined,
+        vatOrCvr: ctx.trimToNull(ctx.arg("--seller-vat") ?? null) ?? brandSeller.vatOrCvr ?? undefined,
+        email: brandSeller.email,
+        phone: brandSeller.phone,
+        web: brandSeller.web,
       },
+      ...(brandLogoText ? { logoText: brandLogoText } : {}),
+      ...(brandLatePaymentNote ? { latePaymentNote: brandLatePaymentNote } : {}),
       buyer,
       lines: computed.lines,
       totals: {

@@ -338,6 +338,48 @@ function paymentLines(payment: InvoicePaymentDetails | undefined): string[] {
   return lines;
 }
 
+/**
+ * Payment-terms label (#DLK-branding). Not a §58 mandatory field, but customary
+ * and requested. Derives "Netto N dage" from issue/due dates when both exist;
+ * falls back to just the due date. Deterministic (parses fixed ISO strings, no
+ * clock read).
+ */
+function paymentTermsLabel(issueDate?: string, dueDate?: string): string | null {
+  const due = compact(dueDate);
+  if (!due) return null;
+  const issue = compact(issueDate);
+  if (issue) {
+    const ms = Date.parse(`${due}T00:00:00Z`) - Date.parse(`${issue}T00:00:00Z`);
+    if (Number.isFinite(ms)) {
+      const days = Math.round(ms / 86_400_000);
+      if (days >= 0) return `Betalingsbetingelser: Netto ${days} dage (forfald ${due}).`;
+    }
+  }
+  return `Betalingsbetingelser: forfald ${due}.`;
+}
+
+/**
+ * Brand contact line(s) for the page footer (#DLK-branding). Only produced when
+ * the seller carries contact details (i.e. an invoice issued under a brand), so
+ * unbranded invoices keep their original single-line footer byte-for-byte.
+ */
+function contactFooterLines(payload: IssuedInvoicePdfPayload): string[] {
+  const s = payload.seller;
+  if (!s) return [];
+  const hasContact = compact(s.email) || compact(s.phone) || compact(s.web);
+  if (!hasContact) return [];
+  const line1 = [compact(s.name), compact(s.address)].filter(Boolean).join(" / ");
+  const line2Parts: string[] = [];
+  if (compact(s.vatOrCvr)) line2Parts.push(`CVR ${s.vatOrCvr!.trim()}`);
+  if (compact(s.phone)) line2Parts.push(`Tlf. ${s.phone!.trim()}`);
+  if (compact(s.web)) line2Parts.push(`Web: ${s.web!.trim()}`);
+  if (compact(s.email)) line2Parts.push(`Mail: ${s.email!.trim()}`);
+  const out: string[] = [];
+  if (line1) out.push(line1);
+  if (line2Parts.length) out.push(line2Parts.join(" / "));
+  return out;
+}
+
 /** Lay the whole invoice out across one or more A4 pages. */
 function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
   const currency = (payload.currency ?? "DKK").trim().toUpperCase();
@@ -517,6 +559,19 @@ function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
     page.y -= 16;
   }
 
+  // ----- Payment terms (betalingsbetingelser, #DLK-branding) -----
+  const termsLabel = paymentTermsLabel(payload.issueDate, payload.dueDate);
+  if (termsLabel) {
+    if (!page.hasRoom(26)) {
+      newPage();
+      page.y = PAGE_TOP;
+    } else {
+      page.advance(16);
+    }
+    page.text(MARGIN_X, termsLabel, { size: 9.5, font: "F2", gray: 0.2 });
+    page.advance(LINE_HEIGHT);
+  }
+
   // ----- Payment details -----
   const payLines = paymentLines(payload.payment);
   if (payLines.length > 0) {
@@ -541,6 +596,24 @@ function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
         gray: 0.45,
       });
       page.advance(LINE_HEIGHT);
+    }
+  }
+
+  // ----- Late-payment (morarente) note (#DLK-branding) -----
+  if (compact(payload.latePaymentNote)) {
+    if (!page.hasRoom(28)) {
+      newPage();
+      page.y = PAGE_TOP;
+    } else {
+      page.advance(14);
+    }
+    for (const wrapped of wrapText(payload.latePaymentNote!.trim(), 8, CONTENT_RIGHT - MARGIN_X)) {
+      if (!page.hasRoom(LINE_HEIGHT)) {
+        newPage();
+        page.y = PAGE_TOP;
+      }
+      page.text(MARGIN_X, wrapped, { size: 8, gray: 0.4 });
+      page.advance(12);
     }
   }
 
@@ -598,13 +671,26 @@ function fmtNum(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-function pageContentStream(page: PageWriter, footer: string) {
+function pageContentStream(page: PageWriter, footer: string, contactLines: string[] = []) {
   const parts: string[] = [];
   // Footer baseline (drawn first so content can never overlap it).
-  parts.push(
-    `BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 22)} Tm (${escapePdfText(footer)}) Tj ET`,
-  );
-  parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 10)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(PAGE_BOTTOM - 10)} l 0.5 w S`);
+  if (contactLines.length > 0) {
+    // Branded footer: centered brand contact line(s) above a hairline, with the
+    // page-number line beneath. (#DLK-branding)
+    let fy = PAGE_BOTTOM - 14;
+    for (const line of contactLines) {
+      const cx = (PAGE_WIDTH - textWidth(line, 7)) / 2;
+      parts.push(`BT /F1 7 Tf 0.4 g 1 0 0 1 ${fmtNum(cx)} ${fmtNum(fy)} Tm (${escapePdfText(line)}) Tj ET`);
+      fy -= 10;
+    }
+    parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(fy - 2)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(fy - 2)} l 0.5 w S`);
+    parts.push(`BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(fy - 14)} Tm (${escapePdfText(footer)}) Tj ET`);
+  } else {
+    parts.push(
+      `BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 22)} Tm (${escapePdfText(footer)}) Tj ET`,
+    );
+    parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 10)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(PAGE_BOTTOM - 10)} l 0.5 w S`);
+  }
 
   for (const op of page.ops) {
     if (op.kind === "rect") {
@@ -632,6 +718,7 @@ function pageContentStream(page: PageWriter, footer: string) {
  */
 export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
   const pages = layoutInvoice(payload);
+  const contactFooter = contactFooterLines(payload);
   const issueDate = compact(payload.issueDate) ?? "1970-01-01";
   const pdfDate = `D:${issueDate.replace(/-/g, "")}000000Z`;
   const producer = "Rentemester deterministic invoice renderer";
@@ -656,7 +743,7 @@ export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
     // rendered as a broken glyph in some PDF viewers ("Faktura 2026-0001 <?>
     // Side 1"). A plain hyphen is safe in every viewer and font.
     const footer = `${title} - Side ${i + 1} af ${pageCount}`;
-    const content = pageContentStream(page, footer);
+    const content = pageContentStream(page, footer, contactFooter);
     objects.push(
       `${pageNo} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] ` +
         `/Resources << /Font << /F1 ${fontRegularNo} 0 R /F2 ${fontBoldNo} 0 R >> >> /Contents ${contentNo} 0 R >>\nendobj\n`,

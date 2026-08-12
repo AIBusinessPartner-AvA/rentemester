@@ -38,6 +38,14 @@ export type SmtpConfig = {
   fromName?: string;
   username?: string;
   password?: string;
+  /**
+   * SMTP2GO HTTP-API key (config/smtp.json `apiKey`). Present when the operator
+   * uses the SMTP2GO API instead of raw SMTP. A live API transport (async POST
+   * to api.smtp2go.com/v3/email/send) is a follow-up — see SESSIONSLOG /
+   * memory; the built-in transport is still dryRun-only. Never persisted to the
+   * ledger; read from the config file only.
+   */
+  apiKey?: string;
   /** When true the default transport records the send without a network call. */
   dryRun?: boolean;
 };

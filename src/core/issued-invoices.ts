@@ -72,6 +72,9 @@ function enrichInvoiceFromCompany(db: Database, payload: InvoicePayload): Invoic
   }
   const companyAddress = companyAddressLine(settings);
   const seller = {
+    // Preserve brand contact extras (email/phone/web, #DLK-branding); only the
+    // identity trio defaults from the company profile when absent.
+    ...payload.seller,
     name: hasText(payload.seller?.name) ? payload.seller!.name : settings.name || undefined,
     address: hasText(payload.seller?.address)
       ? payload.seller!.address

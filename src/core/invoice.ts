@@ -33,8 +33,15 @@ export type InvoicePayload = {
   vatTreatment?: VatTreatment;
   issueDate?: string;
   invoiceNumber?: string;
-  seller?: { name?: string; address?: string; vatOrCvr?: string };
+  seller?: { name?: string; address?: string; vatOrCvr?: string; email?: string; phone?: string; web?: string };
   buyer?: InvoiceBuyer;
+  /**
+   * Brand presentation extras (#DLK-branding). A short header word-mark and a
+   * late-payment (morarente) note. Persisted in the issued snapshot so a later
+   * re-render is byte-identical. Presentation only — the validator ignores them.
+   */
+  logoText?: string;
+  latePaymentNote?: string;
   /**
    * Peppol cbc:InvoicedQuantity/@unitCode (UN/ECE Rec 20). Defaults to H87
    * ("piece") in the e-invoice export; set per payload to override.

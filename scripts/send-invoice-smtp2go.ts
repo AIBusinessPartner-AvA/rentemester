@@ -3,27 +3,28 @@
  * Decoupled invoice delivery via the SMTP2GO HTTP API (#DLK-branding).
  *
  * DESIGN (user's idea): keep Rentemester's core untouched. Rentemester issues
- * the invoice (PDF + immutable snapshot) and can dry-run its own `invoice send`
- * for the intent log; THIS standalone script is the separate "pickup" that
- * performs the actual delivery through SMTP2GO afterwards. Because it only
- * READS Rentemester's outputs (the issued snapshot + PDF + config/smtp.json),
- * it needs no change to the synchronous EmailTransport pipeline.
+ * the invoice (PDF + immutable snapshot); THIS standalone script is the separate
+ * "pickup" that delivers it through SMTP2GO afterwards. It only READS Rentemester
+ * outputs (issued snapshot + PDF + config/*), so no async change to the core.
  *
- * Brand-aware sender: the From address is the invoice's own seller.email — i.e.
- * the brand contact printed in the footer (DLK → kontakt@denlanghaaredekonsulent.dk,
- * Mind AI → bogholder@mindai.dk), both approved sender domains on SMTP2GO.
+ * The mail is composed from an EDITABLE template (config/faktura-mail.html) with
+ * {{ }} merge fields filled from the invoice, plus the BRAND's own HTML signature
+ * (config/brands.json → signaturePath). Brand is resolved from the invoice's
+ * seller.email, so DLK and Mind AI each get their own sender, signature and logo.
+ * Nothing about the mail body is hardcoded here except the plain-text fallback.
  *
- * SAFETY: dry-run by DEFAULT. It prints exactly what would be sent (API key
- * REDACTED) and transmits nothing. Real delivery requires the explicit --live
- * flag. Every actual send is appended to invoices/smtp2go-delivery.log.
+ * SAFETY: dry-run by DEFAULT (prints what would be sent, API key REDACTED,
+ * transmits nothing). Real delivery requires --live. Each live send is appended
+ * to invoices/smtp2go-delivery.log.
  *
  * Usage:
  *   bun run scripts/send-invoice-smtp2go.ts \
  *     --company <path> --invoice-number <no> --to <recipient@email> [--kind invoice|reminder] [--live]
+ *   Add --html-out <file> to also write the rendered HTML body for inspection.
  */
 
-import { existsSync, readFileSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { join, isAbsolute } from "node:path";
 
 type Args = Record<string, string | boolean>;
 
@@ -34,23 +35,37 @@ function parseArgs(argv: string[]): Args {
     if (!a.startsWith("--")) continue;
     const key = a.slice(2);
     const next = argv[i + 1];
-    if (next === undefined || next.startsWith("--")) {
-      out[key] = true;
-    } else {
-      out[key] = next;
-      i += 1;
-    }
+    if (next === undefined || next.startsWith("--")) out[key] = true;
+    else { out[key] = next; i += 1; }
   }
   return out;
 }
-
-function fail(msg: string): never {
-  console.error(`FEJL: ${msg}`);
-  process.exit(1);
-}
-
+function fail(msg: string): never { console.error(`FEJL: ${msg}`); process.exit(1); }
 function str(v: string | boolean | undefined): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
+const DA_MONTHS = ["januar","februar","marts","april","maj","juni","juli","august","september","oktober","november","december"];
+function formatDanishDate(iso?: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((iso ?? "").trim());
+  if (!m) return (iso ?? "").trim();
+  return `${Number(m[3])}. ${DA_MONTHS[Number(m[2]) - 1]} ${m[1]}`;
+}
+function formatDanishAmount(value: number | undefined, currency = "DKK"): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const fixed = value.toFixed(2);
+  const [intPart, dec] = fixed.split(".");
+  const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return `${grouped},${dec} ${currency}`;
+}
+function fillTemplate(tpl: string, vars: Record<string, string>): string {
+  return tpl.replace(/\{\{\s*([a-zæøå]+)\s*\}\}/gi, (_m, key) => vars[key.toLowerCase()] ?? "");
+}
+function extractSignature(html: string): string {
+  const m = /<!--\s*SIGNATUR START\s*-->([\s\S]*?)<!--\s*SIGNATUR SLUT\s*-->/i.exec(html);
+  const block = m ? m[1] : html;
+  // Strip HTML comments so notes / commented-out rows never ride along in the mail.
+  return block.replace(/<!--[\s\S]*?-->/g, "").trim();
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -60,92 +75,139 @@ const recipientOverride = str(args.to);
 const kind = (str(args.kind) ?? "invoice") as "invoice" | "reminder";
 if (kind !== "invoice" && kind !== "reminder") fail("--kind skal være 'invoice' eller 'reminder'");
 const live = args.live === true;
+const htmlOut = str(args["html-out"]);
 
-// --- Load config/smtp.json (apiKey, fromName, fromAddress fallback) ----------
+// --- config/smtp.json --------------------------------------------------------
 const smtpPath = join(companyRoot, "config", "smtp.json");
 if (!existsSync(smtpPath)) fail(`mangler ${smtpPath}`);
-const smtp = JSON.parse(readFileSync(smtpPath, "utf8")) as {
-  apiKey?: string;
-  fromName?: string;
-  fromAddress?: string;
-};
+const smtp = JSON.parse(readFileSync(smtpPath, "utf8")) as { apiKey?: string; fromName?: string; fromAddress?: string };
 const apiKey = str(smtp.apiKey) ?? fail("config/smtp.json mangler 'apiKey' (SMTP2GO API-nøgle)");
 
-// --- Load the issued invoice snapshot + PDF ----------------------------------
+// --- issued invoice snapshot + PDF ------------------------------------------
 const snapshotPath = join(companyRoot, "invoices", "issued", `${invoiceNumber}.json`);
 const pdfPath = join(companyRoot, "invoices", "issued", `${invoiceNumber}.pdf`);
 if (!existsSync(snapshotPath)) fail(`ingen udstedt faktura: ${snapshotPath}`);
 if (!existsSync(pdfPath)) fail(`ingen faktura-PDF: ${pdfPath}`);
-const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
+const snap = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
   seller?: { name?: string; email?: string };
   buyer?: { name?: string; email?: string };
+  issueDate?: string;
+  currency?: string;
+  totals?: { grossAmount?: number };
 };
 
-// Brand-aware sender: prefer the invoice's own seller.email (the brand contact
-// printed on the invoice); fall back to the SMTP config's fromAddress.
-const fromEmail = str(snapshot.seller?.email) ?? str(smtp.fromAddress) ?? fail(
-  "ingen afsender-mail: fakturaen har ingen seller.email og smtp.json ingen fromAddress",
+// --- config/brands.json (mail template + subject + per-brand signature) ------
+type BrandsFile = {
+  mail?: { subject?: string; templatePath?: string; reminderSubject?: string; reminderTemplatePath?: string };
+  brands?: Record<string, { name?: string; email?: string; signaturePath?: string }>;
+};
+const brandsPath = join(companyRoot, "config", "brands.json");
+const brandsCfg: BrandsFile = existsSync(brandsPath)
+  ? (JSON.parse(readFileSync(brandsPath, "utf8")) as BrandsFile)
+  : {};
+
+// Resolve the brand from the invoice's seller.email (unique per brand).
+const sellerEmail = str(snap.seller?.email);
+const brandEntry = Object.values(brandsCfg.brands ?? {}).find(
+  (b) => str(b.email)?.toLowerCase() === sellerEmail?.toLowerCase(),
 );
-const fromName = str(snapshot.seller?.name) ?? str(smtp.fromName) ?? fromEmail;
+
+const fromEmail = sellerEmail ?? str(smtp.fromAddress) ?? fail("ingen afsender-mail (seller.email/fromAddress mangler)");
+const fromName = str(snap.seller?.name) ?? str(smtp.fromName) ?? fromEmail;
 const sender = `${fromName} <${fromEmail}>`;
 
-const recipientEmail = recipientOverride ?? str(snapshot.buyer?.email)
-  ?? fail("ingen modtager: angiv --to <email> (fakturaen har ingen buyer.email)");
-const recipientName = str(snapshot.buyer?.name);
+const recipientEmail = recipientOverride ?? str(snap.buyer?.email) ?? fail("ingen modtager: angiv --to <email>");
+const recipientName = str(snap.buyer?.name);
 const to = recipientName ? `${recipientName} <${recipientEmail}>` : recipientEmail;
 
-const subject = kind === "reminder"
-  ? `Betalingspåmindelse for faktura ${invoiceNumber}`
-  : `Faktura ${invoiceNumber}`;
-const greeting = recipientName ? `Hej ${recipientName}` : "Hej";
-const textBody = kind === "reminder"
-  ? `${greeting}\n\nVi kan se at faktura ${invoiceNumber} endnu ikke er registreret som betalt. `
-    + `Fakturaen er vedhæftet som PDF — kontakt os gerne, hvis betalingen allerede er gennemført.\n\n`
-    + `Med venlig hilsen\n${fromName}\n${fromEmail}`
-  : `${greeting}\n\nHermed faktura ${invoiceNumber}, vedhæftet som PDF.\n\n`
-    + `Tak for samarbejdet.\n\nMed venlig hilsen\n${fromName}\n${fromEmail}`;
+// --- merge fields ------------------------------------------------------------
+const vars: Record<string, string> = {
+  kontaktnavn: recipientName ?? "kunde",
+  brand: fromName,
+  fakturanummer: invoiceNumber,
+  fakturadato: formatDanishDate(snap.issueDate),
+  "beløb": formatDanishAmount(snap.totals?.grossAmount, (snap.currency ?? "DKK").toUpperCase()),
+  signatur: "",
+};
+
+// Brand signature (extracted, comment-stripped). Empty if not configured.
+let signatureHtml = "";
+const sigPath = str(brandEntry?.signaturePath);
+if (sigPath && existsSync(sigPath)) signatureHtml = extractSignature(readFileSync(sigPath, "utf8"));
+else if (sigPath) console.error(`ADVARSEL: signaturePath findes ikke: ${sigPath} (mail sendes uden signatur)`);
+vars.signatur = signatureHtml;
+
+// --- subject + body from template -------------------------------------------
+const mailCfg = brandsCfg.mail ?? {};
+const subjectTpl = kind === "reminder"
+  ? (mailCfg.reminderSubject ?? "Betalingspåmindelse for faktura {{fakturanummer}} fra {{brand}}")
+  : (mailCfg.subject ?? "Faktura af {{fakturadato}} fra {{brand}}");
+const subject = fillTemplate(subjectTpl, vars);
+
+const templateRel = kind === "reminder" ? mailCfg.reminderTemplatePath : mailCfg.templatePath;
+const templatePath = templateRel ? (isAbsolute(templateRel) ? templateRel : join(companyRoot, templateRel)) : undefined;
+let htmlBody: string;
+if (templatePath && existsSync(templatePath)) {
+  htmlBody = fillTemplate(readFileSync(templatePath, "utf8").replace(/<!--[\s\S]*?-->/g, ""), vars);
+} else {
+  // Built-in fallback (used for reminders without a template, or if the file is missing).
+  const intro = kind === "reminder"
+    ? `<p>Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF — kontakt os gerne, hvis betalingen allerede er gennemført.</p>`
+    : `<p>Tusind tak, fordi du har valgt at være kunde hos ${vars.brand}.</p><p>Her er din faktura ${vars.fakturanummer} på ${vars["beløb"]}.</p><p>Fakturaen er vedhæftet denne mail som PDF.</p>`;
+  htmlBody = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.5; color: #101820;"><p>Kære ${vars.kontaktnavn}</p>${intro}${signatureHtml}</div>`;
+}
+
+// Plain-text fallback (few clients need it, but it keeps the mail well-formed).
+const textBody = [
+  `Kære ${vars.kontaktnavn}`,
+  "",
+  kind === "reminder"
+    ? `Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF.`
+    : `Tusind tak, fordi du har valgt at være kunde hos ${vars.brand}.\n\nHer er din faktura ${vars.fakturanummer} på ${vars["beløb"]}. Fakturaen er vedhæftet som PDF.`,
+  "",
+  "Med venlig hilsen",
+  fromName,
+  fromEmail,
+].join("\n");
+
+if (htmlOut) { writeFileSync(htmlOut, htmlBody); console.log(`HTML-body skrevet til ${htmlOut}`); }
 
 const pdfBase64 = readFileSync(pdfPath).toString("base64");
-
 const payload = {
   api_key: apiKey,
   sender,
   to: [to],
   subject,
+  html_body: htmlBody,
   text_body: textBody,
-  attachments: [
-    { filename: `${invoiceNumber}.pdf`, fileblob: pdfBase64, mimetype: "application/pdf" },
-  ],
+  attachments: [{ filename: `${invoiceNumber}.pdf`, fileblob: pdfBase64, mimetype: "application/pdf" }],
 };
 
-// --- Dry-run (default): show what WOULD be sent, transmit nothing -------------
-const redacted = { ...payload, api_key: "***REDACTED***", attachments: [{ filename: `${invoiceNumber}.pdf`, mimetype: "application/pdf", fileblob: `<${pdfBase64.length} base64-tegn>` }] };
-console.log(JSON.stringify({ mode: live ? "LIVE" : "DRY-RUN", endpoint: "https://api.smtp2go.com/v3/email/send", from: sender, to, subject, request: redacted }, null, 2));
+// --- dry-run (default) -------------------------------------------------------
+console.log(JSON.stringify({
+  mode: live ? "LIVE" : "DRY-RUN",
+  endpoint: "https://api.smtp2go.com/v3/email/send",
+  from: sender, to, subject,
+  brand_matched: brandEntry ? (brandEntry.name ?? "(unnamed)") : "(ingen brand-match — ingen signatur)",
+  merge_fields: vars,
+  html_body_length: htmlBody.length,
+  api_key: "***REDACTED***",
+}, null, 2));
 
-if (!live) {
-  console.log("\nDRY-RUN: intet sendt. Kør igen med --live for at sende via SMTP2GO.");
-  process.exit(0);
-}
+if (!live) { console.log("\nDRY-RUN: intet sendt. Kør igen med --live for at sende via SMTP2GO."); process.exit(0); }
 
-// --- Live send ---------------------------------------------------------------
+// --- live send ---------------------------------------------------------------
 const res = await fetch("https://api.smtp2go.com/v3/email/send", {
   method: "POST",
   headers: { "Content-Type": "application/json", Accept: "application/json" },
   body: JSON.stringify(payload),
 }).catch((e) => fail(`netværksfejl mod SMTP2GO: ${(e as Error).message}`));
-
 const bodyText = await res.text();
-let parsed: unknown;
-try { parsed = JSON.parse(bodyText); } catch { parsed = bodyText; }
-const data = (parsed as { data?: { succeeded?: number; failed?: number; failures?: unknown[]; email_id?: string } })?.data;
+let parsed: unknown; try { parsed = JSON.parse(bodyText); } catch { parsed = bodyText; }
+const data = (parsed as { data?: { succeeded?: number; failed?: number; email_id?: string } })?.data;
 const ok = res.ok && (data?.succeeded ?? 0) >= 1 && (data?.failed ?? 0) === 0;
-
 const logLine = `${new Date().toISOString()}\t${ok ? "OK" : "FAIL"}\t${invoiceNumber}\t${kind}\t${to}\tfrom=${fromEmail}\temail_id=${data?.email_id ?? "-"}\thttp=${res.status}\n`;
 try { appendFileSync(join(companyRoot, "invoices", "smtp2go-delivery.log"), logLine); } catch { /* non-fatal */ }
-
 console.log(`\n${ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${res.status}, succeeded=${data?.succeeded ?? "?"}, failed=${data?.failed ?? "?"}`);
-if (!ok) {
-  console.error("SMTP2GO-svar:", typeof parsed === "string" ? parsed.slice(0, 800) : JSON.stringify(parsed, null, 2).slice(0, 800));
-  process.exit(1);
-}
+if (!ok) { console.error("SMTP2GO-svar:", typeof parsed === "string" ? parsed.slice(0, 800) : JSON.stringify(parsed, null, 2).slice(0, 800)); process.exit(1); }
 console.log(`Logget i invoices/smtp2go-delivery.log (email_id=${data?.email_id ?? "-"}).`);

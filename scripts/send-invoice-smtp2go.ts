@@ -76,6 +76,7 @@ const kind = (str(args.kind) ?? "invoice") as "invoice" | "reminder";
 if (kind !== "invoice" && kind !== "reminder") fail("--kind skal være 'invoice' eller 'reminder'");
 const live = args.live === true;
 const htmlOut = str(args["html-out"]);
+const actor = str(args.actor) ?? "user:anders";
 
 // --- config/smtp.json --------------------------------------------------------
 const smtpPath = join(companyRoot, "config", "smtp.json");
@@ -211,3 +212,24 @@ try { appendFileSync(join(companyRoot, "invoices", "smtp2go-delivery.log"), logL
 console.log(`\n${ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${res.status}, succeeded=${data?.succeeded ?? "?"}, failed=${data?.failed ?? "?"}`);
 if (!ok) { console.error("SMTP2GO-svar:", typeof parsed === "string" ? parsed.slice(0, 800) : JSON.stringify(parsed, null, 2).slice(0, 800)); process.exit(1); }
 console.log(`Logget i invoices/smtp2go-delivery.log (email_id=${data?.email_id ?? "-"}).`);
+
+// (b) ONLY after SMTP2GO has confirmed delivery (HTTP 200 + succeeded) do we
+// record the send in Rentemester's own email_send_log — by calling Rentemester's
+// `invoice send` tool in dry-run. Rentemester never transmits (SMTP2GO already
+// did); it just logs the confirmed send. Requires "dryRun": true in
+// config/smtp.json so Rentemester's built-in transport records instead of erroring.
+const repoRoot = join(import.meta.dir, "..");
+const cliPath = join(repoRoot, "src", "cli.ts");
+const proc = Bun.spawnSync(
+  ["bun", "run", cliPath, "invoice", "send",
+    "--company", companyRoot, "--invoice-number", invoiceNumber,
+    "--kind", kind, "--to", recipientEmail, "--actor", actor],
+  { cwd: repoRoot, stdout: "pipe", stderr: "pipe" },
+);
+if (proc.exitCode === 0) {
+  console.log("✅ Rentemesters email_send_log opdateret (efter bekræftet levering).");
+} else {
+  console.error("⚠️  Rentemesters log blev IKKE opdateret — mailen ER sendt, men Rentemester nåede ikke at logge den.");
+  console.error("    " + new TextDecoder().decode(proc.stderr).trim().split("\n").slice(-2).join(" ").slice(0, 400));
+  console.error("    Tjek: config/smtp.json har \"dryRun\": true, og --actor er i policy.yaml-allowlist.");
+}

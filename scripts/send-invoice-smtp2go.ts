@@ -20,6 +20,7 @@
  * Usage:
  *   bun run scripts/send-invoice-smtp2go.ts \
  *     --company <path> --invoice-number <no> --to <recipient@email> [--kind invoice|reminder] [--live]
+ *   Add --attention <name> to greet a person instead of the buyer company.
  *   Add --html-out <file> to also write the rendered HTML body for inspection.
  *   Add --schedule "2026-09-01 08:00" (local time, or ISO 8601 with a zone) to
  *   have SMTP2GO hold the mail and deliver it later — max 3 days ahead.
@@ -84,6 +85,11 @@ if (kind !== "invoice" && kind !== "reminder") fail("--kind skal være 'invoice'
 const live = args.live === true;
 const htmlOut = str(args["html-out"]);
 const actor = str(args.actor) ?? "user:anders";
+// Hilsenen i mailen. Uden --attention bruges køberens navn fra fakturaen, og så
+// står der "Kære <firmanavn> ApS" — korrekt på selve fakturaen, men stift i en
+// mail til et menneske. --attention "Tue" retter KUN hilsenen; fakturaens PDF og
+// snapshot er udstedt og urørlige, og modtagerlinjen beholder firmanavnet.
+const attention = str(args.attention);
 
 // --- --schedule: udskudt afsendelse ------------------------------------------
 // SMTP2GO tager imod mailen nu og leverer den på det angivne tidspunkt. Kravet
@@ -226,7 +232,7 @@ const to = recipientName ? `${recipientName} <${recipientEmail}>` : recipientEma
 
 // --- merge fields ------------------------------------------------------------
 const vars: Record<string, string> = {
-  kontaktnavn: recipientName ?? "kunde",
+  kontaktnavn: attention ?? recipientName ?? "kunde",
   brand: fromName,
   fakturanummer: invoiceNumber,
   fakturadato: formatDanishDate(snap.issueDate),

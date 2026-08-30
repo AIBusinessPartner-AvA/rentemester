@@ -27,6 +27,13 @@ export type BrandProfile = {
   web?: string;
   /** Short text word-mark rendered in the invoice header. Defaults to `name`. */
   logoText?: string;
+  /**
+   * Path to a PNG logo drawn in the invoice header instead of `logoText`.
+   * Read once at issue time and stored in the invoice snapshot as bytes, so
+   * replacing the file later never changes an already-issued invoice.
+   * 8-bit, non-interlaced, no palette. Falls back to `logoText` if unreadable.
+   */
+  logoPath?: string;
 };
 
 type BrandEntry = Omit<BrandProfile, "key">;

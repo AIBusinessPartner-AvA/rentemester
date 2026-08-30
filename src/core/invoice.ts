@@ -41,6 +41,12 @@ export type InvoicePayload = {
    * re-render is byte-identical. Presentation only — the validator ignores them.
    */
   logoText?: string;
+  /**
+   * Base64-encoded PNG header logo, drawn instead of `logoText`. Stored as
+   * bytes — not a path — so the snapshot stays self-contained and re-renders
+   * identically even if the brand's logo file is later changed or deleted.
+   */
+  logoImage?: string;
   latePaymentNote?: string;
   /**
    * Peppol cbc:InvoicedQuantity/@unitCode (UN/ECE Rec 20). Defaults to H87

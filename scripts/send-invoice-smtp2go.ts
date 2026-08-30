@@ -21,6 +21,8 @@
  *   bun run scripts/send-invoice-smtp2go.ts \
  *     --company <path> --invoice-number <no> --to <recipient@email> [--kind invoice|reminder] [--live]
  *   Add --html-out <file> to also write the rendered HTML body for inspection.
+ *   Add --schedule "2026-09-01 08:00" (local time, or ISO 8601 with a zone) to
+ *   have SMTP2GO hold the mail and deliver it later — max 3 days ahead.
  */
 
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
@@ -77,6 +79,47 @@ if (kind !== "invoice" && kind !== "reminder") fail("--kind skal være 'invoice'
 const live = args.live === true;
 const htmlOut = str(args["html-out"]);
 const actor = str(args.actor) ?? "user:anders";
+
+// --- --schedule: udskudt afsendelse ------------------------------------------
+// SMTP2GO tager imod mailen nu og leverer den på det angivne tidspunkt. Kravet
+// er ISO 8601 i UTC (YYYY-MM-DDTHH:MM:SSZ), i fremtiden og maks. 3 døgn frem.
+// Vi accepterer også lokal tid uden tidszone ("2026-09-01 08:00") og omregner,
+// så man slipper for at hovedregne sommertid.
+const SCHEDULE_MAX_DAYS = 3;
+function parseSchedule(raw: string): string {
+  const bare = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?$/.exec(raw);
+  const zoned = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(raw);
+  // Kun de to former ovenfor accepteres. new Date() alene duer ikke: dens
+  // fallback-parser GÆTTER på vrøvl ("i morgen kl 8" bliver til 2001-07-31)
+  // i stedet for at fejle, og en gættet dato på en fakturamail er værre end
+  // en afvist kommando.
+  if (!bare && !zoned) {
+    fail(`--schedule "${raw}" kunne ikke læses. Brug "2026-09-01 08:00" (lokal tid) eller "2026-09-01T06:00:00Z" (UTC).`);
+  }
+  // Uden tidszone: læs som LOKAL tid (new Date(y, m, d, ...) er lokal).
+  const when = bare
+    ? new Date(
+        Number(bare[1].slice(0, 4)), Number(bare[1].slice(5, 7)) - 1, Number(bare[1].slice(8, 10)),
+        Number(bare[2].slice(0, 2)), Number(bare[2].slice(3, 5)), Number((bare[3] ?? ":00").slice(1)),
+      )
+    : new Date(raw);
+  if (Number.isNaN(when.getTime())) fail(`--schedule "${raw}" er ikke en gyldig dato.`);
+  // Date ruller stiltiende en ugyldig kalenderdato videre (31. september bliver
+  // 1. oktober). Tjek at vi fik den dag der blev skrevet.
+  if (bare) {
+    const back = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, "0")}-${String(when.getDate()).padStart(2, "0")}`;
+    if (back !== bare[1]) fail(`--schedule "${raw}" er ikke en gyldig kalenderdato (${bare[1]} findes ikke).`);
+  }
+  const now = Date.now();
+  if (when.getTime() <= now) fail(`--schedule skal ligge i fremtiden (${when.toISOString()} er passeret).`);
+  const days = (when.getTime() - now) / 86_400_000;
+  if (days > SCHEDULE_MAX_DAYS) {
+    fail(`--schedule må højst være ${SCHEDULE_MAX_DAYS} døgn frem — ${when.toISOString()} er ${days.toFixed(1)} døgn ude. Det er SMTP2GOs grænse, ikke vores.`);
+  }
+  return `${when.toISOString().slice(0, 19)}Z`;
+}
+const scheduleRaw = str(args.schedule);
+const schedule = scheduleRaw ? parseSchedule(scheduleRaw) : undefined;
 
 // --- config/smtp.json --------------------------------------------------------
 const smtpPath = join(companyRoot, "config", "smtp.json");
@@ -182,6 +225,7 @@ const payload = {
   html_body: htmlBody,
   text_body: textBody,
   attachments: [{ filename: `${invoiceNumber}.pdf`, fileblob: pdfBase64, mimetype: "application/pdf" }],
+  ...(schedule ? { schedule } : {}),
 };
 
 // --- dry-run (default) -------------------------------------------------------
@@ -189,6 +233,7 @@ console.log(JSON.stringify({
   mode: live ? "LIVE" : "DRY-RUN",
   endpoint: "https://api.smtp2go.com/v3/email/send",
   from: sender, to, subject,
+  levering: schedule ? `PLANLAGT ${schedule} (= ${new Date(schedule).toLocaleString("da-DK")} lokal tid)` : "straks",
   brand_matched: brandEntry ? (brandEntry.name ?? "(unnamed)") : "(ingen brand-match — ingen signatur)",
   merge_fields: vars,
   html_body_length: htmlBody.length,
@@ -205,16 +250,31 @@ const res = await fetch("https://api.smtp2go.com/v3/email/send", {
 }).catch((e) => fail(`netværksfejl mod SMTP2GO: ${(e as Error).message}`));
 const bodyText = await res.text();
 let parsed: unknown; try { parsed = JSON.parse(bodyText); } catch { parsed = bodyText; }
-const data = (parsed as { data?: { succeeded?: number; failed?: number; email_id?: string } })?.data;
-const ok = res.ok && (data?.succeeded ?? 0) >= 1 && (data?.failed ?? 0) === 0;
-const logLine = `${new Date().toISOString()}\t${ok ? "OK" : "FAIL"}\t${invoiceNumber}\t${kind}\t${to}\tfrom=${fromEmail}\temail_id=${data?.email_id ?? "-"}\thttp=${res.status}\n`;
+const data = (parsed as { data?: { succeeded?: number; failed?: number; email_id?: string; schedule_id?: string } })?.data;
+// En planlagt mail er KØSAT, ikke leveret: SMTP2GO svarer med et schedule_id i
+// stedet for succeeded/failed. Kvitteringen skal derfor læses forskelligt.
+const ok = schedule
+  ? res.ok && Boolean(data?.schedule_id)
+  : res.ok && (data?.succeeded ?? 0) >= 1 && (data?.failed ?? 0) === 0;
+const status = ok ? (schedule ? "SCHEDULED" : "OK") : "FAIL";
+const logLine = `${new Date().toISOString()}\t${status}\t${invoiceNumber}\t${kind}\t${to}\tfrom=${fromEmail}\temail_id=${data?.email_id ?? "-"}\tschedule=${schedule ?? "-"}\tschedule_id=${data?.schedule_id ?? "-"}\thttp=${res.status}\n`;
 try { appendFileSync(join(companyRoot, "invoices", "smtp2go-delivery.log"), logLine); } catch { /* non-fatal */ }
-console.log(`\n${ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${res.status}, succeeded=${data?.succeeded ?? "?"}, failed=${data?.failed ?? "?"}`);
+if (ok && schedule) {
+  console.log(`\n🕒 KØSAT — HTTP ${res.status}, schedule_id=${data?.schedule_id ?? "-"}`);
+  console.log(`   Leveres ${new Date(schedule).toLocaleString("da-DK")} (lokal tid). Endnu IKKE i kundens indbakke.`);
+  console.log(`   Fortryd: DELETE https://api.smtp2go.com/v3/email/scheduled med schedule_id ovenfor.`);
+} else {
+  console.log(`\n${ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${res.status}, succeeded=${data?.succeeded ?? "?"}, failed=${data?.failed ?? "?"}`);
+}
 if (!ok) { console.error("SMTP2GO-svar:", typeof parsed === "string" ? parsed.slice(0, 800) : JSON.stringify(parsed, null, 2).slice(0, 800)); process.exit(1); }
-console.log(`Logget i invoices/smtp2go-delivery.log (email_id=${data?.email_id ?? "-"}).`);
+console.log(`Logget i invoices/smtp2go-delivery.log (status=${status}).`);
 
-// (b) ONLY after SMTP2GO has confirmed delivery (HTTP 200 + succeeded) do we
-// record the send in Rentemester's own email_send_log — by calling Rentemester's
+// (b) ONLY after SMTP2GO has taken responsibility for the mail — delivered
+// (HTTP 200 + succeeded), or queued with a schedule_id — do we record the send
+// in Rentemester's own email_send_log. A queued mail is logged too: SMTP2GO has
+// committed to sending it, and the log entry burns the idempotency key so a
+// second run can't queue the same invoice twice.
+// We record it by calling Rentemester's
 // `invoice send` tool in dry-run. Rentemester never transmits (SMTP2GO already
 // did); it just logs the confirmed send. Requires "dryRun": true in
 // config/smtp.json so Rentemester's built-in transport records instead of erroring.
@@ -227,9 +287,9 @@ const proc = Bun.spawnSync(
   { cwd: repoRoot, stdout: "pipe", stderr: "pipe" },
 );
 if (proc.exitCode === 0) {
-  console.log("✅ Rentemesters email_send_log opdateret (efter bekræftet levering).");
+  console.log(`✅ Rentemesters email_send_log opdateret (${schedule ? "mailen er køsat hos SMTP2GO" : "efter bekræftet levering"}).`);
 } else {
-  console.error("⚠️  Rentemesters log blev IKKE opdateret — mailen ER sendt, men Rentemester nåede ikke at logge den.");
+  console.error(`⚠️  Rentemesters log blev IKKE opdateret — mailen ER ${schedule ? "køsat" : "sendt"}, men Rentemester nåede ikke at logge den.`);
   console.error("    " + new TextDecoder().decode(proc.stderr).trim().split("\n").slice(-2).join(" ").slice(0, 400));
   console.error("    Tjek: config/smtp.json har \"dryRun\": true, og --actor er i policy.yaml-allowlist.");
 }

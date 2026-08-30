@@ -23,6 +23,11 @@
  *   Add --html-out <file> to also write the rendered HTML body for inspection.
  *   Add --schedule "2026-09-01 08:00" (local time, or ISO 8601 with a zone) to
  *   have SMTP2GO hold the mail and deliver it later — max 3 days ahead.
+ *   --schedule next picks the next slot inside the send window.
+ *
+ * SEND WINDOW: delivery must fall on a weekday between 08:00 and 15:00 local
+ * time. --live outside that window is refused (override: --ignore-send-window);
+ * dry-run only warns, so an invoice can be prepared and reviewed at any hour.
  */
 
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
@@ -86,7 +91,7 @@ const actor = str(args.actor) ?? "user:anders";
 // Vi accepterer også lokal tid uden tidszone ("2026-09-01 08:00") og omregner,
 // så man slipper for at hovedregne sommertid.
 const SCHEDULE_MAX_DAYS = 3;
-function parseSchedule(raw: string): string {
+function parseSchedule(raw: string): Date {
   const bare = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?$/.exec(raw);
   const zoned = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(raw);
   // Kun de to former ovenfor accepteres. new Date() alene duer ikke: dens
@@ -116,10 +121,65 @@ function parseSchedule(raw: string): string {
   if (days > SCHEDULE_MAX_DAYS) {
     fail(`--schedule må højst være ${SCHEDULE_MAX_DAYS} døgn frem — ${when.toISOString()} er ${days.toFixed(1)} døgn ude. Det er SMTP2GOs grænse, ikke vores.`);
   }
-  return `${when.toISOString().slice(0, 19)}Z`;
+  return when;
 }
+
+// --- Afsendelsesvindue: hverdage 08:00-15:00 ---------------------------------
+// Husreglen: fakturamails skal lande hos kunden i almindelig arbejdstid — ikke
+// søndag morgen og ikke kl. 23. Vinduet gælder LEVERINGStidspunktet: med
+// --schedule er det det planlagte tidspunkt, ellers "nu".
+//
+// Reglen blokerer kun den faktiske afsendelse (--live). Dry-run advarer, men
+// kører — man skal kunne klargøre og gennemse en faktura når som helst.
+//
+// BEMÆRK: kun ugedag og klokkeslæt tjekkes. Scriptet kender ikke danske
+// helligdage, så 1. juledag og grundlovsdag slipper igennem som hverdage.
+const WORK_START_HOUR = 8;
+const WORK_END_HOUR = 15;
+const WINDOW_LABEL = `hverdage kl. ${WORK_START_HOUR}-${WORK_END_HOUR}`;
+function insideSendWindow(d: Date): boolean {
+  const day = d.getDay(); // 0 = søndag, 6 = lørdag
+  if (day === 0 || day === 6) return false;
+  const minutes = d.getHours() * 60 + d.getMinutes();
+  return minutes >= WORK_START_HOUR * 60 && minutes <= WORK_END_HOUR * 60;
+}
+function nextSendSlot(from: Date): Date {
+  const d = new Date(from);
+  if (insideSendWindow(d)) return d;
+  const isWeekday = d.getDay() >= 1 && d.getDay() <= 5;
+  // Tidligt nok på en hverdag: vent til vinduet åbner samme dag.
+  if (isWeekday && d.getHours() * 60 + d.getMinutes() < WORK_START_HOUR * 60) {
+    d.setHours(WORK_START_HOUR, 0, 0, 0);
+    return d;
+  }
+  d.setDate(d.getDate() + 1);
+  d.setHours(WORK_START_HOUR, 0, 0, 0);
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+  return d;
+}
+function formatLocal(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 const scheduleRaw = str(args.schedule);
-const schedule = scheduleRaw ? parseSchedule(scheduleRaw) : undefined;
+// --schedule next = "næste gyldige tidspunkt i afsendelsesvinduet", så man
+// slipper for selv at regne weekender og lukketid ud.
+const scheduleAt = scheduleRaw
+  ? (scheduleRaw === "next" ? nextSendSlot(new Date()) : parseSchedule(scheduleRaw))
+  : undefined;
+const schedule = scheduleAt ? `${scheduleAt.toISOString().slice(0, 19)}Z` : undefined;
+
+const ignoreWindow = args["ignore-send-window"] === true;
+const deliveryAt = scheduleAt ?? new Date();
+const windowOk = insideSendWindow(deliveryAt);
+if (!windowOk && live && !ignoreWindow) {
+  fail(
+    `afsendelsesvinduet er ${WINDOW_LABEL}, og ${formatLocal(deliveryAt)} ligger udenfor.\n` +
+    `  Næste gyldige tidspunkt: --schedule "${formatLocal(nextSendSlot(deliveryAt))}"  (eller blot --schedule next)\n` +
+    `  Skal den afsted alligevel: --ignore-send-window`,
+  );
+}
 
 // --- config/smtp.json --------------------------------------------------------
 const smtpPath = join(companyRoot, "config", "smtp.json");
@@ -233,7 +293,10 @@ console.log(JSON.stringify({
   mode: live ? "LIVE" : "DRY-RUN",
   endpoint: "https://api.smtp2go.com/v3/email/send",
   from: sender, to, subject,
-  levering: schedule ? `PLANLAGT ${schedule} (= ${new Date(schedule).toLocaleString("da-DK")} lokal tid)` : "straks",
+  levering: schedule ? `PLANLAGT ${schedule} (= ${formatLocal(deliveryAt)} lokal tid)` : "straks",
+  afsendelsesvindue: windowOk
+    ? `OK — ${formatLocal(deliveryAt)} er inden for ${WINDOW_LABEL}`
+    : `⚠️  UDEN FOR ${WINDOW_LABEL} (${formatLocal(deliveryAt)}). --live vil blive afvist. Næste slot: "${formatLocal(nextSendSlot(deliveryAt))}"`,
   brand_matched: brandEntry ? (brandEntry.name ?? "(unnamed)") : "(ingen brand-match — ingen signatur)",
   merge_fields: vars,
   html_body_length: htmlBody.length,

@@ -285,6 +285,7 @@ Rentemester er stadig under udvikling og bør endnu ikke være din eneste kilde 
 - validér og udsted danske fakturaer med moms og forfald; et immutabelt snapshot gemmes
 - generér en PDF af en udstedt faktura
 - send en faktura eller en betalingspåmindelse til kunden på e-mail med PDF'en vedhæftet — afsendelsen logges og kan ikke ske dobbelt ved et uheld. *Bemærk:* selve den indbyggede e-mailafsendelse kører foreløbig i test-tilstand; rigtig levering kræver at man tilkobler sin egen e-mailkanal
+- fakturér under flere brands fra samme selskab (fx et binavn) med eget navn, logo, kontaktlinje og afsendermail — men én fælles fortløbende nummerserie. Levering via SMTP2GO ligger som et selvstændigt script uden for kernen. Se [`docs/brand-invoicing.md`](docs/brand-invoicing.md)
 - gentagne fakturaer via skabeloner (månedlige, kvartalsvise, årlige) — første trin mod abonnementsfakturering
 - registrér betalinger og afstem dem mod banken
 - udsted kreditnotaer og bogfør refundering tilbage til kunden

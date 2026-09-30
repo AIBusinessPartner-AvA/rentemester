@@ -33,6 +33,13 @@
 
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
+import {
+  WINDOW_LABEL,
+  formatLocal,
+  insideSendWindow,
+  nextSendSlot,
+  parseSchedule,
+} from "../src/core/send-window";
 
 type Args = Record<string, string | boolean>;
 
@@ -91,89 +98,25 @@ const actor = str(args.actor) ?? "user:anders";
 // snapshot er udstedt og urørlige, og modtagerlinjen beholder firmanavnet.
 const attention = str(args.attention);
 
-// --- --schedule: udskudt afsendelse ------------------------------------------
-// SMTP2GO tager imod mailen nu og leverer den på det angivne tidspunkt. Kravet
-// er ISO 8601 i UTC (YYYY-MM-DDTHH:MM:SSZ), i fremtiden og maks. 3 døgn frem.
-// Vi accepterer også lokal tid uden tidszone ("2026-09-01 08:00") og omregner,
-// så man slipper for at hovedregne sommertid.
-const SCHEDULE_MAX_DAYS = 3;
-function parseSchedule(raw: string): Date {
-  const bare = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2})?$/.exec(raw);
-  const zoned = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(raw);
-  // Kun de to former ovenfor accepteres. new Date() alene duer ikke: dens
-  // fallback-parser GÆTTER på vrøvl ("i morgen kl 8" bliver til 2001-07-31)
-  // i stedet for at fejle, og en gættet dato på en fakturamail er værre end
-  // en afvist kommando.
-  if (!bare && !zoned) {
-    fail(`--schedule "${raw}" kunne ikke læses. Brug "2026-09-01 08:00" (lokal tid) eller "2026-09-01T06:00:00Z" (UTC).`);
-  }
-  // Uden tidszone: læs som LOKAL tid (new Date(y, m, d, ...) er lokal).
-  const when = bare
-    ? new Date(
-        Number(bare[1].slice(0, 4)), Number(bare[1].slice(5, 7)) - 1, Number(bare[1].slice(8, 10)),
-        Number(bare[2].slice(0, 2)), Number(bare[2].slice(3, 5)), Number((bare[3] ?? ":00").slice(1)),
-      )
-    : new Date(raw);
-  if (Number.isNaN(when.getTime())) fail(`--schedule "${raw}" er ikke en gyldig dato.`);
-  // Date ruller stiltiende en ugyldig kalenderdato videre (31. september bliver
-  // 1. oktober). Tjek at vi fik den dag der blev skrevet.
-  if (bare) {
-    const back = `${when.getFullYear()}-${String(when.getMonth() + 1).padStart(2, "0")}-${String(when.getDate()).padStart(2, "0")}`;
-    if (back !== bare[1]) fail(`--schedule "${raw}" er ikke en gyldig kalenderdato (${bare[1]} findes ikke).`);
-  }
-  const now = Date.now();
-  if (when.getTime() <= now) fail(`--schedule skal ligge i fremtiden (${when.toISOString()} er passeret).`);
-  const days = (when.getTime() - now) / 86_400_000;
-  if (days > SCHEDULE_MAX_DAYS) {
-    fail(`--schedule må højst være ${SCHEDULE_MAX_DAYS} døgn frem — ${when.toISOString()} er ${days.toFixed(1)} døgn ude. Det er SMTP2GOs grænse, ikke vores.`);
-  }
-  return when;
-}
-
-// --- Afsendelsesvindue: hverdage 08:00-15:00 ---------------------------------
-// Husreglen: fakturamails skal lande hos kunden i almindelig arbejdstid — ikke
-// søndag morgen og ikke kl. 23. Vinduet gælder LEVERINGStidspunktet: med
-// --schedule er det det planlagte tidspunkt, ellers "nu".
+// --- Afsendelsestidspunkt ----------------------------------------------------
+// Reglerne selv bor i src/core/send-window.ts, så de kan testes uden at køre
+// dette script. Her tages kun beslutningen om at afbryde.
 //
-// Reglen blokerer kun den faktiske afsendelse (--live). Dry-run advarer, men
-// kører — man skal kunne klargøre og gennemse en faktura når som helst.
-//
-// BEMÆRK: kun ugedag og klokkeslæt tjekkes. Scriptet kender ikke danske
-// helligdage, så 1. juledag og grundlovsdag slipper igennem som hverdage.
-const WORK_START_HOUR = 8;
-const WORK_END_HOUR = 15;
-const WINDOW_LABEL = `hverdage kl. ${WORK_START_HOUR}-${WORK_END_HOUR}`;
-function insideSendWindow(d: Date): boolean {
-  const day = d.getDay(); // 0 = søndag, 6 = lørdag
-  if (day === 0 || day === 6) return false;
-  const minutes = d.getHours() * 60 + d.getMinutes();
-  return minutes >= WORK_START_HOUR * 60 && minutes <= WORK_END_HOUR * 60;
-}
-function nextSendSlot(from: Date): Date {
-  const d = new Date(from);
-  if (insideSendWindow(d)) return d;
-  const isWeekday = d.getDay() >= 1 && d.getDay() <= 5;
-  // Tidligt nok på en hverdag: vent til vinduet åbner samme dag.
-  if (isWeekday && d.getHours() * 60 + d.getMinutes() < WORK_START_HOUR * 60) {
-    d.setHours(WORK_START_HOUR, 0, 0, 0);
-    return d;
-  }
-  d.setDate(d.getDate() + 1);
-  d.setHours(WORK_START_HOUR, 0, 0, 0);
-  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
-  return d;
-}
-function formatLocal(d: Date): string {
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
+// Vinduet (hverdage 08-15) gælder LEVERINGStidspunktet: med --schedule er det
+// det planlagte tidspunkt, ellers "nu". Det blokerer kun faktisk afsendelse
+// (--live) — dry-run advarer, men kører, så en faktura kan klargøres og
+// gennemses når som helst.
 const scheduleRaw = str(args.schedule);
 // --schedule next = "næste gyldige tidspunkt i afsendelsesvinduet", så man
 // slipper for selv at regne weekender og lukketid ud.
-const scheduleAt = scheduleRaw
-  ? (scheduleRaw === "next" ? nextSendSlot(new Date()) : parseSchedule(scheduleRaw))
-  : undefined;
+let scheduleAt: Date | undefined;
+if (scheduleRaw === "next") {
+  scheduleAt = nextSendSlot(new Date());
+} else if (scheduleRaw) {
+  const parsed = parseSchedule(scheduleRaw, new Date());
+  if (!parsed.ok) fail(parsed.error);
+  scheduleAt = parsed.when;
+}
 const schedule = scheduleAt ? `${scheduleAt.toISOString().slice(0, 19)}Z` : undefined;
 
 const ignoreWindow = args["ignore-send-window"] === true;

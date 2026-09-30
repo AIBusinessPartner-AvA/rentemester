@@ -13,10 +13,10 @@ To adskilte ting, som bare ofte bruges sammen:
 
 > **Status:** bygget og i daglig brug hos ét rigtigt selskab siden august 2026 —
 > fakturaer er sendt live til rigtige kunder. De rene, deterministiske dele er
-> dækket af tests (100 i alt: PNG-dekoderen, brand-indlæsningen,
-> afsendelsesvinduet og SMTP2GO-kaldet). Mailkompositionen og PDF-renderingen er
-> ikke. Se [Hvad der mangler](#hvad-der-mangler) før du bygger videre eller
-> åbner en PR mod `main`.
+> dækket af 159 tests: PNG-dekoderen, brand-indlæsningen, afsendelsesvinduet,
+> SMTP2GO-kaldet og mailkompositionen. PDF-renderingen er ikke. Se
+> [Hvad der mangler](#hvad-der-mangler) før du bygger videre eller åbner en PR
+> mod `main`.
 
 Relateret: [cli-contract.md](cli-contract.md), [build-loop.md](build-loop.md),
 [efaktura-digisense.md](efaktura-digisense.md) (den certificerede vej til
@@ -276,22 +276,24 @@ confirm-kontrakt. Den er et værktøj ved siden af, ikke en del af ledgeren.
 
 Ærlig liste over hvad der stadig står tilbage:
 
-- **Testdækningen er delvis.** Dækket er de rene, deterministiske enheder,
-  100 tests i alt: `src/core/png-image.ts` (23 — alle fem scanline-filtre,
-  alfa-komposition mod hvid, og hver enkelt afvisningsgrund),
-  `src/core/brands.ts` (17 — opslag, default, og at indlæsningen aldrig kaster
-  uanset hvad der står i filen), `src/core/send-window.ts` (28 — vinduets
-  grænser, weekendspring og schedule-parsing) og `src/core/smtp2go.ts` (32 —
-  payload-formen, begge kvitteringsregler og selve kaldet mod en fake fetch).
-  Alle fire suiter er muteringstestet: knæk prædiktoren i Paeth-filteret,
+- **Testdækningen — 159 tests over fem moduler.** `src/core/png-image.ts` (23 —
+  alle fem scanline-filtre, alfa-komposition mod hvid, og hver enkelt
+  afvisningsgrund), `src/core/brands.ts` (17 — opslag, default, og at
+  indlæsningen aldrig kaster uanset hvad der står i filen),
+  `src/core/send-window.ts` (28 — vinduets grænser, weekendspring og
+  schedule-parsing), `src/core/smtp2go.ts` (32 — payload-formen, begge
+  kvitteringsregler og selve kaldet mod en fake fetch) og
+  `src/core/invoice-mail.ts` (59 — datoer, beløb, flettefelter,
+  signatur-ekstraktion, brand- og kontaktopslag, emne og begge kroppe).
+  Alle fem suiter er muteringstestet — fx: knæk prædiktoren i Paeth-filteret,
   komponér alfa mod sort, ryk vinduets lukketid en time, fjern weekendspringet,
   drop navnekravet på et brand, bedøm en planlagt afsendelse på `succeeded`, se
-  bort fra HTTP-statussen, eller skriv det rå svar i leveringsloggen — hver
-  enkelt mutation fanges af mindst én test.
-  **Ikke dækket:** mailkompositionen i `scripts/send-invoice-smtp2go.ts`
-  (skabelonudfyldning, brand-opslag, signatur) og PDF-renderingen i
-  `src/core/invoice-pdf.ts`. Begge kræver en større udtrækning end de fire
-  moduler ovenfor.
+  bort fra HTTP-statussen, skriv det rå svar i leveringsloggen, lad rykkeren og
+  fakturaen bytte indledning, eller strip kommentarer EFTER fletning i stedet
+  for før. Hver enkelt mutation fanges af mindst én test.
+  **Ikke dækket:** PDF-renderingen i `src/core/invoice-pdf.ts`, og den del af
+  `scripts/send-invoice-smtp2go.ts` der læser filer og binder modulerne sammen.
+  Selve kompositionen er flyttet ud og testet.
 - **Logo som `cid:`-vedhæftning.** Signaturens logo hentes fra en ekstern URL og
   blokeres af mailklienter der ikke henter billeder.
 - **Ingen helligdagskalender** i afsendelsesvinduet.

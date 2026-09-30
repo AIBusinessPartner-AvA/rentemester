@@ -32,7 +32,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
-import { join, isAbsolute } from "node:path";
+import { join } from "node:path";
 import {
   WINDOW_LABEL,
   formatLocal,
@@ -46,6 +46,17 @@ import {
   formatDeliveryLogLine,
   sendViaSmtp2go,
 } from "../src/core/smtp2go";
+import {
+  type BrandsMailFile,
+  type Kontaktperson,
+  buildMergeFields,
+  composeMail,
+  extractSignature,
+  resolveBrandEntry,
+  resolveContactName,
+  resolveTemplatePath,
+  templateRelFor,
+} from "../src/core/invoice-mail";
 
 type Args = Record<string, string | boolean>;
 
@@ -66,28 +77,8 @@ function str(v: string | boolean | undefined): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-const DA_MONTHS = ["januar","februar","marts","april","maj","juni","juli","august","september","oktober","november","december"];
-function formatDanishDate(iso?: string): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((iso ?? "").trim());
-  if (!m) return (iso ?? "").trim();
-  return `${Number(m[3])}. ${DA_MONTHS[Number(m[2]) - 1]} ${m[1]}`;
-}
-function formatDanishAmount(value: number | undefined, currency = "DKK"): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "";
-  const fixed = value.toFixed(2);
-  const [intPart, dec] = fixed.split(".");
-  const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ".");
-  return `${grouped},${dec} ${currency}`;
-}
-function fillTemplate(tpl: string, vars: Record<string, string>): string {
-  return tpl.replace(/\{\{\s*([a-zæøå]+)\s*\}\}/gi, (_m, key) => vars[key.toLowerCase()] ?? "");
-}
-function extractSignature(html: string): string {
-  const m = /<!--\s*SIGNATUR START\s*-->([\s\S]*?)<!--\s*SIGNATUR SLUT\s*-->/i.exec(html);
-  const block = m ? m[1] : html;
-  // Strip HTML comments so notes / commented-out rows never ride along in the mail.
-  return block.replace(/<!--[\s\S]*?-->/g, "").trim();
-}
+// Selve mailkompositionen — datoer, beløb, flettefelter, emne og kroppe — bor i
+// src/core/invoice-mail.ts som rene funktioner. Her læses kun filerne.
 
 const args = parseArgs(process.argv.slice(2));
 const companyRoot = str(args.company) ?? fail("--company <path> er påkrævet");
@@ -156,20 +147,15 @@ const snap = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
 };
 
 // --- config/brands.json (mail template + subject + per-brand signature) ------
-type BrandsFile = {
-  mail?: { subject?: string; templatePath?: string; reminderSubject?: string; reminderTemplatePath?: string };
-  brands?: Record<string, { name?: string; email?: string; signaturePath?: string }>;
-};
 const brandsPath = join(companyRoot, "config", "brands.json");
-const brandsCfg: BrandsFile = existsSync(brandsPath)
-  ? (JSON.parse(readFileSync(brandsPath, "utf8")) as BrandsFile)
+const brandsCfg: BrandsMailFile = existsSync(brandsPath)
+  ? (JSON.parse(readFileSync(brandsPath, "utf8")) as BrandsMailFile)
   : {};
 
-// Resolve the brand from the invoice's seller.email (unique per brand).
+// Brandet udledes af fakturaens seller.email (unik pr. brand), ikke af et flag:
+// et flag kunne være uenigt med den PDF der rent faktisk blev udstedt.
 const sellerEmail = str(snap.seller?.email);
-const brandEntry = Object.values(brandsCfg.brands ?? {}).find(
-  (b) => str(b.email)?.toLowerCase() === sellerEmail?.toLowerCase(),
-);
+const brandEntry = resolveBrandEntry(brandsCfg.brands, sellerEmail);
 
 const fromEmail = sellerEmail ?? str(smtp.fromAddress) ?? fail("ingen afsender-mail (seller.email/fromAddress mangler)");
 const fromName = str(snap.seller?.name) ?? str(smtp.fromName) ?? fromEmail;
@@ -184,73 +170,43 @@ const to = recipientName ? `${recipientName} <${recipientEmail}>` : recipientEma
 // append-only uden update-kommando. Denne fil ligger derfor ved siden af
 // bogføringen: den er ren præsentation og rører hverken ledger eller
 // revisionsspor. Slås op på køberens CVR, ellers på modtagermailen.
-type KontaktpersonerFile = {
-  kontakter?: Array<{ cvr?: string; email?: string; navn?: string }>;
-};
 const kontaktPath = join(companyRoot, "config", "kontaktpersoner.json");
-const kontaktCfg: KontaktpersonerFile = existsSync(kontaktPath)
-  ? (JSON.parse(readFileSync(kontaktPath, "utf8")) as KontaktpersonerFile)
+const kontaktCfg: { kontakter?: Kontaktperson[] } = existsSync(kontaktPath)
+  ? (JSON.parse(readFileSync(kontaktPath, "utf8")) as { kontakter?: Kontaktperson[] })
   : {};
-const normCvr = (v: string | undefined) => v?.toUpperCase().replace(/[^A-Z0-9]/g, "") || undefined;
-const buyerCvr = normCvr(str(snap.buyer?.vatOrCvr));
-const kontaktpersonNavn = str(
-  kontaktCfg.kontakter?.find((k) => {
-    const byCvr = buyerCvr && normCvr(str(k.cvr)) === buyerCvr;
-    const byMail = str(k.email)?.toLowerCase() === recipientEmail.toLowerCase();
-    return byCvr || byMail;
-  })?.navn,
-);
 
-// --- merge fields ------------------------------------------------------------
-const vars: Record<string, string> = {
-  // --attention vinder altid; derefter kontaktpersoner.json; til sidst firmanavnet.
-  kontaktnavn: attention ?? kontaktpersonNavn ?? recipientName ?? "kunde",
-  brand: fromName,
-  fakturanummer: invoiceNumber,
-  fakturadato: formatDanishDate(snap.issueDate),
-  "beløb": formatDanishAmount(snap.totals?.grossAmount, (snap.currency ?? "DKK").toUpperCase()),
-  signatur: "",
-};
-
-// Brand signature (extracted, comment-stripped). Empty if not configured.
+// Brandets signatur (udtrukket og kommentar-strippet). Tom hvis ikke opsat.
 let signatureHtml = "";
 const sigPath = str(brandEntry?.signaturePath);
 if (sigPath && existsSync(sigPath)) signatureHtml = extractSignature(readFileSync(sigPath, "utf8"));
 else if (sigPath) console.error(`ADVARSEL: signaturePath findes ikke: ${sigPath} (mail sendes uden signatur)`);
-vars.signatur = signatureHtml;
 
-// --- subject + body from template -------------------------------------------
+// --- merge fields ------------------------------------------------------------
+const vars = buildMergeFields({
+  contactName: resolveContactName({
+    attention,
+    contacts: kontaktCfg.kontakter,
+    buyerVatOrCvr: snap.buyer?.vatOrCvr,
+    recipientEmail,
+    buyerName: recipientName,
+  }),
+  brandName: fromName,
+  invoiceNumber,
+  issueDate: snap.issueDate,
+  grossAmount: snap.totals?.grossAmount,
+  currency: snap.currency,
+  signatureHtml,
+});
+
+// --- emne + kroppe -----------------------------------------------------------
 const mailCfg = brandsCfg.mail ?? {};
-const subjectTpl = kind === "reminder"
-  ? (mailCfg.reminderSubject ?? "Betalingspåmindelse for faktura {{fakturanummer}} fra {{brand}}")
-  : (mailCfg.subject ?? "Faktura af {{fakturadato}} fra {{brand}}");
-const subject = fillTemplate(subjectTpl, vars);
-
-const templateRel = kind === "reminder" ? mailCfg.reminderTemplatePath : mailCfg.templatePath;
-const templatePath = templateRel ? (isAbsolute(templateRel) ? templateRel : join(companyRoot, templateRel)) : undefined;
-let htmlBody: string;
-if (templatePath && existsSync(templatePath)) {
-  htmlBody = fillTemplate(readFileSync(templatePath, "utf8").replace(/<!--[\s\S]*?-->/g, ""), vars);
-} else {
-  // Built-in fallback (used for reminders without a template, or if the file is missing).
-  const intro = kind === "reminder"
-    ? `<p>Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF — kontakt os gerne, hvis betalingen allerede er gennemført.</p>`
-    : `<p>Tusind tak, fordi du har valgt at være kunde hos ${vars.brand}.</p><p>Her er din faktura ${vars.fakturanummer} på ${vars["beløb"]}.</p><p>Fakturaen er vedhæftet denne mail som PDF.</p>`;
-  htmlBody = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.5; color: #101820;"><p>Hej ${vars.kontaktnavn}</p>${intro}${signatureHtml}</div>`;
-}
-
-// Plain-text fallback (few clients need it, but it keeps the mail well-formed).
-const textBody = [
-  `Hej ${vars.kontaktnavn}`,
-  "",
-  kind === "reminder"
-    ? `Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF.`
-    : `Tusind tak, fordi du har valgt at være kunde hos ${vars.brand}.\n\nHer er din faktura ${vars.fakturanummer} på ${vars["beløb"]}. Fakturaen er vedhæftet som PDF.`,
-  "",
-  "Med venlig hilsen",
-  fromName,
-  fromEmail,
-].join("\n");
+const templatePath = resolveTemplatePath(companyRoot, templateRelFor(mailCfg, kind));
+const template = templatePath && existsSync(templatePath)
+  ? readFileSync(templatePath, "utf8")
+  : undefined;
+const { subject, htmlBody, textBody } = composeMail({
+  kind, vars, mail: mailCfg, template, signatureHtml, fromName, fromEmail,
+});
 
 if (htmlOut) { writeFileSync(htmlOut, htmlBody); console.log(`HTML-body skrevet til ${htmlOut}`); }
 

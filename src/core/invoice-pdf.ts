@@ -4,7 +4,6 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { decodePng, type DecodedImage } from "./png-image";
-import type { Database } from "bun:sqlite";
 import { insertAuditLog } from "./actor";
 import { promoteTempFileExclusive, removeIfExists, writeTempFileFor } from "./atomic-file";
 import { snapshotRegisteredDocumentEvidence } from "./document-storage";

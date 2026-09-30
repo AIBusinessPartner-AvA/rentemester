@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "bun:test";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { JournalView } from "./JournalView";
@@ -18,7 +18,27 @@ function renderView() {
   });
 }
 
+function dimensionsRoute() {
+  return {
+    ...route(),
+    "GET /api/companies/acme-aps/dimensions/101": { assignments: [{ id: 7, allocations_json: JSON.stringify([{ dimensionId: "project", memberId: "alpha", amountMinor: 2228628, currency: "DKK" }]), source: "reviewed", plan_hash: "a".repeat(64), event_type: "assigned", supersedes_assignment_id: null, actor: "user:owner", principal: "service:cockpit", created_at: "2026-08-30T12:00:00.000Z" }] },
+    "POST /api/companies/acme-aps/dimensions/plan": { ok: true, plan: { planHash: "b".repeat(64) } },
+    "POST /api/companies/acme-aps/dimensions/replace": { ok: true },
+  };
+}
+
 describe("JournalView — Posteringer", () => {
+  test("links only journal entries with an explicit linked-document party ID", async () => {
+    const row = journal().entries[0];
+    mockFetch(route({ entries: [
+      { ...row, id: 11, text: "Samme navn", partyId: "party-journal" },
+      { ...row, id: 12, text: "Samme navn", partyId: null },
+    ] }));
+    renderView();
+    expect(await screen.findByRole("link", { name: "Samme navn" })).toHaveAttribute("href", "/companies/acme-aps/parter/party-journal");
+    expect(screen.getAllByText("Samme navn").some((element) => element.closest("a") === null)).toBe(true);
+  });
+
   test("lists the posted journal entries", async () => {
     mockFetch(route());
     renderView();
@@ -41,14 +61,23 @@ describe("JournalView — Posteringer", () => {
     expect(screen.getByText("Salgsmoms")).toBeInTheDocument();
   });
 
-  test("the company sub-nav exposes the new tabs", async () => {
+  test("shows approved dimensions with provenance and requires a hash-bound review before correction", async () => {
+    mockFetch(dimensionsRoute());
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: /Salg af ydelse/ }));
+    await userEvent.click(await screen.findByText(/project: alpha/i));
+    expect(screen.getByText(/Kilde: reviewed/i)).toBeInTheDocument();
+    expect(screen.getByText(/Godkendt af user:owner/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Gennemgå og ret/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Validér revideret plan/i }));
+    expect(await screen.findByText(/Plan-hash:/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Erstat nuværende tildeling atomisk/i })).toBeDisabled();
+  });
+
+  test("the daily navigation lets the owner find money and documents", async () => {
     mockFetch(route());
     renderView();
-    const bankTab = await screen.findByRole("link", { name: "Bank" });
-    expect(bankTab).toHaveAttribute(
-      "href",
-      expect.stringContaining("/companies/acme-aps/bank"),
-    );
+    expect(await screen.findByRole("link", { name: "Penge og bilag" })).toHaveAttribute("href", expect.stringContaining("/companies/acme-aps/bank"));
   });
 
   test("the fiscal-year selector reloads for the chosen year", async () => {
@@ -56,7 +85,7 @@ describe("JournalView — Posteringer", () => {
     renderView();
     const select = await screen.findByLabelText("Vælg regnskabsår");
     await userEvent.selectOptions(select, "2025");
-    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
     const lastUrl = String(calls[calls.length - 1]![0]);
     expect(lastUrl).toContain("year=2025");
   });
@@ -84,10 +113,10 @@ describe("JournalView — Posteringer", () => {
       path: "/companies/:slug/posteringer",
     });
     // The filter banner names the account.
-    expect(await screen.findByText("Bank")).toBeInTheDocument();
+    expect(await screen.findByText(/Posteringer på konto/)).toHaveTextContent("Bank");
     expect(screen.getByText("55000")).toBeInTheDocument();
     // The fetch carried the account param.
-    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
     expect(calls.some((c) => String(c[0]).includes("account=55000"))).toBe(
       true,
     );

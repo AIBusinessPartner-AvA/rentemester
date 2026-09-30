@@ -19,6 +19,8 @@
 // clear, source-shaped error; postOpeningBalance is the backstop.
 
 import { dirname } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, unlinkSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { postOpeningBalance } from "../opening-balance";
 import { isValidIsoDate } from "../dates";
@@ -31,8 +33,12 @@ import {
   checkRollForward,
   describeRollForward,
   parseArchiveYears,
+  type RollForwardResult,
 } from "./dinero-archive";
-import { ingestDineroBilag } from "./dinero-bilag";
+import { ingestDineroBilag, planDineroBilag } from "./dinero-bilag";
+import { insertAuditLog } from "../actor";
+import { recordMigrationOpenItemBatch } from "../migration-open-items";
+import { importedScheduleBalanceOre, recordImportedReceivableSchedule, validateImportedReceivableSchedule } from "../imported-receivables";
 import type {
   ImportOptions,
   ImportResult,
@@ -43,6 +49,11 @@ import type {
 } from "./types";
 
 const IMPORT_RULE = "DK-BOOKKEEPING-BALANCED-001";
+
+/** Test-only deterministic fault boundary for the atomic Dinero v4 landing. */
+export const dineroImportFaults: Partial<Record<"archive" | "document" | "link" | "audit" | "verify" | "publish", () => void>> = {};
+function dineroFault(point: keyof typeof dineroImportFaults) { dineroImportFaults[point]?.(); }
+function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 
 /**
  * Validates and posts a normalised `ImportSource` as the company's
@@ -374,10 +385,214 @@ export function runImport(db: Database, source: ImportSource, options: ImportOpt
       if (!withProposals.ok) throw new ImportRollback(withProposals);
       if (options.dryRun) throw new ImportRollback({ ...withProposals, dryRun: true });
       return withProposals;
-    }, { immediate: true })();
+    }).immediate();
   } catch (error) {
     if (error instanceof ImportRollback) return error.result;
     throw error;
+  }
+}
+
+/** Persist the immutable v4 provenance rows.  This deliberately runs only after
+ * all source parsing and cross-file planning has succeeded. */
+function persistDineroEvidence(db: Database, resolved: MultiArtifactSource, source: ImportSource, options: ImportOptions, outcome: "accepted" | "rejected", result: ImportResult): { attemptId: number; inventoryId: number; sourceId: number } {
+  const evidence = resolved.sourceEvidence;
+  const raw = evidence.rawSha256 ?? evidence.canonicalInventorySha256;
+  const rawSize = evidence.rawSize ?? evidence.totalUncompressedBytes;
+  const listing = evidence.canonicalListingSha256 ?? evidence.canonicalInventorySha256;
+  const listingCount = evidence.listingEntryCount ?? evidence.importedEntryCount;
+  let sourceRow = db.query("SELECT id FROM dinero_import_sources WHERE raw_sha256 = ?").get(raw) as { id: number } | null;
+  if (!sourceRow) {
+    const inserted = db.query("INSERT INTO dinero_import_sources (raw_sha256, raw_size_bytes, canonical_listing_sha256, canonical_listing_count) VALUES (?, ?, ?, ?)").run(raw, rawSize, listing, listingCount);
+    sourceRow = { id: Number(inserted.lastInsertRowid) };
+  }
+  const inv = db.query("INSERT INTO dinero_import_inventories (source_id, source_raw_sha256, canonical_listing_sha256, canonical_listing_count, entry_count, total_size_bytes) VALUES (?, ?, ?, ?, ?, ?)").run(sourceRow.id, raw, listing, listingCount, evidence.importedEntryCount, evidence.totalUncompressedBytes);
+  const inventoryId = Number(inv.lastInsertRowid);
+  const addEntry = db.query("INSERT INTO dinero_import_inventory_entries (inventory_id, entry_path, entry_size_bytes, entry_sha256) VALUES (?, ?, ?, ?)");
+  for (const entry of evidence.entries) addEntry.run(inventoryId, entry.path, entry.size, entry.sha256);
+  const attempt = db.query("INSERT INTO dinero_import_attempts (inventory_id, source_id, source_raw_sha256, parser_contract, actor, cutover_date, outcome, result_sha256) VALUES (?, ?, ?, 'dinero-v4', ?, ?, ?, ?)")
+    .run(inventoryId, sourceRow.id, raw, options.createdBy ?? "system", source.cutOverDate, outcome, digest(result));
+  return { attemptId: Number(attempt.lastInsertRowid), inventoryId, sourceId: sourceRow.id };
+}
+
+function planMigrationOpenItemControls(db: Database, source: ImportSource): {
+  balances: NonNullable<ImportSource["openItemControlBalances"]>;
+  receivableAmount: number;
+  payableAmount: number;
+  errors: string[];
+} {
+  const balances = Array.isArray(source.openItemControlBalances) ? source.openItemControlBalances : [];
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  let receivableOre = 0n;
+  let payableOre = 0n;
+  for (const balance of balances) {
+    const accountNo = balance.accountNo?.trim() ?? "";
+    if (!accountNo || seen.has(accountNo)) {
+      errors.push(`migration open-item control repeats or omits account '${accountNo}'`);
+      continue;
+    }
+    seen.add(accountNo);
+    if (balance.kind !== "receivable" && balance.kind !== "payable") {
+      errors.push(`migration open-item control ${accountNo} has an invalid kind`);
+      continue;
+    }
+    if (!Number.isFinite(balance.amount) || toOre(balance.amount) <= 0n) {
+      errors.push(`migration open-item control ${accountNo} needs a positive amount`);
+      continue;
+    }
+    if (!balance.sourceReference?.trim()) {
+      errors.push(`migration open-item control ${accountNo} needs a source reference`);
+      continue;
+    }
+    const row = db.query(
+      `SELECT COALESCE(SUM(jl.debit_amount - jl.credit_amount), 0) AS balance
+         FROM journal_lines jl
+         JOIN journal_entries je ON je.id = jl.journal_entry_id AND je.status = 'posted'
+         JOIN accounts account ON account.id = jl.account_id
+        WHERE account.account_no = ?`,
+    ).get(accountNo) as { balance: number };
+    const expected = balance.kind === "receivable" ? toOre(balance.amount) : -toOre(balance.amount);
+    const actual = toOre(Number(row.balance));
+    if (actual !== expected) {
+      errors.push(`migration open-item control ${accountNo} does not reconcile to the imported ledger in øre (${actual} != ${expected})`);
+      continue;
+    }
+    if (balance.kind === "receivable") receivableOre += toOre(balance.amount);
+    else payableOre += toOre(balance.amount);
+  }
+  return {
+    balances,
+    receivableAmount: Number(receivableOre) / 100,
+    payableAmount: Number(payableOre) / 100,
+    errors,
+  };
+}
+
+/** Dinero is a whole-export import, not three independent best-effort imports.
+ * The old generic path remains untouched for every other source parser. */
+function runDineroV4(db: Database, resolved: MultiArtifactSource, source: ImportSource, options: ImportOptions): ImportResult {
+  const preflight = preflightDineroArchive(db, resolved, source);
+  const bilagErrors = planDineroBilag(resolved, (source.historicalEntries ?? []).map((entry) => entry.voucherRef ?? "").filter(Boolean));
+  const hasReceipts = Object.keys(resolved.files).some((name) =>
+    /^(\d{4}\/(?:Bilag|Faktura)|Ikke-bogførte-bilag)\//i.test(name),
+  );
+  const root = companyRootFor(db, options);
+  if (preflight.errors.length || bilagErrors.length || (hasReceipts && !root)) {
+    return { ok: false, sourceSystem: "dinero", cutOverDate: source.cutOverDate, openingBalanceLineCount: source.openingBalances.length, historicalEntriesSkipped: source.historicalEntries?.length ?? 0, auditTrail: ["Dinero v4 planning rejected before mutation"], appliedRules: [IMPORT_RULE], errors: [...preflight.errors, ...bilagErrors, ...(hasReceipts && !root ? ["receipt-bearing Dinero import requires a resolvable company root"] : [])] };
+  }
+  const raw = resolved.sourceEvidence.rawSha256 ?? resolved.sourceEvidence.canonicalInventorySha256;
+  const existingAccepted = db.query("SELECT id FROM dinero_import_attempts WHERE source_raw_sha256 = ? AND outcome = 'accepted' LIMIT 1").get(raw);
+  if (existingAccepted) return { ok: false, sourceSystem: "dinero", cutOverDate: source.cutOverDate, openingBalanceLineCount: source.openingBalances.length, historicalEntriesSkipped: source.historicalEntries?.length ?? 0, auditTrail: ["Dinero v4 import already accepted for this immutable source"], appliedRules: [IMPORT_RULE], errors: ["already-imported"] };
+
+  // A legacy archive has no immutable v4 ownership. Never silently attach new
+  // evidence to it: that would make changed history look accepted.
+  const years = parseArchiveYears(resolved);
+  if (years.ok) {
+    for (const year of years.years) {
+      const legacy = db.query("SELECT id FROM import_archive_years WHERE source_system = 'dinero' AND fiscal_year = ?").get(year.fiscalYear);
+      if (legacy) return { ok: false, sourceSystem: "dinero", cutOverDate: source.cutOverDate, openingBalanceLineCount: source.openingBalances.length, historicalEntriesSkipped: source.historicalEntries?.length ?? 0, auditTrail: ["Dinero v4 planning rejected legacy archive collision"], appliedRules: [IMPORT_RULE], errors: [`legacy archive already exists for fiscal year ${year.fiscalYear}`] };
+    }
+  }
+  const createdPaths: string[] = [];
+  let bilagOutcome: ReturnType<typeof ingestDineroBilag> | undefined;
+  let result: ImportResult | undefined;
+  try {
+    result = db.transaction(() => {
+      const landed = runImportImpl(db, source, options);
+      if (!landed.ok) throw new ImportRollback(landed);
+      const openItems = planMigrationOpenItemControls(db, source);
+      if (openItems.errors.length > 0) throw new Error(openItems.errors.join("; "));
+      const controlDate=(source.historicalEntries??[]).reduce((latest,entry)=>entry.transactionDate>latest?entry.transactionDate:latest,source.cutOverDate);
+      if (source.importedReceivableSchedule) {
+        const schedule = validateImportedReceivableSchedule(source.importedReceivableSchedule, controlDate);
+        if (!schedule.ok) throw new Error(schedule.errors.join("; "));
+        const receivableControls=openItems.balances.filter(balance=>balance.kind==="receivable");
+        for (const balance of receivableControls) {
+          if (importedScheduleBalanceOre(schedule.schedule,controlDate,balance.accountNo)!==toOre(balance.amount)) throw new Error(`imported receivable schedule does not reconcile exactly to control ${balance.accountNo} at ${controlDate}`);
+        }
+        const scheduledControls=new Set(schedule.schedule.invoices.map(invoice=>invoice.controlAccountNo));
+        for (const accountNo of scheduledControls) if (!receivableControls.some(balance=>balance.accountNo===accountNo)) throw new Error(`imported receivable schedule control ${accountNo} has no authoritative receivable control balance`);
+      }
+      if (openItems.balances.length > 0) {
+        landed.migrationOpenItems = {
+          batchCount: openItems.balances.length,
+          receivableAmount: openItems.receivableAmount,
+          payableAmount: openItems.payableAmount,
+        };
+        for (const balance of openItems.balances) {
+          landed.auditTrail.push(`Preserve unallocated ${balance.kind} control ${balance.accountNo} from ${balance.sourceReference}: ${balance.amount}`);
+        }
+      }
+      if (options.dryRun) throw new ImportRollback({ ...landed, dryRun: true });
+      dineroFault("archive");
+      const archive = archiveDineroYears(db, resolved);
+      if (!archive.ok) throw new Error(archive.errors.join("; "));
+      landed.auditTrail.push(...archive.auditTrail, ...describeRollForward(preflight.rollForward!));
+      if (root) {
+        dineroFault("document");
+        dineroFault("publish");
+        const bilag = ingestDineroBilag(db, root, resolved, landed);
+        bilagOutcome = bilag;
+        createdPaths.push(...bilag.publishedPaths);
+        if (!bilag.ok) throw new Error(bilag.errors.join("; "));
+        dineroFault("link");
+        landed.bilag = { linkedCount: bilag.linked.length, unmatchedCount: bilag.unmatched.length, duplicateCount: bilag.duplicates.length, unbookedCount: bilag.unbooked.length };
+      }
+      const provenance = persistDineroEvidence(db, resolved, source, options, "accepted", landed);
+      if (source.importedReceivableSchedule) {
+        const recordedSchedule = recordImportedReceivableSchedule(db, provenance.attemptId, source.importedReceivableSchedule, controlDate);
+        if (!recordedSchedule.ok) throw new Error(recordedSchedule.errors.join("; "));
+        landed.auditTrail.push(`Recorded immutable imported receivable schedule ${recordedSchedule.scheduleHash}`);
+      }
+      for (const balance of openItems.balances) {
+        const recorded = recordMigrationOpenItemBatch(db, {
+          dineroImportAttemptId: provenance.attemptId,
+          controlAccountNo: balance.accountNo,
+          kind: balance.kind,
+          sourceControlAmount: balance.amount,
+          items: [{
+            externalRef: `UNALLOCATED:${balance.accountNo}`,
+            originalAmount: balance.amount,
+            openAmountAtImport: balance.amount,
+            sourceKind: "control_balance",
+            resolutionStatus: "unallocated",
+          }],
+        });
+        if (!recorded.ok) throw new Error(recorded.errors.join("; "));
+      }
+      if (bilagOutcome) {
+        const addLink = db.query("INSERT INTO dinero_import_document_links (attempt_id, inventory_id, entry_path, entry_sha256, document_id, journal_entry_id, voucher_reference, disposition) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        for (const item of bilagOutcome.linked) addLink.run(provenance.attemptId, provenance.inventoryId, item.fileName, item.sha256, item.documentId, item.journalEntryId, item.voucherRef, "linked");
+        for (const item of bilagOutcome.unmatched) {
+          const artifact = resolved.files[item.fileName]!;
+          const document = db.query("SELECT id, sha256_hash FROM documents WHERE sha256_hash = ?").get(createHash("sha256").update(artifact.bytes).digest("hex")) as { id: number; sha256_hash: string };
+          addLink.run(provenance.attemptId, provenance.inventoryId, item.fileName, document.sha256_hash, document.id, null, item.voucherRef, "unmatched");
+        }
+        for (const item of bilagOutcome.unbooked) addLink.run(provenance.attemptId, provenance.inventoryId, item.fileName, item.sha256, item.documentId, null, null, "excluded");
+      }
+      for (const year of years.years) {
+        const yearEntries = resolved.sourceEvidence.entries.filter((entry) => entry.path.startsWith(`${year.fiscalYear}/`));
+        db.query("INSERT INTO dinero_import_archive_evidence (attempt_id, inventory_id, source_id, source_raw_sha256, fiscal_year, archive_sha256, archive_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)")
+          .run(provenance.attemptId, provenance.inventoryId, provenance.sourceId, raw, year.fiscalYear, digest(yearEntries), yearEntries.reduce((sum, entry) => sum + entry.size, 0));
+      }
+      dineroFault("audit");
+      insertAuditLog(db, { eventType: "dinero_import_accepted", entityType: "import", entityId: provenance.attemptId, message: `Accepted immutable Dinero v4 import ${raw}`, createdBy: options.createdBy, createdByProgram: options.createdByProgram });
+      dineroFault("verify");
+      // Provenance is per source artifact, not per newly-created document.
+      // A pre-existing content-addressed receipt still needs its immutable
+      // evidence row and must not make this verifier undercount.
+      const expectedDocs = landed.bilag ? landed.bilag.linkedCount + landed.bilag.unmatchedCount + landed.bilag.unbookedCount : 0;
+      if (expectedDocs > 0 && (db.query("SELECT COUNT(*) AS n FROM dinero_import_document_links WHERE attempt_id = ?").get(provenance.attemptId) as { n: number }).n !== expectedDocs) throw new Error("Dinero v4 verifier: provenance document-link count mismatch");
+      if ((db.query("SELECT COUNT(*) AS n FROM migration_open_item_batches WHERE dinero_import_attempt_id = ?").get(provenance.attemptId) as { n: number }).n !== openItems.balances.length) throw new Error("Dinero v4 verifier: migration open-item batch count mismatch");
+      return landed;
+    }).immediate();
+    return result;
+  } catch (error) {
+    for (const path of createdPaths) { try { if (existsSync(path)) unlinkSync(path); } catch {} }
+    if (error instanceof ImportRollback) return error.result;
+    const rejected: ImportResult = { ok: false, sourceSystem: "dinero", cutOverDate: source.cutOverDate, openingBalanceLineCount: source.openingBalances.length, historicalEntriesSkipped: source.historicalEntries?.length ?? 0, auditTrail: ["Dinero v4 transaction rolled back"], appliedRules: [IMPORT_RULE], errors: [error instanceof Error ? error.message : String(error)] };
+    try { db.transaction(() => { persistDineroEvidence(db, resolved, source, options, "rejected", rejected); }).immediate(); } catch (recordError) { rejected.errors.push(`rejected-attempt evidence could not be recorded: ${recordError instanceof Error ? recordError.message : String(recordError)}`); }
+    return rejected;
   }
 }
 
@@ -445,9 +660,14 @@ export function runImportFromSource(
   if (!parsed.ok || !parsed.source) {
     return failParse(parsed.errors, resolved);
   }
+  let archivePreflight: RollForwardResult | undefined;
   if (parser.system === "dinero" && typeof parser.parseSource === "function") {
-    const archivePreflightErrors = preflightDineroArchive(db, resolved, parsed.source);
-    if (archivePreflightErrors.length > 0) return failParse(archivePreflightErrors, resolved);
+    const preflight = preflightDineroArchive(db, resolved, parsed.source);
+    archivePreflight = preflight.rollForward;
+    if (preflight.errors.length > 0) return failParse(preflight.errors, resolved);
+    const atomic = runDineroV4(db, resolved, parsed.source as ImportSource, options);
+    if (resolved.archiveIntegrity) atomic.archiveIntegrity = resolved.archiveIntegrity;
+    return atomic;
   }
   const result = runImport(db, parsed.source as ImportSource, options);
   if (resolved.archiveIntegrity) result.archiveIntegrity = resolved.archiveIntegrity;
@@ -459,7 +679,7 @@ export function runImportFromSource(
   // roll-forward consistency into the next year's opening balance. Archiving
   // is purely additive: it never affects whether the ledger import succeeded.
   if (result.ok && !result.dryRun && parser.system === "dinero" && typeof parser.parseSource === "function") {
-    archivePreCutOverYears(db, resolved, result);
+    archivePreCutOverYears(db, resolved, result, archivePreflight);
     // --- bilag (receipts) ingest (#196) ------------------------------------
     // A Dinero export ships the actual receipts. Ingest each cut-over-year
     // bilag through the documents pipeline, link it to its voucher's journal
@@ -476,9 +696,9 @@ function preflightDineroArchive(
   db: Database,
   resolved: MultiArtifactSource,
   source: ImportSource,
-): string[] {
+): { errors: string[]; rollForward?: RollForwardResult } {
   const parsed = parseArchiveYears(resolved);
-  if (!parsed.ok) return parsed.errors.map((error) => `archive integrity failure: ${error}`);
+  if (!parsed.ok) return { errors: parsed.errors.map((error) => `archive integrity failure: ${error}`) };
   const closingBalances = new Map<number, Map<string, number>>(
     parsed.years.map((year) => [
       year.fiscalYear,
@@ -490,15 +710,23 @@ function preflightDineroArchive(
       .filter((account) => account.normalizedType)
       .map((account) => [account.accountNo, account.normalizedType!] as const),
   );
-  const rollForward = checkRollForward(db, resolved, { closingBalances, accountTypes });
-  if (rollForward.ok) return [];
-  return [
+  const accountNames = new Map(
+    source.chartOfAccounts.map((account) => [account.accountNo, account.name] as const),
+  );
+  const rollForward = checkRollForward(db, resolved, {
+    closingBalances,
+    accountTypes,
+    accountNames,
+    accountRoleProposals: source.accountRoleProposals,
+  });
+  if (rollForward.ok) return { errors: [], rollForward };
+  return { rollForward, errors: [
     ...rollForward.errors.map((error) => `roll-forward integrity failure: ${error}`),
     ...rollForward.breaks.map(
       (item) =>
         `roll-forward integrity failure: account ${item.accountNo} ${item.fromYear}->${item.toYear} closing ${item.closingAmount} != opening ${item.openingAmount}`,
     ),
-  ];
+  ] };
 }
 
 /**
@@ -559,6 +787,7 @@ function archivePreCutOverYears(
   db: Database,
   resolved: MultiArtifactSource,
   result: ImportResult,
+  preflight?: RollForwardResult,
 ): void {
   const archive = archiveDineroYears(db, resolved);
   for (const line of archive.auditTrail) result.auditTrail.push(line);
@@ -568,7 +797,7 @@ function archivePreCutOverYears(
     }
     return;
   }
-  const rollForward = checkRollForward(db, resolved);
+  const rollForward = preflight ?? checkRollForward(db, resolved);
   for (const line of describeRollForward(rollForward)) result.auditTrail.push(line);
   if (!rollForward.ok) {
     result.auditTrail.push(

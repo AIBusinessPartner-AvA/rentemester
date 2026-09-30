@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { writeFileAtomic } from "./atomic-file";
 import { companyPaths } from "./paths";
+import { openLedgerReadOnly } from "./ledger-inspection";
 
 /**
  * Workspace model.
@@ -11,9 +12,8 @@ import { companyPaths } from "./paths";
  * Rentemester company directory (a `data/ledger.sqlite` plus the usual
  * `companyPaths` subdirs).
  *
- * The company directories are the source of truth: a `workspace.json` manifest
- * in the root is a lightweight index (slug, display name, createdAt, archived).
- * A present-but-unlisted directory can be adopted into the manifest.
+ * `workspace.json` is authoritative. A directory is not a workspace company
+ * until an explicit write registers it in the manifest.
  *
  * This module is intentionally pure filesystem + JSON: the later cockpit API
  * (#170) and MCP tools (#172) call these same functions.
@@ -21,7 +21,10 @@ import { companyPaths } from "./paths";
 
 export const WORKSPACE_MANIFEST_FILE = "workspace.json";
 
-const MANIFEST_VERSION = 1 as const;
+const MANIFEST_VERSION = 2 as const;
+const LEGACY_MANIFEST_VERSION = 1 as const;
+
+export type WorkspaceCompanyPurpose = "live" | "test" | "dry-run" | "restore" | "backup" | "retest" | "baseline";
 
 export type WorkspaceCompanyEntry = {
   /** Filesystem-safe identifier; the subdirectory name under the workspace. */
@@ -32,6 +35,8 @@ export type WorkspaceCompanyEntry = {
   createdAt: string;
   /** Soft-deletion flag; archived companies stay on disk. */
   archived: boolean;
+  /** `live` is the backwards-compatible default for pre-purpose manifests. */
+  purpose?: WorkspaceCompanyPurpose;
 };
 
 export type WorkspaceManifest = {
@@ -117,6 +122,95 @@ function emptyManifest(): WorkspaceManifest {
   return { version: MANIFEST_VERSION, companies: [] };
 }
 
+function purposeOf(entry: WorkspaceCompanyEntry): WorkspaceCompanyPurpose {
+  return entry.purpose ?? "live";
+}
+
+const PURPOSES = new Set<WorkspaceCompanyPurpose>(["live", "test", "dry-run", "restore", "backup", "retest", "baseline"]);
+
+/** Normalizes a CVR/VAT identifier for comparison without exposing it. */
+export function normalizeCompanyCvr(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let normalized = value.trim().toUpperCase();
+  if (normalized.startsWith("DK")) normalized = normalized.slice(2);
+  return /^\d{8}$/.test(normalized) ? `DK${normalized}` : null;
+}
+
+export type CanonicalLiveCompany = { entry: WorkspaceCompanyEntry; companyRoot: string; cvr: string };
+export type CanonicalLiveCompanyReasonCode =
+  | "WORKSPACE_COMPANY_NOT_LIVE"
+  | "WORKSPACE_COMPANY_ARCHIVED"
+  | "WORKSPACE_LIVE_COMPANY_LEDGER_UNAVAILABLE"
+  | "WORKSPACE_LIVE_COMPANY_IDENTITY_MISSING"
+  | "WORKSPACE_DUPLICATE_LEGAL_IDENTITY";
+export type CanonicalLiveCompanyDiagnostic = {
+  slug: string;
+  reasonCode: CanonicalLiveCompanyReasonCode;
+};
+export type CanonicalLiveCompanyResolution = {
+  companies: CanonicalLiveCompany[];
+  excluded: CanonicalLiveCompanyDiagnostic[];
+  blockers: CanonicalLiveCompanyDiagnostic[];
+};
+
+export class WorkspaceCanonicalityError extends Error {
+  readonly diagnostics: CanonicalLiveCompanyDiagnostic[];
+
+  constructor(diagnostics: CanonicalLiveCompanyDiagnostic[]) {
+    super(diagnostics.map((item) => `${item.reasonCode}:${item.slug}`).join(","));
+    this.name = "WorkspaceCanonicalityError";
+    this.diagnostics = diagnostics;
+  }
+}
+
+/**
+ * The single read-only authority for companies which may participate in a
+ * workspace-wide live surface. It never creates, migrates, renames or adopts.
+ */
+export function resolveCanonicalLiveCompanies(workspaceRoot: string): CanonicalLiveCompanyResolution {
+  const candidates = listWorkspaceCompanies(workspaceRoot).slice().sort((a, b) => a.slug.localeCompare(b.slug));
+  const excluded: CanonicalLiveCompanyDiagnostic[] = [];
+  const blockers: CanonicalLiveCompanyDiagnostic[] = [];
+  const valid: CanonicalLiveCompany[] = [];
+  for (const entry of candidates) {
+    if (entry.archived) { excluded.push({ slug: entry.slug, reasonCode: "WORKSPACE_COMPANY_ARCHIVED" }); continue; }
+    if (purposeOf(entry) !== "live") { excluded.push({ slug: entry.slug, reasonCode: "WORKSPACE_COMPANY_NOT_LIVE" }); continue; }
+    const companyRoot = companyRootForSlug(workspaceRoot, entry.slug);
+    try {
+      const db = openLedgerReadOnly(companyPaths(companyRoot).db);
+      let cvr: string | null;
+      try { cvr = normalizeCompanyCvr((db.query("SELECT cvr FROM companies ORDER BY id ASC LIMIT 1").get() as { cvr?: unknown } | null)?.cvr); }
+      finally { db.close(); }
+      if (!cvr) { blockers.push({ slug: entry.slug, reasonCode: "WORKSPACE_LIVE_COMPANY_IDENTITY_MISSING" }); continue; }
+      valid.push({ entry: { ...entry, purpose: purposeOf(entry) }, companyRoot, cvr });
+    } catch { blockers.push({ slug: entry.slug, reasonCode: "WORKSPACE_LIVE_COMPANY_LEDGER_UNAVAILABLE" }); }
+  }
+  const duplicateCvrs = new Set<string>();
+  const seen = new Set<string>();
+  for (const item of valid) { if (seen.has(item.cvr)) duplicateCvrs.add(item.cvr); seen.add(item.cvr); }
+  const companies = valid.filter((item) => {
+    if (!duplicateCvrs.has(item.cvr)) return true;
+    blockers.push({ slug: item.entry.slug, reasonCode: "WORKSPACE_DUPLICATE_LEGAL_IDENTITY" });
+    return false;
+  });
+  const ordered = (items: CanonicalLiveCompanyDiagnostic[]) => items.sort(
+    (a, b) => a.slug.localeCompare(b.slug) || a.reasonCode.localeCompare(b.reasonCode),
+  );
+  return { companies, excluded: ordered(excluded), blockers: ordered(blockers) };
+}
+
+/** Returns the canonical live set or fails the whole discovery read safely. */
+export function requireCanonicalLiveCompanies(workspaceRoot: string): CanonicalLiveCompany[] {
+  const resolution = resolveCanonicalLiveCompanies(workspaceRoot);
+  const fatal = resolution.blockers.filter(
+    (item) => item.reasonCode !== "WORKSPACE_LIVE_COMPANY_IDENTITY_MISSING",
+  );
+  if (fatal.length > 0) {
+    throw new WorkspaceCanonicalityError(fatal);
+  }
+  return resolution.companies;
+}
+
 function sortedManifest(manifest: WorkspaceManifest): WorkspaceManifest {
   return {
     version: MANIFEST_VERSION,
@@ -140,17 +234,28 @@ export function loadWorkspaceManifest(workspaceRoot: string): WorkspaceManifest 
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as any).companies)) {
     throw new Error(`workspace manifest at ${path} is malformed`);
   }
-  if ((parsed as any).version !== MANIFEST_VERSION) {
+  const parsedVersion = (parsed as any).version;
+  if (parsedVersion !== MANIFEST_VERSION && parsedVersion !== LEGACY_MANIFEST_VERSION) {
     throw new Error(
-      `workspace manifest at ${path} has unsupported version ${(parsed as any).version}; expected ${MANIFEST_VERSION}`,
+      `workspace manifest at ${path} has unsupported version ${parsedVersion}; expected ${MANIFEST_VERSION}`,
     );
   }
-  const companies: WorkspaceCompanyEntry[] = (parsed as any).companies.map((raw: any) => ({
-    slug: String(raw.slug),
-    name: String(raw.name),
-    createdAt: String(raw.createdAt),
-    archived: Boolean(raw.archived),
-  }));
+  const companies: WorkspaceCompanyEntry[] = (parsed as any).companies.map((raw: any) => {
+    if (parsedVersion === LEGACY_MANIFEST_VERSION && raw.purpose !== undefined) {
+      throw new Error("workspace manifest purpose requires version 2");
+    }
+    const purpose = raw.purpose === undefined ? "live" : raw.purpose;
+    if (!PURPOSES.has(purpose)) {
+      throw new Error(`workspace manifest has unsupported company purpose`);
+    }
+    return {
+      slug: String(raw.slug),
+      name: String(raw.name),
+      createdAt: String(raw.createdAt),
+      archived: Boolean(raw.archived),
+      purpose,
+    };
+  });
   return { version: MANIFEST_VERSION, companies };
 }
 
@@ -189,6 +294,15 @@ export function findWorkspaceCompany(
   return listWorkspaceCompanies(workspaceRoot).find((c) => c.slug === slug) ?? null;
 }
 
+/** Manifest-only routing check; never opens, discovers or adopts a directory. */
+export function findRoutableWorkspaceCompany(
+  workspaceRoot: string,
+  slug: string,
+): WorkspaceCompanyEntry | null {
+  const entry = findWorkspaceCompany(workspaceRoot, slug);
+  return entry && purposeOf(entry) === "live" ? entry : null;
+}
+
 /** The absolute company directory for `slug` (whether or not it exists). */
 export function companyRootForSlug(workspaceRoot: string, slug: string): string {
   assertValidSlug(slug);
@@ -217,6 +331,9 @@ export function registerWorkspaceCompany(
   entry: WorkspaceCompanyEntry,
 ): WorkspaceCompanyEntry {
   assertValidSlug(entry.slug);
+  if (entry.purpose !== undefined && !PURPOSES.has(entry.purpose)) {
+    throw new Error("workspace company purpose is unsupported");
+  }
   const manifest = loadWorkspaceManifest(workspaceRoot);
   if (manifest.companies.some((c) => c.slug === entry.slug)) {
     throw new Error(`virksomheden med slug '${entry.slug}' er allerede registreret i workspacet`);
@@ -291,6 +408,7 @@ export function registerCompanyDirIntoWorkspace(
     name,
     createdAt: options?.createdAt ?? new Date().toISOString(),
     archived: false,
+    purpose: "live",
   });
   return { status: "registered", slug };
 }
@@ -322,6 +440,7 @@ export function adoptCompanyDir(
     name,
     createdAt: options?.createdAt ?? new Date().toISOString(),
     archived: false,
+    purpose: "live",
   });
 }
 
@@ -372,10 +491,7 @@ export function setWorkspaceCompanyArchived(
 
 function readCompanyName(dbPath: string): string | null {
   try {
-    // Lazy import keeps the module dependency-light for callers that only
-    // need the pure manifest helpers.
-    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
-    const db = new Database(dbPath, { readonly: true });
+    const db = openLedgerReadOnly(dbPath);
     try {
       const row = db.query("SELECT name FROM companies ORDER BY id ASC LIMIT 1").get() as
         | { name: string }

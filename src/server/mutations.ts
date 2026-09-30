@@ -24,17 +24,16 @@
 // `{ ok, errors }` result; a business rejection (`ok:false`) is mapped to a
 // 400/409 `ApiError`, never a 500.
 
-import { existsSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { migrate, openDb } from "../core/db";
-import { companyPaths } from "../core/paths";
 import type { ActorContext } from "../core/actor";
 import { evaluateBackupLock } from "../core/backup-governance";
-import { findWorkspaceCompany, companyRootForSlug } from "../core/workspace";
+import { resolveWorkspaceCompany } from "../core/workspace-company-resolver";
 import type { ServerConfig } from "./config";
 import { ApiError } from "./errors";
-import { authMiddleware, type Principal } from "./auth";
+import type { Principal } from "./auth";
 import { resolveCockpitActor } from "./actor";
+import { executeLocalIdempotentMutation, IdempotencyError, RETRY_CLASS_BY_OPERATION, validateIdempotencyKey, withoutIdempotencyTransportFields, type StablePrincipal } from "../core/idempotency";
 
 /**
  * The context handed to a write handler once every gate has passed:
@@ -50,6 +49,11 @@ export type MutationContext = {
 
 /** A core-style business result — what `resolveException` and friends return. */
 export type CoreResult = { ok: boolean; errors?: string[] };
+
+function httpMutationOperation(request: Request): string {
+  const path = new URL(request.url).pathname.replace(/\/companies\/[^/]+/g, "/companies/:company");
+  return `${request.method.toUpperCase()} ${path}`;
+}
 
 export type WithCompanyMutationOptions = {
   /**
@@ -67,6 +71,11 @@ export type WithCompanyMutationOptions = {
    * body is a tiny JSON object (slice 1's resolve-exception) leave this off.
    */
   maxBodyBytes?: number;
+  keyIdempotent?: keyof typeof RETRY_CLASS_BY_OPERATION;
+  /** Require a receipt key for this operation instead of allowing unkeyed writes. */
+  requireIdempotencyKey?: boolean;
+  /** Canonical transport-neutral DTO used for durable retry identity. */
+  idempotencyPayload?: (body: Record<string, unknown>) => Record<string, unknown>;
 };
 
 /**
@@ -143,18 +152,23 @@ const LOOPBACK_ORIGIN_HOSTNAMES = new Set([
  *
  *   - manglende Origin → tilladt (CLI/curl/MCP/ikke-browser-klienter);
  *   - loopback-origin  → tilladt på ENHVER port: produktion serverer SPA'en
- *                        fra samme loopback-server, og vite-dev kører på
+ *                        fra samme loopback-server, og Bun-dev kører på
  *                        http://localhost:5319 og proxy'er `/api` videre
- *                        (app/vite.config.ts) med Origin-headeren intakt;
+ *                        (app/scripts/serve.ts) med Origin-headeren intakt;
  *   - alt andet        → afvist med stabil subcode FORBIDDEN_ORIGIN. Det
  *                        dækker også `Origin: null` (sandboxed iframe).
  *
- * Når auth ER slået til, træder gaten til side ligesom localhost-gaten: dér
- * er bearer-tokenet i `authMiddleware` gaten (et cross-site angreb kan ikke
- * sætte Authorization-headeren i en simple request), og en legitim
- * fjern-deployment har netop en ikke-loopback Origin.
+ * I lokal/shared-secret drift er en manglende Origin fortsat den eksplicitte
+ * CLI/MCP-kontrakt. Hosted Better Auth er anderledes: cookie-sessioner kan
+ * sendes af browseren uden en Authorization-header, så alle unsafe custom API
+ * calls skal komme fra en valideret `trustedOrigins`-origin. Better Auth
+ * beskytter kun `/api/auth/*`, ikke disse routes.
  */
 export function assertMutationOriginAllowed(request: Request, config: ServerConfig): void {
+  if (config.betterAuthProvider) {
+    assertHostedMutationOriginAllowed(request, config);
+    return;
+  }
   if (config.authRequired) return;
   const origin = (request.headers.get("origin") ?? "").trim();
   if (origin === "") return;
@@ -175,6 +189,31 @@ export function assertMutationOriginAllowed(request: Request, config: ServerConf
         "loopback-origin (http://localhost, http://127.0.0.1 eller http://[::1]).",
       { subcode: "FORBIDDEN_ORIGIN" },
     );
+  }
+}
+
+/**
+ * Hosted cookie-authenticated mutations have no headerless CLI escape hatch.
+ * A browser supplies Origin; Referer is accepted only as a fallback for
+ * privacy-restricted same-origin browser requests. Both are checked as full
+ * URL origins against the already validated hosted `trustedOrigins` list.
+ */
+export function assertHostedMutationOriginAllowed(request: Request, config: ServerConfig): void {
+  if (!config.betterAuthProvider) return;
+  const trustedOrigins = new Set(config.hostedBetterAuth?.trustedOrigins ?? []);
+  const header = (request.headers.get("origin") ?? "").trim();
+  const referer = (request.headers.get("referer") ?? "").trim();
+  const candidate = header || referer;
+  let origin = "";
+  try {
+    origin = new URL(candidate).origin;
+  } catch {
+    // Missing, malformed and `Origin: null` all fail closed below.
+  }
+  if (!candidate || !trustedOrigins.has(origin)) {
+    throw new ApiError("unauthorized", "missing or invalid credentials", {
+      subcode: "FORBIDDEN_ORIGIN",
+    });
   }
 }
 
@@ -266,21 +305,26 @@ export async function withCompanyMutation<T extends CoreResult>(
   assertMutationOriginAllowed(request, config);
   assertMutationContentType(request);
 
-  // The auth seam already ran once in `handleRequest`; re-running it here is
-  // cheap and yields the typed `Principal` the actor mapper needs without
-  // threading it through every route signature.
-  const principal = authMiddleware(request, config);
+  // Authentication belongs to the router. In Phase 1 actor mapping is fixed,
+  // but keep the request principal explicit so Better Auth can replace that
+  // mapping without re-authenticating or using mutable request-global state.
+  const principal = config.requestPrincipal;
+  if (!principal) {
+    throw ApiError.unauthorized("request authentication context missing");
+  }
 
   // (2) Company resolution. A registered slug whose ledger is missing on disk
   // is a 404 — the same shape the read routes return.
-  if (!findWorkspaceCompany(config.workspaceRoot, slug)) {
+  const target = resolveWorkspaceCompany(config.workspaceRoot, slug, {
+    selection: "registered", archived: "allow", ledger: "required",
+  });
+  if (!target.ok && target.reason !== "LEDGER_MISSING") {
     throw ApiError.notFound(`ingen virksomhed med slug '${slug}' findes i workspacet`);
   }
-  const companyRoot = companyRootForSlug(config.workspaceRoot, slug);
-  const dbPath = companyPaths(companyRoot).db;
-  if (!existsSync(dbPath)) {
+  if (!target.ok) {
     throw ApiError.notFound(`virksomheden '${slug}' har ingen ledger`);
   }
+  const { companyRoot, ledgerDbPath: dbPath } = target.company;
 
   const body = await readMutationBody(request, options.maxBodyBytes);
 
@@ -310,8 +354,25 @@ export async function withCompanyMutation<T extends CoreResult>(
     // (6) Actor resolution — fixed Phase-1 web actor.
     const actor = resolveCockpitActor(principal);
 
-    // (7) Handler.
-    const result = await handler({ db, actor, companyRoot, principal }, body);
+    // (7) Authorization, confirmation, policy and period gates above run for
+    // every call. Only a completed, matching receipt skips the executor.
+    const result = options.keyIdempotent
+      ? (() => {
+          try {
+            const stable: StablePrincipal | undefined = principal.via === "service-principal"
+              ? (principal.serviceAccountId ? { kind: "service-account", subjectId: principal.serviceAccountId } : undefined)
+              : (principal.userId ? { kind: "user", subjectId: principal.userId } : undefined);
+            const key = validateIdempotencyKey(request.headers.get("idempotency-key") ?? body.idempotencyKey);
+            if (!key && options.requireIdempotencyKey) throw new IdempotencyError("IDEMPOTENCY_STORAGE_FAILURE", "idempotency key is required");
+            const run = executeLocalIdempotentMutation(db, { key, operation: options.keyIdempotent, principal: stable, payload: options.idempotencyPayload ? options.idempotencyPayload(body) : withoutIdempotencyTransportFields(body), actor, execute: () => {
+              const value = handler({ db, actor, companyRoot, principal }, body);
+              if (value instanceof Promise) throw new IdempotencyError("IDEMPOTENCY_STORAGE_FAILURE", "key-idempotent HTTP operation must execute synchronously");
+              return value;
+            }});
+            return run.receipt ? Object.assign(run.result, { idempotency: run.receipt }) : run.result;
+          } catch (error) { if (error instanceof IdempotencyError) throw ApiError.conflict(error.message, { subcode: error.code }); throw error; }
+        })()
+      : await handler({ db, actor, companyRoot, principal }, body);
 
     // (8) Business-result map. A core rejection is the caller's fault, not the
     // server's — surface it as a 400 (or 409 for a conflict-shaped message),
@@ -350,6 +411,9 @@ export async function withCompanyMutation<T extends CoreResult>(
 
     return result;
   } finally {
-    db.close();
+    // An HTTP mutation is complete before its response is observable. A
+    // strict close prevents Bun from deferring WAL cleanup until the next
+    // (possibly read-only) request in this long-lived server process.
+    db.close(true);
   }
 }

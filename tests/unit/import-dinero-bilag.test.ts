@@ -14,10 +14,10 @@
 // Tests run against the synthetic fixture in examples/import-dinero/ — the real
 // Dinero export is private and is never committed.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureCompanyDirs } from "../../src/core/paths";
+import { companyPaths, ensureCompanyDirs } from "../../src/core/paths";
 import { openDb, migrate } from "../../src/core/db";
 import { seedAccounts, verifyAuditChain } from "../../src/core/ledger";
 import { resolveSource } from "../../src/core/import/source";
@@ -37,6 +37,55 @@ function freshCompany(prefix: string) {
 }
 
 describe("Dinero bilag ingest (#196)", () => {
+  test("accepts a partial booked-document set because Dinero exports only files that exist", () => {
+    const { root, db } = freshCompany("rentemester-bilag-partial-");
+    const source = mkdtempSync(join(tmpdir(), "rentemester-bilag-partial-source-"));
+    cpSync(FIXTURE, source, { recursive: true });
+    unlinkSync(join(source, "2025", "Bilag", "2025-Bilag-5.pdf"));
+    try {
+      const result = runImportFromSource(db, dineroParser, source, {
+        createdBy: "user:tester",
+        companyRoot: root,
+      });
+      expect(result.ok).toBe(true);
+      expect(result.bilag).toMatchObject({ linkedCount: 4, unmatchedCount: 0 });
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(source, { recursive: true, force: true });
+    }
+  });
+
+  test("ingests and links Dinero Faktura PDFs as issued-invoice artifacts", () => {
+    const { root, db } = freshCompany("rentemester-faktura-link-");
+    const source = mkdtempSync(join(tmpdir(), "rentemester-faktura-source-"));
+    cpSync(FIXTURE, source, { recursive: true });
+    mkdirSync(join(source, "2025", "Faktura"));
+    writeFileSync(join(source, "2025", "Faktura", "2025-Faktura-1.pdf"), "%PDF-1.4\nsynthetic issued invoice\n%%EOF\n");
+    try {
+      const result = runImportFromSource(db, dineroParser, source, {
+        createdBy: "user:tester",
+        companyRoot: root,
+      });
+      expect(result.ok).toBe(true);
+      expect(result.bilag).toMatchObject({ linkedCount: 6, unmatchedCount: 0 });
+      const importedInvoice = db.query(
+        "SELECT document_type, original_filename, stored_path FROM documents WHERE original_filename = '2025-Faktura-1.pdf'",
+      ).get() as { document_type: string; original_filename: string; stored_path: string };
+      expect(importedInvoice.document_type).toBe("issued_invoice_pdf");
+      expect(importedInvoice.original_filename).toBe("2025-Faktura-1.pdf");
+      expect(importedInvoice.stored_path.startsWith(companyPaths(root).invoicesIssued)).toBe(true);
+      expect(db.query(
+        "SELECT voucher_ref FROM import_document_links l JOIN documents d ON d.id = l.document_id WHERE d.original_filename = '2025-Faktura-1.pdf'",
+      ).get()).toEqual({ voucher_ref: "1" });
+      expect(verifyAuditChain(db, { companyRoot: root })).toMatchObject({ ok: true, errors: [] });
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(source, { recursive: true, force: true });
+    }
+  });
+
   test("ingests every cut-over-year bilag with a SHA-256 hash", () => {
     const { root, db } = freshCompany("rentemester-bilag-hash-");
     try {

@@ -9,13 +9,20 @@
 // `requireConfirm: true`.
 
 import {
-  registerPayable as corePayableRegister,
-  payPayableFromBank as corePayablePayFromBank,
+  registerPayableInCurrentTransaction as corePayableRegister,
+  payPayableFromBankInCurrentTransaction as corePayablePayFromBank,
+  payablePayOperationPayload,
 } from "../../core/payables";
 import type { ServerConfig } from "../config";
+import { planDirectBankPurchasePayableCorrection, applyDirectBankPurchasePayableCorrection } from "../../core/direct-bank-purchase-payable-correction";
+import { applyLegacyPayablePaymentBackfill, planLegacyPayablePaymentBackfill } from "../../core/legacy-bank-payable-backfill";
 import { ApiError } from "../errors";
 import { withCockpitActor } from "../actor";
 import { withCompanyMutation } from "../mutations";
+import { openLedgerReadOnly } from "../../core/ledger-inspection";
+import { companyPaths } from "../../core/paths";
+import { companyRootForSlug } from "../../core/workspace";
+import { readJsonBody } from "../router/_shared";
 import {
   okResponse,
   optionalBodyNumber,
@@ -96,10 +103,13 @@ export async function handlePayableRegister(
         entryNo: registered.entryNo,
       };
     },
-    { requireConfirm: true },
+    { requireConfirm: true, keyIdempotent: "payable_register" },
   );
 
   return okResponse({
+    // The shared mutation layer owns the durable receipt. Keep it on the
+    // public response so an HTTP caller can distinguish original from replay.
+    ...("idempotency" in result ? { idempotency: result.idempotency } : {}),
     payable: {
       payableId: result.payableId ?? null,
       documentId: result.documentId ?? null,
@@ -169,10 +179,18 @@ export async function handlePayablePay(
         openBalance: paid.openBalance,
       };
     },
-    { requireConfirm: true },
+    { requireConfirm: true, keyIdempotent: "payable_pay", idempotencyPayload: (body) => payablePayOperationPayload({
+      payableId,
+      bankTransactionId: Number(body.bankTransactionId),
+      amount: typeof body.amount === "number" ? body.amount : undefined,
+      paymentDate: typeof body.paymentDate === "string" ? body.paymentDate : undefined,
+      paymentAccountNo: typeof body.paymentAccountNo === "string" ? body.paymentAccountNo : undefined,
+      note: typeof body.note === "string" ? body.note : undefined,
+    }) },
   );
 
   return okResponse({
+    ...("idempotency" in result ? { idempotency: result.idempotency } : {}),
     payment: {
       paymentId: result.paymentId ?? null,
       journalEntryId: result.journalEntryId ?? null,
@@ -181,3 +199,44 @@ export async function handlePayablePay(
     },
   });
 }
+
+function correctionInput(body: Record<string, unknown>) {
+  const vatTreatmentRaw = optionalBodyString(body, "vatTreatment");
+  if (vatTreatmentRaw !== undefined && !["standard", "exempt", "non_deductible"].includes(vatTreatmentRaw)) {
+    throw ApiError.badRequest("'vatTreatment' must be one of: standard, exempt, non_deductible");
+  }
+  const vatTreatment = vatTreatmentRaw as "standard" | "exempt" | "non_deductible" | undefined;
+  return {
+    documentId: requireBodyPositiveInt(body, "documentId"),
+    bankTransactionId: requireBodyPositiveInt(body, "bankTransactionId"),
+    billDate: requireBodyString(body, "billDate"), dueDate: requireBodyString(body, "dueDate"),
+    expenseAccountNo: requireBodyString(body, "expenseAccountNo"), vatTreatment,
+    vendorId: optionalBodyPositiveInt(body, "vendorId"), note: optionalBodyString(body, "note"),
+  };
+}
+
+export async function handleDirectBankPurchasePayablePlan(config: ServerConfig, request: Request, slug: string): Promise<Response> {
+  const body = await readJsonBody(request);
+  const db = openLedgerReadOnly(companyPaths(companyRootForSlug(config.workspaceRoot, slug)).db);
+  try {
+    const result = planDirectBankPurchasePayableCorrection(db, correctionInput(body));
+    if (!result.ok) throw ApiError.conflict(result.errors.join("; "));
+    return okResponse({ plan: result.plan });
+  } finally {
+    db.close();
+  }
+}
+
+export async function handleDirectBankPurchasePayableApply(config: ServerConfig, request: Request, slug: string): Promise<Response> {
+  const result = await withCompanyMutation(request, config, slug, (ctx, body) => {
+    const stable = ctx.principal.via === "service-principal"
+      ? (ctx.principal.serviceAccountId ? { kind: "service-account" as const, subjectId: ctx.principal.serviceAccountId } : undefined)
+      : (ctx.principal.userId ? { kind: "user" as const, subjectId: ctx.principal.userId } : undefined);
+    return applyDirectBankPurchasePayableCorrection(ctx.db, { ...correctionInput(body), planHash: requireBodyString(body,"planHash"), reason:requireBodyString(body,"reason"), actor:ctx.actor.createdBy, principal:stable, confirm:true });
+  }, { requireConfirm:true, keyIdempotent:"direct_bank_purchase_payable_correction_apply", requireIdempotencyKey:true });
+  return okResponse({ correction: result, ...("idempotency" in result ? { idempotency: result.idempotency } : {}) });
+}
+
+function legacyBackfillInput(body:Record<string,unknown>){return {purchaseJournalEntryId:requireBodyPositiveInt(body,"purchaseJournalEntryId"),paymentJournalEntryId:requireBodyPositiveInt(body,"paymentJournalEntryId"),documentId:requireBodyPositiveInt(body,"documentId"),bankTransactionId:requireBodyPositiveInt(body,"bankTransactionId")};}
+export async function handleLegacyPayableBackfillPlan(config:ServerConfig,request:Request,slug:string):Promise<Response>{const body=await readJsonBody(request);const db=openLedgerReadOnly(companyPaths(companyRootForSlug(config.workspaceRoot,slug)).db);try{const result=planLegacyPayablePaymentBackfill(db,legacyBackfillInput(body));if(!result.ok)throw ApiError.conflict(result.errors.join("; "));return okResponse({plan:result.plan});}finally{db.close();}}
+export async function handleLegacyPayableBackfillApply(config:ServerConfig,request:Request,slug:string):Promise<Response>{const result=await withCompanyMutation(request,config,slug,(ctx,body)=>{const p=ctx.principal;return applyLegacyPayablePaymentBackfill(ctx.db,{...legacyBackfillInput(body),planHash:requireBodyString(body,"planHash"),idempotencyKey:requireBodyString(body,"idempotencyKey"),actor:ctx.actor.createdBy,principal:p.serviceAccountId?{kind:"service-account" as const,subjectId:p.serviceAccountId}:{kind:"user" as const,subjectId:p.userId??p.id},confirm:true});},{requireConfirm:true,keyIdempotent:"payable_legacy_backfill_apply",requireIdempotencyKey:true});return okResponse({backfill:result,...("idempotency" in result?{idempotency:result.idempotency}:{})});}

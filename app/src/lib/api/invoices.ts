@@ -1,5 +1,6 @@
 import type {
   InvoicesResponse,
+  ImportedReceivablesResponse,
   RecurringInvoiceGenerationResult,
   RecurringInvoiceTemplateCreatedResult,
   RecurringInvoiceTemplateInput,
@@ -14,6 +15,23 @@ export const invoicesApi = {
         year ? `?year=${encodeURIComponent(year)}` : ""
       }`,
     ).then((r) => r.invoices),
+
+  importedReceivables: (slug: string, asOf: string) =>
+    request<ImportedReceivablesResponse>(
+      `/api/companies/${encodeURIComponent(slug)}/imported-receivables?asOf=${encodeURIComponent(asOf)}`,
+    ).then((r) => r.importedReceivables),
+
+  planImportedReceivableSettlement: (slug: string, input: { scheduleHash: string; externalInvoiceId: string; bankTransactionId: number }) =>
+    request<{ ok: true; settlement: { ok: boolean; plan?: { planHash: string } } }>(
+      `/api/companies/${encodeURIComponent(slug)}/imported-receivables/settlement/plan`,
+      { method: "POST", body: JSON.stringify(input) },
+    ).then((r) => r.settlement),
+
+  applyImportedReceivableSettlement: (slug: string, input: { scheduleHash: string; externalInvoiceId: string; bankTransactionId: number; planHash: string; idempotencyKey: string }) =>
+    request<{ ok: true; settlement: { ok: boolean; errors?: string[] } }>(
+      `/api/companies/${encodeURIComponent(slug)}/imported-receivables/settlement/apply`,
+      { method: "POST", body: JSON.stringify({ ...input, confirm: true }) },
+    ).then((r) => r.settlement),
 
   /**
    * URL of an issued invoice's PDF — opened directly in a new browser tab so
@@ -292,12 +310,8 @@ export const invoicesApi = {
     ).then((r) => r.reminder),
 
   /**
-   * #428 — sends an issued invoice as an e-faktura (NemHandel/PEPPOL) via
-   * the cockpit. Third caller of the SAME `submitPublicEInvoicePeppol` core
-   * function the CLI / MCP use; the server loads its access-point config
-   * from `RENTEMESTER_PEPPOL_ACCESS_POINT` so credentials never enter the
-   * body. Write-irreversible (it appends a `peppol_submissions` row + an
-   * `audit_log` entry), so the body carries `confirm: true`.
+   * Sends through the selected company's local DigiSense binding. The browser
+   * never supplies a company key, access-point identity or credentials.
    */
   sendInvoiceAsEInvoice: (slug: string, input: InvoiceSendEInvoiceInput) =>
     request<{ ok: true; submission: InvoiceSendEInvoiceSummary }>(
@@ -308,6 +322,16 @@ export const invoicesApi = {
           invoiceDocumentId: input.invoiceDocumentId,
           confirm: true,
         }),
+      },
+    ).then((r) => r.submission),
+
+  /** Observes a queued DigiSense delivery without ever redelivering it. */
+  refreshEInvoiceStatus: (slug: string, input: InvoiceSendEInvoiceInput) =>
+    request<{ ok: true; submission: InvoiceSendEInvoiceSummary }>(
+      `/api/companies/${encodeURIComponent(slug)}/invoices/send-public/status`,
+      {
+        method: "POST",
+        body: JSON.stringify({ invoiceDocumentId: input.invoiceDocumentId, confirm: true }),
       },
     ).then((r) => r.submission),
 };
@@ -390,6 +414,7 @@ export type InvoiceSendEInvoiceSummary = {
   submissionReference: string | null;
   status: "prepared" | "acknowledged" | null;
   duplicate: boolean;
+  transmissionId?: string | null;
   envelopeSha256: string | null;
   oioublSha256: string | null;
 };

@@ -25,7 +25,7 @@
 // config (secret-laget), aldrig her.
 
 import type { Database } from "bun:sqlite";
-import { insertAuditLog } from "../actor";
+import { insertAuditLog, type ResolveActorInput } from "../actor";
 import type {
   DigisenseClient,
   DigisenseCompanyType,
@@ -34,7 +34,12 @@ import type {
   ParticipantType,
   RegisterParticipantRequest,
 } from "./digisense-client";
-import { saveDigisenseCompany, saveDigisenseParticipant } from "./digisense-state";
+import {
+  getDigisenseCompanyByParticipantId,
+  saveDigisenseCompany,
+  saveDigisenseParticipant,
+} from "./digisense-state";
+import { validateDigisenseRegistrationIdentity } from "./digisense-identity";
 
 // Begge retninger registreres altid: en virksomhed der registreres skal kunne
 // både sende (outbound) og modtage (inbound).
@@ -42,7 +47,9 @@ const DIRECTIONS: ParticipantDirection[] = ["outbound", "inbound"];
 
 // Vi poller selv (ingen always-on server), så vi registrerer aldrig en webhook.
 const NO_WEBHOOK = null;
-const DEFAULT_DOCUMENT_PROFILES = "default-nemhandel";
+function defaultDocumentProfiles(network: DigisenseNetwork): "default-nemhandel" | "default-peppol" {
+  return network === "peppol" ? "default-peppol" : "default-nemhandel";
+}
 
 export type RegisterDigisenseCompanyOptions = {
   /** CVR/NIP-identifikatoren der registreres som virksomhed hos Digisense. */
@@ -65,6 +72,8 @@ export type RegisterDigisenseCompanyOptions = {
    * en dansk virksomhed registreres på sit eget CVR.
    */
   participantId?: string;
+  /** Explicit actor from CLI/MCP, propagated to registration audit evidence. */
+  actor?: ResolveActorInput;
 };
 
 export type RegisterDigisenseCompanyResult =
@@ -94,29 +103,49 @@ export async function registerDigisenseCompany(
   client: DigisenseClient,
   options: RegisterDigisenseCompanyOptions,
 ): Promise<RegisterDigisenseCompanyResult> {
+  const identity = validateDigisenseRegistrationIdentity(db, {
+    cvr: options.companyType.id,
+    companyName: options.companyName,
+  });
+  if (!identity.ok) return { ok: false, errors: identity.errors };
   const companyName = options.companyName?.trim();
   if (!companyName) {
     return { ok: false, errors: ["companyName is required to register a company"] };
   }
-  const participantId = (options.participantId ?? options.companyType.id)?.trim();
-  if (!participantId) {
-    return { ok: false, errors: ["participantId is required to register a participant"] };
-  }
+  // A ledger represents one legal entity. Participant routing must therefore
+  // be exactly that profile's DK:CVR identity; accepting an override would let
+  // a caller bind this ledger's companyKey to another company.
+  const participantId = identity.value.cvr;
   const network = options.network ?? "nemhandel";
-  const participantType: ParticipantType = options.participantType ?? "DK:CVR";
-
-  // 1) register-company ⇒ companyKey. En fejl her ⇒ vi rører aldrig state.
-  const registered = await client.registerCompany({
-    companyType: options.companyType,
-    companyName,
-  });
-  if (!registered.ok) {
-    return {
-      ok: false,
-      errors: [`register-company failed: ${registered.error.message}`],
-    };
+  const participantType: ParticipantType = "DK:CVR";
+  if (options.participantId !== undefined && options.participantId.trim() !== participantId) {
+    return { ok: false, errors: ["participantId must match this ledger's profile CVR"] };
   }
-  const companyKey = registered.data.companyKey?.trim();
+  if (options.participantType !== undefined && options.participantType !== participantType) {
+    return { ok: false, errors: ["participantType must be DK:CVR for this ledger's profile identity"] };
+  }
+
+  // 1) Genbrug en allerede auditeret lokal companyKey for samme juridiske
+  // identitet. DigiSense returnerer 409 ved gentaget register-company, så den
+  // lokale state er den idempotente genvej til at tilføje et nyt netværk.
+  const existingCompany = getDigisenseCompanyByParticipantId(db, identity.value.cvr);
+  if (existingCompany && existingCompany.companyType !== options.companyType.type) {
+    return { ok: false, errors: ["Existing Digisense company type does not match registration request"] };
+  }
+  let companyKey = existingCompany?.companyKey.trim() ?? "";
+  if (!companyKey) {
+    const registered = await client.registerCompany({
+      companyType: options.companyType,
+      companyName,
+    });
+    if (!registered.ok) {
+      return {
+        ok: false,
+        errors: [`register-company failed: ${registered.error.message}`],
+      };
+    }
+    companyKey = registered.data.companyKey?.trim() ?? "";
+  }
   if (!companyKey) {
     return { ok: false, errors: ["register-company returned no companyKey"] };
   }
@@ -124,11 +153,13 @@ export async function registerDigisenseCompany(
   // 2) Gem companyKey FØR participant-registreringen, så et delvist udfald (én
   // retning lykkes, den anden fejler) stadig kan retries på et re-run uden at
   // miste companyKey'en. Upsert på participant-id ⇒ ingen dublet ved re-run.
-  saveDigisenseCompany(db, {
-    companyKey,
-    companyType: options.companyType,
-    companyName,
-  });
+  if (!existingCompany) {
+    saveDigisenseCompany(db, {
+      companyKey,
+      companyType: options.companyType,
+      companyName,
+    });
+  }
 
   // 3) register-participant for BÅDE outbound OG inbound. webhookUrl=null ⇒ vi
   // poller selv. Hvert udfald gemmes i state-laget (upsert pr. retning).
@@ -141,7 +172,7 @@ export async function registerDigisenseCompany(
       participantId,
       companyKey,
       webhookUrl: NO_WEBHOOK,
-      documentProfiles: DEFAULT_DOCUMENT_PROFILES,
+      documentProfiles: defaultDocumentProfiles(network),
     };
     const result = await client.registerParticipant(network, body);
     if (!result.ok) {
@@ -172,6 +203,7 @@ export async function registerDigisenseCompany(
       `på ${network} (companyKey=${companyKey}); ` +
       `retninger: ${directionsRegistered.length > 0 ? directionsRegistered.join(", ") : "ingen"}` +
       (errors.length > 0 ? ` — ${errors.length} fejlede` : ""),
+    ...options.actor,
   });
 
   if (errors.length > 0) {

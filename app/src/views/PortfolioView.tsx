@@ -4,6 +4,7 @@
 // and one card per company shows the headline health an owner judges a
 // company on. Companies that need attention sort to the top and are flagged.
 
+import { useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { formatKroner, sortByAttention } from "../lib/format";
@@ -15,6 +16,11 @@ import { Onboarding } from "./Onboarding";
 export function PortfolioView() {
   const navigate = useNavigate();
   const state = useAsync(() => api.portfolio(), []);
+  useEffect(() => {
+    if (state.data?.companies.length === 1) {
+      navigate(`/companies/${state.data.companies[0]!.slug}`, { replace: true });
+    }
+  }, [navigate, state.data]);
 
   if (state.loading) return <Loading label="Henter portefølje…" />;
   if (state.error)
@@ -22,12 +28,16 @@ export function PortfolioView() {
 
   const portfolio = state.data!;
 
+  // The server has already filtered this list to the authenticated member's
+  // visible companies. Do not reconstruct membership in the browser.
   // First run: an empty workspace drops straight into onboarding.
   if (portfolio.companies.length === 0) {
     return (
       <Onboarding onCreated={(slug) => navigate(`/companies/${slug}`)} />
     );
   }
+
+  if (portfolio.companies.length === 1) return <Loading label="Åbner virksomhedsoverblik…" />;
 
   const ordered = sortByAttention(portfolio.companies);
   const needAttention = ordered.filter(
@@ -36,7 +46,7 @@ export function PortfolioView() {
       (c.ledgerMissing ||
         !c.auditChainOk ||
         c.resultat < 0 ||
-        c.openTaskCount > 0 ||
+        c.attentionStatus === "requires-attention" ||
         (c.vat !== null &&
           c.vat.payable > 0 &&
           c.vat.daysRemaining <= 30)),
@@ -61,7 +71,7 @@ export function PortfolioView() {
       </div>
 
       {rollup && (
-        <div className="rollup-strip" aria-label="Tværgående overblik">
+        <div className="rollup-strip" role="group" aria-label="Tværgående overblik">
           <div
             className={`rollup-cell ${rollup.resultat < 0 ? "neg" : "pos"}`}
           >
@@ -73,8 +83,9 @@ export function PortfolioView() {
           <div className="rollup-cell">
             <span className="rollup-label">Samlet likviditet</span>
             <span className="rollup-value">
-              {formatKroner(rollup.liquidity)}
+              {rollup.liquidity === null ? "—" : formatKroner(rollup.liquidity)}
             </span>
+            {!rollup.liquidityComplete && <span className="rollup-note">Ufuldstændig — kontrollér Bank</span>}
           </div>
           <div className="rollup-cell">
             <span className="rollup-label">Moms at betale</span>

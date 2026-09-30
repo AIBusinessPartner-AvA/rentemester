@@ -10,6 +10,7 @@ import {
   resolveYearParam,
 } from "../data";
 import { okResponse } from "./_shared";
+export { handleCompanyChangesSince } from "./changes-since";
 
 export function handleCompanyDashboard(
   config: ServerConfig,
@@ -32,7 +33,8 @@ export function handleCompanyOverview(
   url: URL,
 ): Response {
   const year = resolveYearParam(url.searchParams.get("year"));
-  const data = buildCompanyOverview(config.workspaceRoot, slug, year);
+  const asOf = resolveAsOfDate(url.searchParams.get("asOf"));
+  const data = buildCompanyOverview(config.workspaceRoot, slug, year, asOf);
   return okResponse({ overview: data });
 }
 

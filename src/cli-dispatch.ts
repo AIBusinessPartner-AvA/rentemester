@@ -4,7 +4,10 @@ import type { ParsedCliArgs } from "./cli-args";
 import type { OutputFormat } from "./cli-format";
 import { printStructuredResult } from "./cli-format";
 import { getCommandSpec } from "./cli-meta";
+import { SIDE_EFFECTING_COMMANDS } from "./cli-meta";
+import { MUTATING_COMMANDS } from "./cli-actor";
 import { openDb } from "./core/db";
+import { openCurrentLedgerReadOnly } from "./core/ledger-inspection";
 import { companyPaths } from "./core/paths";
 
 export type CommandContext = {
@@ -32,10 +35,34 @@ export type CommandHandler = (ctx: CommandContext) => void | Promise<void>;
 /**
  * Åbner company-databasen for et CLI-command-ctx. Erstatter den copy-paste'ede
  * `openDb(companyPaths(ctx.companyRoot()).db)`-linje i CLI-handlerne.
- * Kalderen er stadig ansvarlig for `migrate(db)` og `db.close()`.
+ * Read-only commands receive an isolated, current-schema snapshot. Mutations
+ * and explicit setup commands receive the writable handle and remain
+ * responsible for `migrate(db)`. Existing read handlers may still call
+ * `migrate(db)`; on a query-only snapshot it is a validation-only no-op.
  */
 export function openCommandDb(ctx: CommandContext): Database {
-  return openDb(companyPaths(ctx.companyRoot()).db);
+  const dbPath = companyPaths(ctx.companyRoot()).db;
+  const writable = MUTATING_COMMANDS.has(ctx.commandKey) || SIDE_EFFECTING_COMMANDS.has(ctx.commandKey);
+  return writable ? openDb(dbPath) : openCurrentLedgerReadOnly(dbPath);
+}
+
+/** Resolve the CLI's discriminated numeric parser at one trusted boundary. */
+export function optionalNumberOrFatal(
+  ctx: CommandContext,
+  flagName: string,
+): number | undefined {
+  const parsed = ctx.parseOptionalNumber(flagName);
+  if (!parsed.ok) ctx.fatal(parsed.error);
+  return parsed.value;
+}
+
+export function requiredNumberOrFatal(
+  ctx: CommandContext,
+  flagName: string,
+): number {
+  const value = optionalNumberOrFatal(ctx, flagName);
+  if (value === undefined) ctx.fatal(`Missing required ${flagName} <n>`);
+  return value;
 }
 
 /**
@@ -80,6 +107,19 @@ export function readJsonCliInput(
     const detail = err instanceof Error ? err.message : String(err);
     ctx.fatal(`'${path}' er ikke gyldig JSON (${detail}) — tjek for kommafejl, manglende parenteser, eller om filen er gemt i et andet format`);
   }
+}
+
+/** JSON object boundary for domain commands; arrays and primitives are usage errors. */
+export function readJsonObjectCliInput(
+  ctx: CommandContext,
+  filePath: string,
+  flagName: string,
+): Record<string, unknown> {
+  const value = readJsonCliInput(ctx, filePath, flagName);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    ctx.fatal(`${flagName} must contain a JSON object`);
+  }
+  return value as Record<string, unknown>;
 }
 
 export class CommandDispatch {

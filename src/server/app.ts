@@ -5,7 +5,16 @@
 // is trivially testable without binding a socket.
 
 import type { ServerConfig } from "./config";
+import {
+  createBetterAuthRequestProvider,
+  openWorkspaceBetterAuth,
+  type WorkspaceBetterAuthRuntime,
+} from "./better-auth";
+import { createHttpJsonV1AuthEmailSender } from "./auth-email";
 import { handleRequest } from "./router";
+import { observeRequest } from "./observability";
+import { createHttpJsonV1DocumentScanner } from "./document-scanner";
+import { resolveConfiguredInvoiceExtractor } from "./invoice-extractor";
 
 /** The concrete `Bun.serve` return type, without needing its generic param. */
 type BunServer = ReturnType<typeof Bun.serve>;
@@ -25,18 +34,61 @@ export type CockpitServer = {
  * reachable off-box without an explicit config change.
  */
 export function startCockpitServer(config: ServerConfig): CockpitServer {
-  const server = Bun.serve({
-    hostname: config.host,
-    port: config.port,
-    fetch(request) {
-      return handleRequest(request, config);
-    },
-  });
+  let authRuntime: WorkspaceBetterAuthRuntime | undefined;
+  let runtimeConfig = config;
+  // The provider is opt-in for every deployment profile. Configuration errors
+  // stop startup; credentials are retained only in this runtime object.
+  if (!runtimeConfig.invoiceExtractor) runtimeConfig = { ...runtimeConfig, invoiceExtractor: resolveConfiguredInvoiceExtractor() ?? undefined };
+  const deploymentProfile = config.deploymentProfile ?? "local";
+  if (deploymentProfile === "hosted") {
+    if (!config.hostedBetterAuth) {
+      throw new Error("hosted deployment requires validated Better Auth configuration");
+    }
+    if (config.hostedDocumentScanning?.policy === "required" && !config.hostedDocumentScanning.provider) {
+      throw new Error("hosted deployment requires a document scanner provider when scanning is required");
+    }
+    authRuntime = openWorkspaceBetterAuth(config.workspaceRoot, {
+      ...config.hostedBetterAuth,
+      deploymentMode: "hosted",
+      useSecureCookies: true,
+      emailSender: createHttpJsonV1AuthEmailSender({
+        ...config.hostedBetterAuth.authEmail,
+        idempotencySecret: config.hostedBetterAuth.secret,
+      }),
+    });
+    const scanning = config.hostedDocumentScanning;
+    runtimeConfig = {
+      ...runtimeConfig,
+      authRequired: true,
+      betterAuthProvider: createBetterAuthRequestProvider(authRuntime.auth),
+      documentScannerPolicy: scanning?.policy ?? "off",
+      ...(scanning?.provider ? { documentScanner: createHttpJsonV1DocumentScanner(scanning.provider) } : {}),
+    };
+  } else if (config.betterAuthProvider) {
+    throw new Error("local deployment must not mount a Better Auth provider");
+  }
+
+  let server: BunServer;
+  try {
+    server = Bun.serve({
+      hostname: runtimeConfig.host,
+      port: runtimeConfig.port,
+      fetch(request) {
+        return observeRequest(request, runtimeConfig, handleRequest);
+      },
+    });
+  } catch (error) {
+    authRuntime?.close();
+    throw error;
+  }
   const host = config.host.includes(":") ? `[${config.host}]` : config.host;
   return {
     server,
-    config,
+    config: runtimeConfig,
     url: `http://${host}:${server.port}`,
-    stop: () => server.stop(true),
+    stop: () => {
+      server.stop(true);
+      authRuntime?.close();
+    },
   };
 }

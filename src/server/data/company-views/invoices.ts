@@ -1,37 +1,40 @@
 import { existsSync } from "node:fs";
-import { companyPaths } from "../../../core/paths";
-import { openDb, migrate } from "../../../core/db";
+import { openCurrentLedgerReadOnly } from "../../../core/ledger-inspection";
 import { buildInvoiceList } from "../../../core/invoice-list";
-import { renderIssuedInvoicePdf } from "../../../core/invoice-pdf";
+import { listImportedReceivables } from "../../../core/imported-receivables";
+import { companyPaths } from "../../../core/paths";
 import {
   companyRootForSlug,
   findWorkspaceCompany,
 } from "../../../core/workspace";
 import { ApiError } from "../../errors";
 import {
+  type EvidenceFileSnapshot,
+  EvidenceFileUnavailable,
+  evidenceDownloadFilename,
+  readVerifiedEvidenceFile,
+} from "../evidence-file";
+import {
   resolveStatementContext,
   roundKroner,
   statementCompanyBlock,
 } from "../shared";
+import { dataCoverage } from "../../../data-coverage";
 
 // --------------------------------------------------------------------------
 // Per-company issued invoices (Fakturaer, year-aware) — cockpit-redesign it. 5
 // --------------------------------------------------------------------------
 
 /**
- * Resolves an issued-invoice document into the on-disk PDF the cockpit can
- * serve to the owner. The same `renderIssuedInvoicePdf` core that the CLI's
- * `invoice render` command uses is called — re-rendering is idempotent: when
- * the payload has not changed since issuance, the existing PDF row is returned
- * unchanged; if it has, the row is updated in place. The thrown shapes match
- * `resolveCompanyDocumentFile` so the route handler can rely on the same
- * not-found mapping. (#378)
+ * Resolves existing issued-invoice PDF evidence into an immutable byte
+ * snapshot. GET never invokes the renderer: rendering/replacing invoice
+ * evidence is an explicit issuing workflow, not a read-side repair.
  */
 export function resolveCompanyIssuedInvoicePdf(
   workspaceRoot: string,
   slug: string,
   invoiceDocumentId: number,
-): { path: string; mimeType: string; filename: string } {
+): EvidenceFileSnapshot {
   const entry = findWorkspaceCompany(workspaceRoot, slug);
   if (!entry) {
     throw ApiError.notFound(`ingen virksomhed med slug '${slug}' findes i workspacet`);
@@ -42,21 +45,50 @@ export function resolveCompanyIssuedInvoicePdf(
     throw ApiError.notFound(`virksomheden '${slug}' har ingen ledger`);
   }
 
-  const db = openDb(dbPath);
+  const db = openCurrentLedgerReadOnly(dbPath);
   try {
-    migrate(db);
-    const result = renderIssuedInvoicePdf(db, companyRoot, {
-      invoiceDocumentId,
-    });
-    if (!result.ok || !result.storedPath || !result.invoiceNumber) {
-      const reason = result.errors[0] ?? "issued invoice PDF could not be rendered";
-      throw ApiError.notFound(reason);
+    db.exec("PRAGMA query_only = ON");
+    const invoice = db.query(
+      `SELECT invoice_no AS invoiceNo, payload_json AS payloadJson FROM documents
+        WHERE id = ? AND document_type = 'issued_invoice'`,
+    ).get(invoiceDocumentId) as { invoiceNo: string | null; payloadJson: string | null } | null;
+    if (!invoice?.invoiceNo || !invoice.payloadJson) {
+      throw ApiError.notFound("faktura-PDF er ikke tilgængelig");
     }
-    return {
-      path: result.storedPath,
-      mimeType: "application/pdf",
-      filename: `${result.invoiceNumber}.pdf`,
-    };
+    // A PDF artifact is immutable evidence for exactly one issued invoice.
+    // Old/ambiguous ledgers are denied rather than guessing the newest row.
+    const pdfRows = db.query(
+      `SELECT id, stored_path AS storedPath, sha256_hash AS sha256Hash,
+              mime_type AS mimeType
+         FROM documents
+        WHERE document_type = 'issued_invoice_pdf'
+          AND invoice_no = ?
+          AND payload_json = ?
+        ORDER BY id ASC`,
+    ).all(invoice.invoiceNo, invoice.payloadJson) as Array<{
+      id: number;
+      storedPath: string | null;
+      sha256Hash: string;
+      mimeType: string | null;
+    }>;
+    if (pdfRows.length !== 1 || !pdfRows[0]!.storedPath || !pdfRows[0]!.sha256Hash) {
+      throw ApiError.notFound("faktura-PDF er ikke tilgængelig");
+    }
+    try {
+      return readVerifiedEvidenceFile({
+        companyRoot,
+        storedPath: pdfRows[0]!.storedPath!,
+        expectedSha256: pdfRows[0]!.sha256Hash,
+        documentType: "issued_invoice_pdf",
+        mimeType: pdfRows[0]!.mimeType,
+        filename: evidenceDownloadFilename(invoiceDocumentId, ".pdf"),
+      });
+    } catch (error) {
+      if (error instanceof EvidenceFileUnavailable) {
+        throw ApiError.notFound("faktura-PDF er ikke tilgængelig");
+      }
+      throw error;
+    }
   } finally {
     db.close();
   }
@@ -65,10 +97,10 @@ export function resolveCompanyIssuedInvoicePdf(
 /**
  * Cockpit-facing PEPPOL/e-faktura status (#428) — verbatim copy of the
  * core `InvoicePeppolStatus`, exposed so the Cockpit can flag
- * "Sendt som e-faktura" on a row and gate the send-action.
+ * truthful delivery status on a row and gate send/status actions.
  */
 export type CompanyInvoicePeppolStatus = {
-  status: "prepared" | "acknowledged";
+  status: "queued" | "failed" | "uncertain" | "retryable" | "in_progress" | "acknowledged";
   submissionReference: string;
   transmissionId: string | null;
   acknowledgedAt: string | null;
@@ -80,6 +112,8 @@ export type CompanyInvoiceRow = {
   invoiceNo: string;
   invoiceDate: string | null;
   customerName: string | null;
+  /** Explicit customer/recipient party relation on this invoice document. */
+  partyId: string | null;
   /**
    * Customer's e-mail when set on the kontaktkort (#429). Surfaced so the
    * cockpit can render a "Send på mail" action only on rows where there is
@@ -161,6 +195,7 @@ export function buildCompanyInvoices(
         totalGross: 0,
         totalOpen: 0,
         overdueCount: 0,
+        coverage: dataCoverage("final", `${ctx.selectedLabel}-12-31`, "not_comparable", "archived", ["Arkiveret periode har ingen native udstedte fakturaer."]),
       };
     }
 
@@ -246,6 +281,9 @@ export function buildCompanyInvoices(
       invoiceNo: r.invoiceNumber,
       invoiceDate: r.invoiceDate,
       customerName: r.customerName,
+      partyId: (ctx.db.query(`SELECT party_id AS partyId FROM current_document_party_links
+        WHERE document_id=? AND party_role IN ('customer','recipient','payer')
+        ORDER BY CASE party_role WHEN 'customer' THEN 0 WHEN 'recipient' THEN 1 WHEN 'payer' THEN 2 END, id DESC LIMIT 1`).get(r.documentId) as { partyId: string } | null)?.partyId ?? null,
       customerEmail: r.customerName
         ? customerEmailByName.get(r.customerName.trim()) ?? null
         : null,
@@ -291,8 +329,31 @@ export function buildCompanyInvoices(
       totalGross,
       totalOpen,
       overdueCount,
+      coverage: dataCoverage("current", list.asOfDate ?? null, "available", "native", ["Native, udstedte Rentemester-fakturaer."]),
     };
   } finally {
     ctx.db.close();
+  }
+}
+
+/** Read-only archive side of the receivables cut-over.  This deliberately
+ * does not join issued invoices: native invoices remain the other canonical
+ * read model and combining them here would make a cut-over double count easy.
+ */
+export function buildCompanyImportedReceivables(
+  workspaceRoot: string,
+  slug: string,
+  asOf: string,
+) {
+  const entry = findWorkspaceCompany(workspaceRoot, slug);
+  if (!entry) throw ApiError.notFound(`ingen virksomhed med slug '${slug}' findes i workspacet`);
+  const dbPath = companyPaths(companyRootForSlug(workspaceRoot, slug)).db;
+  if (!existsSync(dbPath)) throw ApiError.notFound(`virksomheden '${slug}' har ingen ledger`);
+  const db = openCurrentLedgerReadOnly(dbPath);
+  try {
+    db.exec("PRAGMA query_only = ON");
+    return listImportedReceivables(db, asOf);
+  } finally {
+    db.close();
   }
 }

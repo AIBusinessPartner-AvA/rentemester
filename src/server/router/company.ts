@@ -4,6 +4,7 @@
 // payables, agent-suggestions.
 
 import type { ServerConfig } from "../config";
+import { withCompanyMutation } from "../mutations";
 import { ApiError } from "../errors";
 import { buildCompanyAccounts } from "../data/accounts-view";
 import { buildCompanyAccruals } from "../data/accruals-view";
@@ -15,8 +16,10 @@ import { buildCompanyPeriods } from "../data/periods-view";
 import { buildCompanyRetention } from "../data/retention-view";
 import {
   buildCompanyAgentSuggestions,
+  buildCompanyAttention,
   buildCompanyArchiveYear,
   buildCompanyBudget,
+  buildCompanyBudgetDimensionActuals,
   buildCompanyBudgetVsActual,
   buildCompanyCashflow,
   buildCompanyMileage,
@@ -40,10 +43,22 @@ export function handleCompanySettings(config: ServerConfig, slug: string): Respo
  * credentials, unknown CVR) is reported inside `sync.ok`, not as an HTTP error.
  */
 export async function handleCompanySyncCvr(
+  request: Request,
   config: ServerConfig,
   slug: string,
 ): Promise<Response> {
-  const data = await syncCompanyCvr(config.workspaceRoot, slug);
+  // Sync mutates stored company master data and can call an external source.
+  // It therefore goes through the same local/origin/content-type, company,
+  // backup-lock and actor gates as every other company mutation.
+  const result = await withCompanyMutation(request, config, slug, async () => ({
+    ok: true,
+    // TODO(auth/core): syncCompanyCvr only exposes workspace+slug and opens
+    // its own DB. Reusing MutationContext.db requires a data-layer API change;
+    // until then this outer pipeline remains the controlling authorization,
+    // origin, backup-lock and actor gate.
+    data: await syncCompanyCvr(config.workspaceRoot, slug),
+  }));
+  const data = result.data;
   return okResponse({ sync: data });
 }
 
@@ -114,6 +129,17 @@ export function handleCompanyBudgetVsActual(
   return okResponse({ budgetVsActual: data });
 }
 
+/** Read-only classifications next to, never inside, the account-level budget. */
+export function handleCompanyBudgetDimensionActuals(
+  config: ServerConfig,
+  slug: string,
+  url: URL,
+): Response {
+  const year = resolveYearParam(url.searchParams.get("year"));
+  const data = buildCompanyBudgetDimensionActuals(config.workspaceRoot, slug, year);
+  return okResponse({ budgetDimensionActuals: data });
+}
+
 export function handleCompanyArchiveYear(
   config: ServerConfig,
   slug: string,
@@ -161,9 +187,10 @@ export function handleCompanyAnnualReport(
   slug: string,
   url: URL,
 ): Response {
+  const canonicalYear = url.searchParams.get("year");
   const fiscalYearStart = url.searchParams.get("fiscalYearStart");
   const fiscalYearEnd = url.searchParams.get("fiscalYearEnd");
-  if (!fiscalYearStart || !fiscalYearEnd) {
+  if (!canonicalYear && (!fiscalYearStart || !fiscalYearEnd)) {
     throw ApiError.badRequest(
       "fiscalYearStart og fiscalYearEnd (YYYY-MM-DD) er begge påkrævet.",
     );
@@ -171,8 +198,9 @@ export function handleCompanyAnnualReport(
   const data = buildCompanyAnnualReport(
     config.workspaceRoot,
     slug,
-    fiscalYearStart,
-    fiscalYearEnd,
+    fiscalYearStart ?? "",
+    fiscalYearEnd ?? "",
+    canonicalYear ?? undefined,
   );
   return okResponse({ annualReport: data });
 }
@@ -311,4 +339,9 @@ export function handleCompanyAgentSuggestions(
 ): Response {
   const data = buildCompanyAgentSuggestions(config.workspaceRoot, slug);
   return okResponse({ agentSuggestions: data });
+}
+
+/** GET /api/companies/:slug/attention — one read-only daily task inbox (#649). */
+export function handleCompanyAttention(config: ServerConfig, slug: string): Response {
+  return okResponse({ attention: buildCompanyAttention(config.workspaceRoot, slug) });
 }

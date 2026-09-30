@@ -28,6 +28,7 @@
 import { readFileSync, readdirSync, rmSync, existsSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeOfflineViesDemoMarker } from "../../src/core/offline-vies-demo";
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -99,6 +100,9 @@ class McpClient {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
+      // This legacy demo intentionally exercises the direct operation surface.
+      // New integrations should use the compact discovery-and-gateway profile.
+      env: { ...process.env, RENTEMESTER_MCP_PROFILE: "full" },
     });
     this.reader = this.proc.stdout.getReader();
   }
@@ -292,6 +296,7 @@ async function ensureCompanyInitialized(company: string) {
     const stderr = await new Response(init.stderr).text();
     throw new Error(`CLI init failed (exit ${init.exitCode}): ${stderr}`);
   }
+  writeOfflineViesDemoMarker(company);
 }
 
 /**
@@ -310,7 +315,7 @@ async function preSeedViesValidations(company: string, inbox: InboxItem[]) {
     eu.add(vat);
   }
   for (const vat of eu) {
-    const proc = Bun.spawn(["bun", SEED_VIES_PATH, company, vat], {
+    const proc = Bun.spawn(["bun", SEED_VIES_PATH, company, vat, "--unsafe-demo"], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -357,6 +362,13 @@ async function runDemo(args: { company: string; mode: Mode; demoDir: string }): 
   await ensureCompanyInitialized(company);
   bullet("✓", `company init OK (${company})`);
 
+  // The unsafe offline VIES fixture is deliberately permitted only before
+  // *any* business mutation. Load the static inbox and seed it immediately
+  // after the documented init flow, while the marker still binds the pristine
+  // ledger and its init audit trail.
+  const inbox = loadInbox(demoDir);
+  const seeded = await preSeedViesValidations(company, inbox);
+
   section("Spawner MCP-server");
   const client = new McpClient();
   let summary: Summary = {
@@ -393,8 +405,6 @@ async function runDemo(args: { company: string; mode: Mode; demoDir: string }): 
 
     // -------- 2. documents_ingest pr. inbox-fil --------
     section("Læser inbox og ingester bilag");
-    const inbox = loadInbox(demoDir);
-    const seeded = await preSeedViesValidations(company, inbox);
     if (seeded > 0) bullet("✓", `${seeded} EU-leverandør(er) VIES-validated (offline-seed)`);
     const ingested: Array<{ item: InboxItem; documentId: number }> = [];
     for (const item of inbox) {

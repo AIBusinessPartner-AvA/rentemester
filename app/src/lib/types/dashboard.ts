@@ -36,10 +36,13 @@ export type CompanyDashboard = {
   unlinkedBank: { count: number };
   exceptions: { count: number; rows: ExceptionRow[] };
   vat: {
-    periodStart: string;
-    periodEnd: string;
+    periodStart: string | null;
+    periodEnd: string | null;
+    periodLabel: string | null;
+    deadline: string | null;
+    periodStatus: "open" | "closed" | "reported" | null;
     netVatPayable: number;
-    daysRemaining: number;
+    daysRemaining: number | null;
     errors: unknown[];
   };
   backup: {
@@ -126,6 +129,8 @@ export type OverviewVat = {
   deadline: string;
   /** Signed countdown from today to the deadline; negative once passed. */
   daysRemaining: number;
+  /** Effective lifecycle state for the exact period shown. */
+  periodStatus: "open" | "closed" | "reported";
 };
 
 export type CompanyOverview = {
@@ -157,6 +162,8 @@ export type CompanyOverview = {
     actualBalance: number | null;
     /** balance − actualBalance; the unreconciled gap, kroner; null when unknown. */
     difference: number | null;
+    bankStatementStatus?: "known" | "no-balance-column" | "none" | "ambiguous";
+    bankStatementDiagnostics?: string[];
   };
   /** Money owed TO the company — open issued-invoice balances at year end. */
   receivables: {
@@ -167,6 +174,8 @@ export type CompanyOverview = {
   };
   /** The half-yearly VAT position; null for an archived year. */
   vat: OverviewVat | null;
+  /** Canonical count from the same attention projection as the task inbox. */
+  attention: { count: number; status: "clear" | "requires-attention" };
   exceptions: {
     count: number;
     rows: OverviewExceptionRow[];
@@ -188,3 +197,6 @@ export type OverviewResponse = {
   ok: true;
   overview: CompanyOverview;
 };
+
+export type ChangesSince = { events: Array<{ id:number; eventType:string; entityType:string; entityId:string|null; message:string; actor:string; createdAt:string }>; cursor:number };
+export type ChangesSinceResponse = { ok:true; changes: ChangesSince };

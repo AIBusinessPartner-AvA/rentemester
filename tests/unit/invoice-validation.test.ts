@@ -128,6 +128,38 @@ describe("invoice validator", () => {
     expect(result.ok).toBe(true);
   });
 
+  test("accepts a simplified invoice without totals.netAmount when complete lines reconcile it", () => {
+    const result = validateInvoice({
+      invoiceType: "simplified",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0046-LINES",
+      seller: { name: "Rentemester ApS", address: "Testvej 1, 2100 København Ø", vatOrCvr: "DK12345678" },
+      lines: [{ description: "Kontant salg", quantity: 1, unitPriceExVat: 1000, lineTotalExVat: 1000 }],
+      totals: { grossAmount: 1250, vatRate: 0.25, vatAmount: 250 },
+      currency: "DKK",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  test("rejects a simplified invoice with complete lines and contradictory totals", () => {
+    const result = validateInvoice({
+      invoiceType: "simplified",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0046-LINES-BAD",
+      seller: { name: "Rentemester ApS", address: "Testvej 1, 2100 København Ø", vatOrCvr: "DK12345678" },
+      lines: [{ description: "Kontant salg", quantity: 1, unitPriceExVat: 1000, lineTotalExVat: 1000 }],
+      totals: { grossAmount: 1200, vatRate: 0.25, vatAmount: 250 },
+      currency: "DKK",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain("totals.grossAmount must equal rounded VAT line totals (1250)");
+  });
+
   test("accepts a simplified invoice whose canonical 20%-of-gross VAT lands on an øre-rounding boundary", () => {
     // gross 100,07 incl. 25% VAT — the VAT contained is roundDkk(100,07 × 0,20)
     // = 20,01. A net-first round-trip (roundDkk((gross−vat) × 0,25)) double-
@@ -146,6 +178,61 @@ describe("invoice validator", () => {
 
     expect(result.errors).toEqual([]);
     expect(result.ok).toBe(true);
+  });
+
+  test("rejects standard VAT totals that reconcile gross but not rounded line VAT", () => {
+    const result = validateInvoice({
+      invoiceType: "full",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0047-VAT",
+      seller: { name: "Rentemester ApS", address: "Testvej 1, 2100 København Ø", vatOrCvr: "DK12345678" },
+      buyer: { name: "Kunde A/S", address: "Købervej 9, 8000 Aarhus C" },
+      lines: [{ description: "Bogføring", quantity: 1, unitPriceExVat: 1000, lineTotalExVat: 1000 }],
+      totals: { netAmount: 1000, vatRate: 0.25, vatAmount: 200, grossAmount: 1200 },
+      currency: "DKK",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors).toContain("totals.vatAmount must equal rounded VAT line amounts (250)");
+    expect(result.errors).toContain("totals.grossAmount must equal rounded VAT line totals (1250)");
+  });
+
+  test("accepts mixed VAT categories using the sum of rounded line projections", () => {
+    const result = validateInvoice({
+      invoiceType: "full",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0047-MIXED",
+      seller: { name: "Rentemester ApS", address: "Testvej 1, 2100 København Ø", vatOrCvr: "DK12345678" },
+      buyer: { name: "Kunde A/S", address: "Købervej 9, 8000 Aarhus C" },
+      lines: [
+        { description: "Taxable service", quantity: 1, unitPriceExVat: 100, lineTotalExVat: 100, taxClassification: "taxable", vatRate: 0.25 },
+        { description: "Exempt service", quantity: 1, unitPriceExVat: 100, lineTotalExVat: 100, taxClassification: "exempt" },
+      ],
+      totals: { netAmount: 200, vatRate: 0.25, vatAmount: 25, grossAmount: 225 },
+      currency: "DKK",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  test("accepts an øre boundary when VAT is rounded per line", () => {
+    const result = validateInvoice({
+      invoiceType: "full",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0047-ORE",
+      seller: { name: "Rentemester ApS", address: "Testvej 1, 2100 København Ø", vatOrCvr: "DK12345678" },
+      buyer: { name: "Kunde A/S", address: "Købervej 9, 8000 Aarhus C" },
+      lines: [{ description: "Øre service", quantity: 1, unitPriceExVat: 0.02, lineTotalExVat: 0.02 }],
+      totals: { netAmount: 0.02, vatRate: 0.25, vatAmount: 0.01, grossAmount: 0.03 },
+      currency: "DKK",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.errors).toEqual([]);
   });
 
   test("rejects invoice with inconsistent line and gross totals", () => {

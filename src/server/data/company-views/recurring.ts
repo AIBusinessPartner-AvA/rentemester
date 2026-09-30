@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { companyPaths } from "../../../core/paths";
-import { openDb, migrate } from "../../../core/db";
+import { openCurrentLedgerReadOnly } from "../../../core/ledger-inspection";
 import {
   listRecurringInvoiceGenerations,
   listRecurringInvoiceTemplates,
@@ -30,7 +30,9 @@ export type RecurringInvoiceGenerationRow = {
 export type RecurringInvoiceTemplateRow = {
   id: number;
   name: string;
-  interval: "monthly" | "quarterly" | "yearly";
+  interval: "weekly" | "monthly" | "quarterly" | "yearly";
+  intervalCount: number;
+  deliveryChannel: "manual" | "email" | "digisense";
   firstIssueDate: string;
   /** Next date `generateRecurringInvoice` will materialize a new invoice for. */
   nextIssueDate: string;
@@ -66,14 +68,15 @@ export function buildCompanyRecurringInvoices(
     throw ApiError.notFound(`virksomheden '${slug}' har ingen ledger`);
   }
 
-  const db = openDb(dbPath);
+  const db = openCurrentLedgerReadOnly(dbPath);
   try {
-    migrate(db);
     const list = listRecurringInvoiceTemplates(db, { includeInactive: true });
     const templates: RecurringInvoiceTemplateRow[] = list.rows.map((row) => ({
       id: row.id,
       name: row.name,
       interval: row.interval,
+      intervalCount: row.intervalCount,
+      deliveryChannel: row.deliveryChannel,
       firstIssueDate: row.firstIssueDate,
       nextIssueDate: row.nextIssueDate,
       paymentTermsDays: row.paymentTermsDays,

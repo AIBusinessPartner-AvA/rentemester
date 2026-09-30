@@ -16,9 +16,15 @@ import {
 import { issueCreditNote } from "../../core/credit-notes";
 import { resolveInvoiceMasterData } from "../../core/master-data";
 import {
-  submitPublicEInvoicePeppol,
-  type PeppolAccessPointConfig,
+  resumePublicEInvoicePeppolSubmission,
+  transmitPublicEInvoicePeppol,
+  type SubmitPublicEInvoicePeppolResult,
 } from "../../core/public-einvoice";
+import {
+  digisenseAccessPointIdentity,
+  resolveDigisenseStatusChecker,
+  resolveDigisenseTransmitter,
+} from "../../core/efaktura/digisense-wiring";
 import {
   createSmtpTransport,
   looksLikeEmail,
@@ -34,11 +40,12 @@ import {
   companyRootForSlug,
   findWorkspaceCompany,
 } from "../../core/workspace";
-import { authMiddleware } from "../auth";
 import type { ServerConfig } from "../config";
+import { responseBodyFromBytes } from "../response-body";
 import { ApiError } from "../errors";
 import { withCockpitActor } from "../actor";
 import { withCompanyMutation } from "../mutations";
+import { assertLocalhostWriteAllowed } from "../mutations";
 import {
   okResponse,
   optionalBodyBoolean,
@@ -50,6 +57,26 @@ import {
   requireBodyPositiveInt,
   requireBodyString,
 } from "./_shared";
+
+type InvoiceDigisenseDependencies = {
+  resolveTransmitter: typeof resolveDigisenseTransmitter;
+  resolveStatusChecker: typeof resolveDigisenseStatusChecker;
+};
+
+const productionInvoiceDigisenseDependencies: InvoiceDigisenseDependencies = {
+  resolveTransmitter: resolveDigisenseTransmitter,
+  resolveStatusChecker: resolveDigisenseStatusChecker,
+};
+let invoiceDigisenseDependencies = productionInvoiceDigisenseDependencies;
+
+/** Test seam: inject local fake transport resolution; production uses wiring. */
+export function setInvoiceDigisenseDependenciesForTests(
+  dependencies: Partial<InvoiceDigisenseDependencies> | null,
+): void {
+  invoiceDigisenseDependencies = dependencies
+    ? { ...productionInvoiceDigisenseDependencies, ...dependencies }
+    : productionInvoiceDigisenseDependencies;
+}
 
 /**
  * POST /api/companies/:slug/invoices/issue — issues a sales invoice.
@@ -176,29 +203,9 @@ export async function handleInvoicePreview(
   request: Request,
   slug: string,
 ): Promise<Response> {
-  // Phase-1 localhost trust + the auth seam — kept identical to the write
-  // pipeline so the preview cannot be probed by a non-loopback client.
-  authMiddleware(request, config);
-  if (!config.authRequired) {
-    const hostHeader = (request.headers.get("host") ?? "").trim().toLowerCase();
-    const host = hostHeader.startsWith("[")
-      ? hostHeader.slice(
-          1,
-          hostHeader.indexOf("]") === -1 ? undefined : hostHeader.indexOf("]"),
-        )
-      : (hostHeader.split(":")[0] ?? "");
-    const isLoopback =
-      host === "127.0.0.1" ||
-      host === "localhost" ||
-      host === "::1" ||
-      host === "0:0:0:0:0:0:0:1";
-    if (!isLoopback) {
-      throw ApiError.unauthorized(
-        "Forhåndsvisning fra Cockpit er kun tilladt fra localhost, " +
-          "medmindre godkendelse er slået til.",
-      );
-    }
-  }
+  // Auth already ran in the router. Preview is read-only, but Phase-1
+  // localhost trust still applies to this potentially sensitive render path.
+  assertLocalhostWriteAllowed(request, config);
 
   if (!findWorkspaceCompany(config.workspaceRoot, slug)) {
     throw ApiError.notFound(`ingen virksomhed med slug '${slug}' findes i workspacet`);
@@ -277,7 +284,7 @@ export async function handleInvoicePreview(
     // PDF bytes inline — same Content-Type / cache headers as the real
     // `GET .../invoices/:id/pdf` route so the cockpit can open the response
     // in a new tab via window.open()/URL.createObjectURL.
-    return new Response(preview.pdfBytes, {
+    return new Response(responseBodyFromBytes(preview.pdfBytes), {
       status: 200,
       headers: {
         "content-type": "application/pdf",
@@ -489,116 +496,62 @@ export async function handleInvoiceCreditNote(
 }
 
 // --------------------------------------------------------------------------
-// Send som e-faktura (NemHandel / PEPPOL) — #428.
+// Send som e-faktura (NemHandel / DigiSense) — #428.
 //
-// A SMB owner that invoices a public buyer is required by law to deliver the
-// invoice as an e-faktura. Until now the only way to do so from Rentemester
-// was the CLI command `invoice submit-public-peppol`, which most owners never
-// discover. This handler is the Cockpit's third caller of the SAME
-// `submitPublicEInvoicePeppol` core function the CLI/MCP use — so the
-// Cockpit and the terminal produce byte-identical PEPPOL envelopes and
-// identical `peppol_submissions` rows.
-//
-// Access-point CONFIG (non-secret: accessPointId + endpointUrl + sender
-// endpointId) is read from a file referenced by the `RENTEMESTER_PEPPOL_ACCESS_POINT`
-// env var, mirroring how `bun run cli invoice submit-public-peppol` consumes
-// its `--access-point <file.json>`. Credentials never enter the request body
-// nor the server config object. When the env var is not configured, the
-// handler returns a 400 with a clear next-step message — never a 500.
-// --------------------------------------------------------------------------
-
-/**
- * Loads the non-secret PEPPOL access-point config from a JSON file at the
- * path in `RENTEMESTER_PEPPOL_ACCESS_POINT`. Returns `null` (not throws) when
- * the env var is missing — that case is mapped to a 400 with a clear
- * next-step so the SMB owner knows what to configure. A malformed file is a
- * 400 with the parse error verbatim.
- */
-function loadConfiguredPeppolAccessPoint(): PeppolAccessPointConfig {
-  const path = (process.env.RENTEMESTER_PEPPOL_ACCESS_POINT ?? "").trim();
-  if (!path) {
-    throw ApiError.badRequest(
-      "PEPPOL er ikke konfigureret i denne installation. " +
-        "Sæt RENTEMESTER_PEPPOL_ACCESS_POINT til stien for en JSON-fil med " +
-        "{accessPointId, endpointUrl, senderEndpointId} for at sende e-fakturaer.",
-    );
-  }
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (error) {
-    throw ApiError.badRequest(
-      `PEPPOL access-point-config kunne ikke læses fra ${path}: ${(error as Error).message}`,
-    );
-  }
-  let parsed: {
-    accessPointId?: string;
-    endpointUrl?: string;
-    senderEndpointId?: string;
-  };
-  try {
-    parsed = JSON.parse(raw) as typeof parsed;
-  } catch (error) {
-    throw ApiError.badRequest(
-      `PEPPOL access-point-config er ikke gyldig JSON: ${(error as Error).message}`,
-    );
-  }
-  return {
-    accessPointId: (parsed.accessPointId ?? "").trim(),
-    endpointUrl: (parsed.endpointUrl ?? "").trim(),
-    senderEndpointId: (parsed.senderEndpointId ?? "").trim(),
-  };
-}
+// The Cockpit deliberately has no access-point, credential or company-key
+// fields. All three are resolved from the selected company's local DigiSense
+// binding. This makes the deterministic access-point identity safe for the
+// acknowledged idempotency fast-path and prevents a browser from delivering
+// under another company's identity.
 
 /**
  * POST /api/companies/:slug/invoices/send-public — sends an issued invoice
  * as a public e-faktura via NemHandel / PEPPOL.
  *
- * Body: `{ invoiceDocumentId: number, confirm: true }`. Calls the SAME
- * `submitPublicEInvoicePeppol` core function the CLI's
- * `invoice submit-public-peppol` command uses, so the Cockpit and the
- * terminal produce byte-identical PEPPOL submission envelopes. Idempotent:
- * a second submission for the same invoice/access-point pair collapses onto
- * the existing `peppol_submissions` row (the underlying core enforces this
- * via a derived idempotency key) and the handler echoes `duplicate: true`.
+ * Body: `{ invoiceDocumentId: number, confirm: true }`. Resolves the real
+ * DigiSense transmitter for this company and delivers through the shared
+ * `transmitPublicEInvoicePeppol` path. An acknowledged retry never invokes
+ * the transport again.
  *
  * Write-irreversible (it inserts a `peppol_submissions` row AND appends an
  * `audit_log` entry — both write-once tables) so `requireConfirm` is set.
  * Goes through `withCompanyMutation`, so the backup lock, the localhost gate
  * and actor attribution all apply.
  *
- * The access-point CONFIG (non-secret: accessPointId + endpointUrl + sender
- * endpointId) is loaded from `RENTEMESTER_PEPPOL_ACCESS_POINT`; credentials
- * are NEVER passed in the request body. A missing/invalid config is a 400.
+ * Missing local DigiSense config/binding is a safe 400 core rejection.
  */
 export async function handleInvoiceSendPublic(
   config: ServerConfig,
   request: Request,
   slug: string,
 ): Promise<Response> {
-  const accessPoint = loadConfiguredPeppolAccessPoint();
-
   const result = await withCompanyMutation(
     request,
     config,
     slug,
-    (ctx, body) => {
-      // Touch the resolved actor so the cockpit's submit is attributable in
-      // the audit_log entry the core writes (the core itself records the
-      // submission as the authenticated actor that opened the db).
+    async (ctx, body): Promise<SubmitPublicEInvoicePeppolResult> => {
       void ctx.actor;
       const invoiceDocumentId = requireBodyPositiveInt(body, "invoiceDocumentId");
-      const submitted = submitPublicEInvoicePeppol(ctx.db, {
-        invoiceDocumentId,
-        accessPoint,
-      });
+      const resolved = invoiceDigisenseDependencies.resolveTransmitter(ctx.db, ctx.companyRoot);
+      if (!resolved.ok) return {
+        ok: false,
+        errors: resolved.errors,
+        appliedRules: [],
+      };
+      const submitted = await transmitPublicEInvoicePeppol(
+        ctx.db,
+        { invoiceDocumentId, accessPoint: digisenseAccessPointIdentity(resolved.companyKey) },
+        resolved.transmitter,
+      );
       return {
         ok: submitted.ok,
         errors: submitted.errors,
+        appliedRules: submitted.appliedRules,
         invoiceNumber: submitted.invoiceNumber,
         submissionReference: submitted.submissionReference,
         status: submitted.status,
         duplicate: submitted.duplicate,
+        transmissionId: submitted.transmissionId,
         envelopeSha256: submitted.envelopeSha256,
         oioublSha256: submitted.oioublSha256,
       };
@@ -612,6 +565,58 @@ export async function handleInvoiceSendPublic(
       submissionReference: result.submissionReference ?? null,
       status: result.status ?? null,
       duplicate: Boolean(result.duplicate),
+      transmissionId: result.transmissionId ?? null,
+      envelopeSha256: result.envelopeSha256 ?? null,
+      oioublSha256: result.oioublSha256 ?? null,
+    },
+  });
+}
+
+/**
+ * POST /api/companies/:slug/invoices/send-public/status — observes a queued
+ * DigiSense document. This action calls document-status only: it can append
+ * status evidence, but can never call document-delivery or redeliver.
+ */
+export async function handleInvoiceSendPublicStatus(
+  config: ServerConfig,
+  request: Request,
+  slug: string,
+): Promise<Response> {
+  const result = await withCompanyMutation(
+    request,
+    config,
+    slug,
+    async (ctx, body): Promise<SubmitPublicEInvoicePeppolResult> => {
+      void ctx.actor;
+      const invoiceDocumentId = requireBodyPositiveInt(body, "invoiceDocumentId");
+      const resolved = invoiceDigisenseDependencies.resolveStatusChecker(ctx.db, ctx.companyRoot);
+      if (!resolved.ok) return {
+        ok: false,
+        errors: resolved.errors,
+        appliedRules: [],
+      };
+      const submission = await resumePublicEInvoicePeppolSubmission(
+        ctx.db,
+        { invoiceDocumentId, accessPoint: digisenseAccessPointIdentity(resolved.companyKey) },
+        async (queuedDocumentId) => {
+          const status = await resolved.client.documentStatus(queuedDocumentId, resolved.companyKey);
+          return status.ok
+            ? { ok: true, status: status.data.documentStatus, message: status.data.message, publicUrl: status.data.publicUrl }
+            : { ok: false, error: `digisense document-status failed: ${status.error.message}` };
+        },
+      );
+      return submission;
+    },
+    { requireConfirm: true },
+  );
+
+  return okResponse({
+    submission: {
+      invoiceNumber: result.invoiceNumber ?? null,
+      submissionReference: result.submissionReference ?? null,
+      status: result.status ?? null,
+      duplicate: Boolean(result.duplicate),
+      transmissionId: result.transmissionId ?? null,
       envelopeSha256: result.envelopeSha256 ?? null,
       oioublSha256: result.oioublSha256 ?? null,
     },

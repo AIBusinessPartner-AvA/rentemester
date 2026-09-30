@@ -33,6 +33,7 @@ import { register as registerBankAccount } from "./cli/bank-account";
 // ===== END BANK CLUSTER (#187) =====
 import { register as registerVat } from "./cli/vat";
 import { register as registerJournal } from "./cli/journal";
+import { register as registerAccountingDraft } from "./cli/accounting-draft";
 import { register as registerSystem } from "./cli/system";
 import { register as registerCustomer } from "./cli/customer";
 import { register as registerVendor } from "./cli/vendor";
@@ -59,6 +60,10 @@ import { register as registerAsset } from "./cli/asset";
 import { register as registerCompany } from "./cli/company";
 // ===== COCKPIT BACKEND (#170) =====
 import { register as registerServe } from "./cli/serve";
+import { register as registerLocal } from "./cli/local";
+import { register as registerWorkspaceAccess } from "./cli/workspace-access";
+import { register as registerGroup } from "./cli/group";
+import { register as registerWorkspaceSnapshot } from "./cli/workspace-snapshot";
 // ===== FINANCIAL STATEMENTS (#176) =====
 import { register as registerReport } from "./cli/report";
 // ===== END FINANCIAL STATEMENTS (#176) =====
@@ -91,15 +96,22 @@ import { register as registerTax } from "./cli/tax";
 // ===== END TAX RETURN PREPARATION =====
 // ===== BUDGET + LIQUIDITY FORECAST =====
 import { register as registerBudget } from "./cli/budget";
+import { register as registerSupplierCommitments } from "./cli/supplier-commitments";
 // ===== END BUDGET + LIQUIDITY FORECAST =====
 // ===== PAYABLES / KREDITORSTYRING =====
 import { register as registerPayable } from "./cli/payable";
+import { register as registerPostingRules } from "./cli/posting-rules";
+import { register as registerBookkeepingBatch } from "./cli/bookkeeping-batch";
+import { register as registerWorkspaceRegistry } from "./cli/workspace-registry";
+import { register as registerDimensions } from "./cli/dimensions";
+import { register as registerPurchaseCase } from "./cli/purchase-case";
 // ===== END PAYABLES / KREDITORSTYRING =====
 import {
   isValidSlug,
   resolveConfiguredWorkspaceRoot,
-  resolveWorkspaceSlug,
+  resolveWorkspaceRoot,
 } from "./core/workspace";
+import { resolveWorkspaceCompany } from "./core/workspace-company-resolver";
 import { migrate, openDb } from "./core/db";
 import { companyPaths } from "./core/paths";
 import { evaluateBackupLock } from "./core/backup-governance";
@@ -162,8 +174,10 @@ function resolveCompanyRoot(): string {
       fatal(error instanceof Error ? error.message : String(error));
     }
     if (workspaceRoot) {
-      const fromSlug = resolveWorkspaceSlug(workspaceRoot, raw);
-      if (fromSlug) return fromSlug;
+      const target = resolveWorkspaceCompany(workspaceRoot, raw, {
+        selection: "registered", archived: "allow", ledger: "optional",
+      });
+      if (target.ok) return target.company.companyRoot;
       fatal(
         `--company '${raw}': no company with that slug in workspace ${workspaceRoot}. ` +
           `Run 'rentemester company list' or pass a path instead.`,
@@ -182,6 +196,33 @@ function resolveCompanyRoot(): string {
   return resolved;
 }
 
+/** The bootstrap policy is deliberately the explicitly selected manifest company. */
+function resolveWorkspaceAccessPolicyRoot(): string {
+  const workspaceRaw = trimToNull(parsedArgs.flags.get("--workspace") as string | undefined);
+  const slug = trimToNull(parsedArgs.flags.get("--company") as string | undefined);
+  if (!workspaceRaw || !slug || !isValidSlug(slug)) {
+    fatal("workspace-access command requires --workspace <dir> and a registered --company <slug>");
+  }
+  const workspace = resolveWorkspaceRoot(workspaceRaw);
+  const target = resolveWorkspaceCompany(workspace, slug, {
+    selection: "registered", archived: "allow", ledger: "optional",
+  });
+  if (!target.ok) fatal("workspace-access command requires a registered company");
+  return target.company.companyRoot;
+}
+
+function resolveGroupPolicyRoot(): string {
+  const workspaceRaw = trimToNull(parsedArgs.flags.get("--workspace") as string | undefined);
+  const slug = trimToNull(parsedArgs.flags.get("--policy-company") as string | undefined);
+  if (!workspaceRaw || !slug || !isValidSlug(slug)) fatal("group apply-manifest requires --workspace <dir> and --policy-company <slug>");
+  const workspace = resolveWorkspaceRoot(workspaceRaw);
+  const target = resolveWorkspaceCompany(workspace, slug, {
+    selection: "registered", archived: "deny", ledger: "optional",
+  });
+  if (!target.ok) fatal("group apply-manifest requires an active registered --policy-company");
+  return target.company.companyRoot;
+}
+
 const parsedArgs = parseCliArgs(Bun.argv);
 const [cmd, sub] = parsedArgs.positionals;
 const commandSpec = getCommandSpec(cmd, sub);
@@ -197,7 +238,8 @@ if (flagErrors.length > 0) fatal(flagErrors.join("\n"));
 if (parsedArgs.flags.has("--example")) {
   if (!commandSpec?.examplePath)
     fatal(`No example is registered for ${cmd}${sub ? ` ${sub}` : ""}`);
-  process.stdout.write(readFileSync(commandSpec.examplePath, "utf8"));
+  const examplePath = resolve(import.meta.dir, "..", commandSpec.examplePath);
+  process.stdout.write(readFileSync(examplePath, "utf8"));
   process.exit(0);
 }
 
@@ -241,12 +283,15 @@ for (const registerFn of [
   registerExceptions,
   registerInvoice,
   registerDocuments,
+  registerDimensions,
+  registerPurchaseCase,
   registerBank,
   // ===== BANK CLUSTER (#187) =====
   registerBankAccount,
   // ===== END BANK CLUSTER (#187) =====
   registerVat,
   registerJournal,
+  registerAccountingDraft,
   registerSystem,
   registerCustomer,
   registerVendor,
@@ -270,8 +315,12 @@ for (const registerFn of [
   // Fixed assets (#124, #125)
   registerAsset,
   registerCompany,
+  registerWorkspaceAccess,
+  registerWorkspaceSnapshot,
+  registerGroup,
   // ===== COCKPIT BACKEND (#170) =====
   registerServe,
+  registerLocal,
   // ===== FINANCIAL STATEMENTS (#176) =====
   registerReport,
   // ===== END FINANCIAL STATEMENTS (#176) =====
@@ -305,9 +354,13 @@ for (const registerFn of [
   // ===== END ACCRUALS / PERIODEAFGRÆNSNINGSPOSTER =====
   // ===== BUDGET + LIQUIDITY FORECAST =====
   registerBudget,
+  registerSupplierCommitments,
   // ===== END BUDGET + LIQUIDITY FORECAST =====
   // ===== PAYABLES / KREDITORSTYRING =====
   registerPayable,
+  registerPostingRules,
+  registerBookkeepingBatch,
+  registerWorkspaceRegistry,
   // ===== END PAYABLES / KREDITORSTYRING =====
 ]) {
   registerFn(dispatch);
@@ -325,14 +378,48 @@ if (!cmd || cmd === "help") {
     console.log(renderGlobalUsage());
     process.exit(2);
   }
+  // These commands use a value-bearing apply capability. Validate its exact
+  // spelling before actor policy so malformed requests are usage errors.
+  const applyValue = parsedArgs.flags.get("--apply");
+  const confirmValue = parsedArgs.flags.get("--confirm");
+  if ((commandKey === "documents parse" || commandKey === "documents parse-pending") && confirmValue !== "yes") {
+    fatal("--confirm must be exactly yes");
+  }
+  if ((commandKey === "period review" || commandKey === "period close") && confirmValue !== "yes") {
+    fatal("--confirm must be exactly yes");
+  }
+  if ((commandKey === "expense vat-preflight" || commandKey === "system migrate") &&
+      applyValue !== undefined && applyValue !== "yes") {
+    fatal("--apply must be exactly yes");
+  }
   // Enforce the actor policy only when actually executing a mutating
   // command — never for `help` / `--help`, which neither read nor write
   // company data. `restore-backup` writes to --target-company, not
   // --company, so resolve its policy root from that flag.
-  if (MUTATING_COMMANDS.has(commandKey)) {
+  // `expense vat-preflight` is read-only unless its explicit `--apply`
+  // switch is present. Only apply participates in actor and backup gates.
+  if (MUTATING_COMMANDS.has(commandKey) &&
+      !(commandKey === "expense vat-preflight" && applyValue !== "yes") &&
+      !(commandKey === "system migrate" && applyValue !== "yes")) {
     const mutationRoot = commandKey === "system restore-backup"
       ? trimToNull(parsedArgs.flags.get("--target-company") as string | undefined)
-      : ctx.companyRoot();
+      // The workspace handler performs an all-target actor + backup preflight
+      // before any network/write. A synthetic --company must not substitute
+      // for those actual target ledgers here.
+      : commandKey === "workspace-access bootstrap-first" || commandKey === "workspace-access bootstrap-local-service" || commandKey === "workspace-access local-service-rotate" || commandKey === "workspace-access local-service-revoke"
+        ? resolveWorkspaceAccessPolicyRoot()
+        : commandKey === "workspace snapshot" || commandKey === "workspace restore"
+          || commandKey.startsWith("party ") || commandKey.startsWith("corporate-record ")
+          ? null
+        : commandKey === "group apply-manifest"
+          ? resolveGroupPolicyRoot()
+        : commandKey === "efaktura modtag-workspace" || commandKey === "recurring-invoice run-workspace" ||
+          commandKey === "group propose-mapping" || commandKey === "group approve-mapping" || commandKey === "group revoke-mapping"
+          || commandKey === "group propose-elimination" || commandKey === "group approve-elimination" || commandKey === "group reject-elimination" || commandKey === "group apply-elimination" || commandKey === "group reverse-elimination"
+          || commandKey === "group propose-profile" || commandKey === "group approve-profile" || commandKey === "group revoke-profile"
+          || commandKey === "group propose-disposition" || commandKey === "group approve-disposition" || commandKey === "group link-disposition"
+        ? null
+        : ctx.companyRoot();
     if (mutationRoot) {
       enforceMutationActorPolicy(commandKey, mutationRoot, cliActor, cliActorVia, fatal);
     }

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { migrate, openDb } from "../../src/core/db";
+import { inspectSchemaViews, repairCanonicalSchemaViews } from "../../src/core/ledger-inspection";
 
 function failOneCanonicalTriggerCreate(realDb: any) {
   return new Proxy(realDb, {
@@ -49,7 +50,7 @@ describe("database trigger restoration", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("migrate replaces a weakened interest-correction authority view", () => {
+  test("migrate leaves a stale view for explicit canonical repair", () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-view-restore-"));
     const db = openDb(join(root, "ledger.sqlite"));
     migrate(db);
@@ -64,14 +65,42 @@ describe("database trigger restoration", () => {
       `SELECT sql FROM sqlite_master
         WHERE type = 'view' AND name = 'invoice_interest_correction_authorized_claims'`,
     ).get() as { sql: string } | null)?.sql ?? "";
-    expect(restoredSql).toContain("WITH RECURSIVE");
-    expect(restoredSql).not.toContain("sentinel");
+    expect(restoredSql).toContain("sentinel");
+    expect(inspectSchemaViews(db).ok).toBe(false);
+
+    const repaired = repairCanonicalSchemaViews(db);
+    expect(repaired.ok).toBe(true);
+    const canonicalSql = (db.query(
+      `SELECT sql FROM sqlite_master
+        WHERE type = 'view' AND name = 'invoice_interest_correction_authorized_claims'`,
+    ).get() as { sql: string } | null)?.sql ?? "";
+    expect(canonicalSql).toContain("WITH RECURSIVE");
+    expect(canonicalSql).not.toContain("sentinel");
 
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("migrate restores credit-note cardinality and claim-journal authority", () => {
+  test("migrate leaves a missing current view missing for explicit repair", () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-view-missing-"));
+    const db = openDb(join(root, "ledger.sqlite"));
+    migrate(db);
+    db.exec("DROP VIEW invoice_interest_correction_authorized_claims;");
+    migrate(db);
+    expect(db.query("SELECT 1 FROM sqlite_master WHERE type='view' AND name='invoice_interest_correction_authorized_claims'").get()).toBeNull();
+    db.close(); rmSync(root, { recursive: true, force: true });
+  });
+
+  test("migrate restores all v17 append-only guards", () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-pdf-guard-"));
+    const db = openDb(join(root, "ledger.sqlite")); migrate(db);
+    for (const name of ["document_pdf_parse_attempts_no_update", "document_pdf_parse_results_no_delete", "document_pdf_parse_pages_no_update"]) db.exec(`DROP TRIGGER ${name}`);
+    migrate(db);
+    for (const name of ["document_pdf_parse_attempts_no_update", "document_pdf_parse_results_no_delete", "document_pdf_parse_pages_no_update"]) expect(db.query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?").get(name)).not.toBeNull();
+    db.close(); rmSync(root, { recursive: true, force: true });
+  });
+
+  test("migrate restores triggers but leaves view repair to the explicit command", () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-claim-guard-restore-"));
     const db = openDb(join(root, "ledger.sqlite"));
     migrate(db);
@@ -124,11 +153,9 @@ describe("database trigger restoration", () => {
     expect(creditTrigger).toContain("only one accounting journal");
     expect(reversalTrigger).toContain("one existing unreversed posted original");
     expect(claimTrigger).toContain("exact DKK receivable/income journal");
-    expect(claimView).toContain("invalid_line_count");
-    expect(claimView).not.toContain("sentinel");
+    expect(claimView).toContain("sentinel");
     expect(badDebtTrigger).toContain("exact VAT-relief expense/output-VAT/receivable journal");
-    expect(badDebtView).toContain("is_valid");
-    expect(badDebtView).not.toContain("sentinel");
+    expect(badDebtView).toContain("sentinel");
 
     db.close();
     rmSync(root, { recursive: true, force: true });

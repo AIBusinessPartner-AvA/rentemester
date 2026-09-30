@@ -49,7 +49,7 @@ export function PeriodsView() {
   const data = state.data!;
 
   return (
-    <section className="periods-view">
+    <section className="periods-view" data-cockpit-page="period-lock" data-evidence-issue="655">
       <header className="page-head">
         <div>
           <h2>{data.company.name}</h2>
@@ -107,7 +107,7 @@ export function PeriodsView() {
             vises her sammen med deres effective status.
           </p>
         ) : (
-          <table className="table">
+          <div className="table-scroll"><table className="table responsive-table" aria-label="Regnskabsperioder">
             <thead>
               <tr>
                 <th>Start</th>
@@ -154,7 +154,7 @@ export function PeriodsView() {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         )}
       </section>
 
@@ -201,6 +201,9 @@ function ClosePeriodModal({
   const [kind, setKind] = useState<AccountingPeriodKind>("vat_period");
   const [reference, setReference] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [packet, setPacket] = useState<{ hash: string; blockers: number; warnings: number; items: Array<{code:string;status:"passed"|"warning"|"blocked"|"unavailable";waivable:boolean;count:number}> } | null>(null);
+  const [force, setForce] = useState(false);
+  const [forceReason, setForceReason] = useState("");
   // #301 — a period whose end lies in the future is not over yet. Require a
   // second, explicit acknowledgement before such a close can go through, the
   // same guard VatView's close-modal has.
@@ -217,11 +220,26 @@ function ClosePeriodModal({
     }
     setSubmitting(true);
     try {
+      if (!packet) {
+        setPacket(await api.closeReadiness(slug, periodStart, periodEnd));
+        setSubmitting(false);
+        return;
+      }
+      const review = await api.reviewCloseReadiness(slug, periodStart, periodEnd);
+      if (review.packet.hash !== packet.hash) {
+        setPacket(review.packet);
+        onError("Grundlaget ændrede sig. Kontrollér den nye packet før lukning.");
+        setSubmitting(false);
+        return;
+      }
       await api.closePeriod(slug, {
         periodStart,
         periodEnd,
         kind,
         ...(reference ? { reference } : {}),
+        packetHash: review.packet.hash,
+        reviewId: review.id,
+        ...(force ? { force: true, reason: forceReason } : {}),
       });
       onDone();
     } catch (err) {
@@ -246,6 +264,14 @@ function ClosePeriodModal({
               required
             />
           </label>
+          {packet && <>
+            <p className="muted">Kontrolleret: {packet.blockers} blokeringer, {packet.warnings} advarsler. Gennemgå resultatet og vælg derefter “Gem review og luk”.</p>
+            {packet.blockers > 0 && <>
+              <div className="callout danger">Blokeringer: {packet.items.filter((item) => item.status === "blocked" || item.status === "unavailable").map((item) => item.code).join(", ")}</div>
+              <label className="confirm-ack"><input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} /> Anmod om force-lukning af alene fravigelige blokeringer</label>
+              {force && <label>Begrundelse for force-lukning<textarea value={forceReason} onChange={(e) => setForceReason(e.target.value)} required rows={2} /></label>}
+            </>}
+          </>}
           <label>
             Slut (YYYY-MM-DD)
             <input
@@ -302,10 +328,10 @@ function ClosePeriodModal({
               type="submit"
               className="btn primary"
               disabled={
-                submitting || (periodEndsInFuture && !futureEndAcknowledged)
+                submitting || (periodEndsInFuture && !futureEndAcknowledged) || (packet?.blockers !== 0 && (!force || !forceReason.trim()))
               }
             >
-              {submitting ? "Lukker …" : "Luk periode"}
+              {submitting ? "Arbejder …" : packet ? "Gem review og luk" : "Kontrollér"}
             </button>
             <button type="button" className="btn secondary" onClick={onClose}>
               Annullér

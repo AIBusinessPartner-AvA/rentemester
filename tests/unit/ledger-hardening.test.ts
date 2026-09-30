@@ -10,7 +10,7 @@ import { ingestDocument } from "../../src/core/documents";
 import { postJournalEntry, seedAccounts, verifyAuditChain } from "../../src/core/ledger";
 import { issueInvoice } from "../../src/core/issued-invoices";
 import { postIssuedInvoiceToLedger } from "../../src/core/invoice-booking";
-import { closeAccountingPeriod } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
 
 describe("ledger hardening", () => {
   test("prevents direct mutation of journal lines after posting", () => {
@@ -140,7 +140,7 @@ describe("ledger hardening", () => {
     });
     expect(posted.ok).toBe(true);
 
-    expect(() => db.run("UPDATE bank_transactions SET amount = 9999 WHERE id = ?", bank.id)).toThrow("bank transaction is referenced by ledger or payment records and cannot be modified");
+    expect(() => db.run("UPDATE bank_transactions SET amount = 9999 WHERE id = ?", bank.id)).toThrow("bank transaction is referenced by ledger, reconciliation, or payment records and cannot be modified");
     expect(() => db.run("DELETE FROM bank_transactions WHERE id = ?", bank.id)).toThrow("bank transactions are append-only");
 
     db.close();

@@ -29,12 +29,14 @@ import { useAsync } from "../lib/useAsync";
 import type {
   CompanyInvoiceRow,
   CompanyInvoices,
+  ImportedReceivableRow,
   InvoiceStatus,
 } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { InvoiceIssueModal } from "../components/InvoiceIssueModal";
+import { PageState, StatusChip } from "../components/CockpitPrimitives";
+import { PartyLink } from "../components/PartyLink";
 
 // #UI-16 — the statutory late-payment reminder fee (rentel. § 9b), in kroner.
 // One named constant, rendered through `formatKroner`, so the two places that
@@ -62,14 +64,22 @@ export function InvoicesView() {
     () => api.invoices(slug, year),
     [slug, year],
   );
+  // The archive schedule is deliberately a second read: it has its own
+  // source hashes and must never be silently mixed into issued-invoice totals.
+  const imported = useAsync(
+    () => api.importedReceivables(slug, `${year ?? new Date().getFullYear()}-12-31`),
+    [slug, year],
+  );
   // True while the invoice-issue modal (#213, slice 4) is open.
   const [issuing, setIssuing] = useState(false);
   // The invoice row whose "Afstem" ConfirmDialog is open, if any.
   const [settling, setSettling] = useState<CompanyInvoiceRow | null>(null);
+  const [settlingImported, setSettlingImported] = useState<ImportedReceivableRow | null>(null);
   // The invoice row whose "Krediter" ConfirmDialog is open, if any (#412).
   const [crediting, setCrediting] = useState<CompanyInvoiceRow | null>(null);
-  // The invoice row whose "Forbered e-faktura" ConfirmDialog is open (#428).
+  // The invoice row whose "Send e-faktura" ConfirmDialog is open (#428).
   const [sendingPublic, setSendingPublic] = useState<CompanyInvoiceRow | null>(null);
+  const [checkingPublicStatus, setCheckingPublicStatus] = useState<CompanyInvoiceRow | null>(null);
   // The invoice row whose "Send på mail" ConfirmDialog is open (#429).
   const [sendingEmail, setSendingEmail] = useState<CompanyInvoiceRow | null>(null);
   // The invoice row whose "Send rykker" ConfirmDialog is open (#434).
@@ -80,15 +90,15 @@ export function InvoicesView() {
   const [reminderBookFee, setReminderBookFee] = useState(true);
 
   if (state.loading && !state.data)
-    return <Loading label="Henter fakturaer…" />;
+    return <PageState kind="loading" title="Henter fakturaer" />;
   if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <PageState kind="error" title="Fakturaer kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState>;
 
   const inv = state.data!;
   const currency = inv.company.currency || "DKK";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="invoices" data-evidence-issue="655">
       <div className="page-head">
         <div>
           <h2>{inv.company.name}</h2>
@@ -121,6 +131,23 @@ export function InvoicesView() {
         selectedYear={inv.selectedYear}
         onYearChange={setYear}
       />
+      <p className="statement-asof muted"><StatusChip coverage={inv.coverage} />{inv.coverage.asOfDate ? ` · Pr. ${inv.coverage.asOfDate}` : ""}</p>
+
+      <section className="card statement-card" aria-label="Importerede tilgodehavender">
+        <div className="row-between">
+          <div>
+            <h3>Importerede tilgodehavender</h3>
+            <p className="muted">Kildearkiv pr. {year ?? new Date().getFullYear()}-12-31 — ikke Rentemester-udstedte fakturaer.</p>
+          </div>
+          <strong>{imported.data ? formatKroner(imported.data.totalOpen, currency) : "—"}</strong>
+        </div>
+        {imported.error ? <p className="muted">Kunne ikke hente importarkivet.</p> : imported.data?.rows.length ? (
+          <div className="table-scroll"><table className="data responsive-table" aria-label="Kilde-fakturaer"><thead><tr><th>Kilde-faktura</th><th>Kunde</th><th>Dato</th><th className="num">Åben saldo</th><th>Handling</th></tr></thead><tbody>
+            {imported.data.rows.map((row) => <tr key={`${row.scheduleHash}:${row.externalInvoiceId}`}><td>{row.externalInvoiceId}</td><td>{row.customerName ?? "—"}</td><td>{formatDateDa(row.invoiceDate)}</td><td className="num">{formatKroner(row.openBalance, currency)}</td><td>{row.openBalance > 0 ? <button type="button" className="btn secondary" onClick={() => setSettlingImported(row)}>Afstem bankpost</button> : "—"}</td></tr>)}
+          </tbody></table></div>
+        ) : <p className="muted">Ingen importerede tilgodehavender i arkivet.</p>}
+        <p className="muted">{imported.data?.boundary ?? "Importarkivet holdes adskilt fra nye fakturaer for at undgå dobbelttælling."}</p>
+      </section>
 
       {issuing && (
         <InvoiceIssueModal
@@ -158,6 +185,28 @@ export function InvoicesView() {
             state.reload();
           }}
           onClose={() => setSettling(null)}
+        />
+      )}
+
+      {settlingImported && (
+        <ConfirmDialog
+          title="Afstem importeret tilgodehavende mod bankpost"
+          body={<p>Afstem kildefaktura <strong>{settlingImported.externalInvoiceId}</strong> mod én indgående DKK-bankpost. Det opretter en append-only postering og kan ikke fortrydes.</p>}
+          confirmLabel="Afstem bankpost"
+          confirmKind="danger"
+          noteLabel="Bankpost-id"
+          notePlaceholder="Det numeriske ID fra bankoversigten"
+          onConfirm={async (value) => {
+            const bankTransactionId = Number(value.trim());
+            if (!Number.isInteger(bankTransactionId) || bankTransactionId <= 0) throw { code: "bad_request", message: "Angiv et gyldigt numerisk bankpost-id." };
+            const input = { scheduleHash: settlingImported.scheduleHash, externalInvoiceId: settlingImported.externalInvoiceId, bankTransactionId };
+            const plan = await api.planImportedReceivableSettlement(slug, input);
+            if (!plan.ok || !plan.plan?.planHash) throw { code: "bad_request", message: "Afregningen blev afvist. Kontrollér bankpost, valuta, beløb og åben saldo." };
+            const result = await api.applyImportedReceivableSettlement(slug, { ...input, planHash: plan.plan.planHash, idempotencyKey: crypto.randomUUID() });
+            if (!result.ok) throw { code: "bad_request", message: result.errors?.join("; ") || "Afregningen blev afvist." };
+            await imported.reload();
+          }}
+          onClose={() => setSettlingImported(null)}
         />
       )}
 
@@ -201,23 +250,22 @@ export function InvoicesView() {
         />
       )}
 
-      {/* #428: Forbered e-faktura ConfirmDialog. The action is only ever
+      {/* #428: Send e-faktura ConfirmDialog. The action is only ever
           offered for rows with an EAN-number on a public-recipient buyer;
           the dialog shows that EAN + the kanal so the owner can sanity-check
           who and where the invoice will be transmitted to. Write-irreversible
           (it records a peppol_submissions row + an audit_log entry), so the
           server requires `confirm: true` — the dialog's primary button maps
           to that flag.
-          Audit UI-2: the server only RECORDS the submission envelope (status
-          `prepared`) — the AS4/NemHandel transport is not wired in yet. The
-          dialog must say "forberedes/registreres", never promise "Sendes nu". */}
+          The server resolves the selected company's DigiSense identity and
+          transmits now; no transport identity or credentials come from the UI. */}
       {sendingPublic && (
         <ConfirmDialog
-          title="Forbered e-faktura"
+          title="Send e-faktura"
           body={
             <div>
               <p>
-                Forbered faktura <strong>{sendingPublic.invoiceNo}</strong> til{" "}
+                Send faktura <strong>{sendingPublic.invoiceNo}</strong> til{" "}
                 <strong>{sendingPublic.customerName ?? "modtageren"}</strong> som
                 e-faktura via NemHandel/PEPPOL.
               </p>
@@ -228,21 +276,20 @@ export function InvoicesView() {
                 </div>
                 <div>
                   <dt>Kanal</dt>
-                  <dd>NemHandel (PEPPOL)</dd>
+                  <dd>DigiSense via NemHandel (PEPPOL)</dd>
                 </div>
                 <div>
                   <dt>Handling</dt>
-                  <dd>Registreres til afsendelse</dd>
+                  <dd>Sendes nu</dd>
                 </div>
               </dl>
               <p className="muted">
-                Fakturaen registreres til afsendelse via NemHandel — selve
-                transmissionen er endnu ikke aktiv i denne version.
-                Registreringen indgår i revisionssporet og kan ikke fortrydes.
+                Fakturaen sendes via DigiSense. Leveringsstatus vises bagefter;
+                en køsat faktura kan kun statuskontrolleres og sendes aldrig igen.
               </p>
             </div>
           }
-          confirmLabel="Registrér til afsendelse"
+          confirmLabel="Send e-faktura"
           confirmKind="danger"
           onConfirm={async () => {
             await api.sendInvoiceAsEInvoice(slug, {
@@ -251,6 +298,20 @@ export function InvoicesView() {
             state.reload();
           }}
           onClose={() => setSendingPublic(null)}
+        />
+      )}
+
+      {checkingPublicStatus && (
+        <ConfirmDialog
+          title="Opdatér leveringsstatus"
+          body={<p>Kontrollér leveringsstatus for <strong>{checkingPublicStatus.invoiceNo}</strong>. Handlingen observerer kun den eksisterende DigiSense-afsendelse og sender ikke fakturaen igen.</p>}
+          confirmLabel="Kontrollér status"
+          confirmKind="danger"
+          onConfirm={async () => {
+            await api.refreshEInvoiceStatus(slug, { invoiceDocumentId: checkingPublicStatus.documentId });
+            state.reload();
+          }}
+          onClose={() => setCheckingPublicStatus(null)}
         />
       )}
 
@@ -450,7 +511,7 @@ export function InvoicesView() {
           </div>
 
           <div className="card statement-card table-scroll">
-            <table className="data statement-table">
+            <table className="data statement-table responsive-table" aria-label="Fakturaer">
               <thead>
                 <tr>
                   <th>Fakturanr.</th>
@@ -478,18 +539,17 @@ export function InvoicesView() {
                     row.status !== "credited" &&
                     row.status !== "refunded" &&
                     row.status !== "written_off";
-                  // #428: "Forbered e-faktura" appears only when the buyer
+                  // #428: A fresh send is offered only when the buyer
                   // is a public recipient with a valid EAN-number (the
                   // server-side requirement for a NemHandel/PEPPOL send).
-                  // Hidden once the invoice has been acknowledged by the
-                  // access point — re-sending an already-acknowledged
-                  // invoice would only confuse the owner. A `prepared`
-                  // status (envelope recorded but not acknowledged) still
-                  // allows a retry.
+                  // A pre-acceptance transport failure is retryable. Once the
+                  // access point has returned a queued document id, only the
+                  // status action is allowed — never a second delivery.
                   const canSendPublic =
                     Boolean(row.buyerEanNumber) &&
                     row.buyerPublicRecipient &&
-                    row.peppolStatus?.status !== "acknowledged";
+                    (row.peppolStatus === null || row.peppolStatus.status === "retryable");
+                  const canCheckPublicStatus = row.peppolStatus?.status === "queued";
                   // #429: "Send på mail" appears only when the customer
                   // has an e-mail on the kontaktkort — without it the
                   // dialog has no recipient to prefill, and the issue
@@ -509,7 +569,7 @@ export function InvoicesView() {
                   return (
                     <tr key={row.documentId}>
                       <td className="account-no">{row.invoiceNo}</td>
-                      <td>{row.customerName ?? "—"}</td>
+                      <td><PartyLink slug={slug} partyId={row.partyId}>{row.customerName ?? "—"}</PartyLink></td>
                       <td className="entry-date">{row.invoiceDate ?? "—"}</td>
                       <td className="entry-date">
                         {row.effectiveDueDate ?? "—"}
@@ -580,8 +640,16 @@ export function InvoicesView() {
                             }
                           >
                             {row.peppolStatus.status === "acknowledged"
-                              ? "Sendt som e-faktura"
-                              : "E-faktura forberedt"}
+                              ? "E-faktura leveret"
+                              : row.peppolStatus.status === "queued"
+                                ? "E-faktura køsat — afventer status"
+                                : row.peppolStatus.status === "failed"
+                                  ? "E-faktura afvist — send ikke igen"
+                                : row.peppolStatus.status === "uncertain"
+                                  ? "E-faktura-status ukendt — afklar manuelt"
+                                : row.peppolStatus.status === "in_progress"
+                                  ? "E-faktura afsendes"
+                                  : "E-faktura fejlede — kan prøves igen"}
                           </span>
                         )}
                       </td>
@@ -621,22 +689,24 @@ export function InvoicesView() {
                               Kreditér
                             </button>
                           )}
-                          {/* #428 — "Forbered e-faktura" is shown ONLY when
+                          {/* #428 — "Send e-faktura" is shown ONLY when
                               the customer has an EAN-number on file (a public
                               buyer). Hidden for archived years and once the
                               invoice has been acknowledged by the access
-                              point. The button replaces the missing CLI step
-                              `invoice submit-public-peppol`. Audit UI-2: it
-                              says "Forbered", not "Send" — the server only
-                              records the envelope (status `prepared`); the
-                              AS4 transport is not wired in yet. */}
+                              point. A queued delivery has its own status-only
+                              action and can never be redelivered from here. */}
                           {!inv.archived && canSendPublic && (
                             <button
                               type="button"
                               className="btn secondary"
                               onClick={() => setSendingPublic(row)}
                             >
-                              Forbered e-faktura
+                              Send e-faktura
+                            </button>
+                          )}
+                          {!inv.archived && canCheckPublicStatus && (
+                            <button type="button" className="btn secondary" onClick={() => setCheckingPublicStatus(row)}>
+                              Opdatér leveringsstatus
                             </button>
                           )}
                           {/* #429 — "Send på mail" is shown ONLY when the

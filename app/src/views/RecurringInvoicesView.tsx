@@ -33,9 +33,15 @@ type Page = {
 };
 
 const INTERVAL_LABELS: Record<RecurringInvoiceTemplateRow["interval"], string> = {
+  weekly: "ugentligt",
   monthly: "månedligt",
   quarterly: "kvartalsvist",
   yearly: "årligt",
+};
+const CHANNEL_LABELS: Record<"manual" | "email" | "digisense", string> = {
+  manual: "manuel kladde",
+  email: "e-mail",
+  digisense: "e-faktura",
 };
 
 export function RecurringInvoicesView() {
@@ -76,7 +82,7 @@ export function RecurringInvoicesView() {
     fiscalYears.find((y) => y.label === selectedYear)?.source === "archive";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="invoice-templates" data-evidence-issue="655">
       <div className="page-head">
         <div>
           <h2>Faktura-skabeloner</h2>
@@ -267,7 +273,7 @@ function TemplateCard({
         {!template.active && <span className="muted">(tilbagetrukken)</span>}
       </h4>
       <p className="muted">
-        {INTERVAL_LABELS[template.interval]} · næste udstedelse{" "}
+        {(template.intervalCount ?? 1) > 1 ? `hver ${template.intervalCount}. ` : ""}{INTERVAL_LABELS[template.interval]} · {CHANNEL_LABELS[template.deliveryChannel ?? "manual"]} · næste udstedelse{" "}
         {template.nextIssueDate} · betalingsfrist {template.paymentTermsDays}{" "}
         dage
         {template.notes ? ` · ${template.notes}` : ""}
@@ -316,7 +322,7 @@ function TemplateCard({
 
       {template.generations.length > 0 && (
         <div className="table-scroll" style={{ marginTop: 12 }}>
-          <table className="data statement-table">
+          <table className="data statement-table responsive-table" aria-label="Udstedte fakturaer fra skabelonen">
             <thead>
               <tr>
                 <th>Periode</th>

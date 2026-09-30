@@ -1,0 +1,5 @@
+{
+  "id": 20,
+  "name": "rentemester-mutation-idempotency-foundation-v20",
+  "sql": "CREATE TABLE IF NOT EXISTS ledger_identity (id INTEGER PRIMARY KEY CHECK(id = 1), ledger_uuid TEXT NOT NULL UNIQUE CHECK(length(ledger_uuid) = 32 AND ledger_uuid NOT GLOB '*[^0-9a-f]*'), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);\nINSERT OR IGNORE INTO ledger_identity(id, ledger_uuid) VALUES (1, lower(hex(randomblob(16))));\nCREATE TRIGGER IF NOT EXISTS ledger_identity_no_update BEFORE UPDATE ON ledger_identity BEGIN SELECT RAISE(ABORT, 'ledger identity is immutable'); END;\nCREATE TRIGGER IF NOT EXISTS ledger_identity_no_delete BEFORE DELETE ON ledger_identity BEGIN SELECT RAISE(ABORT, 'ledger identity is append-only'); END;\n"
+}

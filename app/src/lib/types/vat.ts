@@ -7,22 +7,24 @@ import type { FiscalYearEntry, StatementCompany } from "./common";
  * numbers an owner types into the momsangivelse. All amounts are kroner.
  */
 export type VatRubrikker = {
-  /** Salgsmoms — output VAT on domestic sales (net of bad-debt relief). */
   salgsmoms: number;
-  /** Moms af varekøb i udlandet — VAT on goods purchased abroad. */
-  momsAfVarekobUdland: number;
-  /** Moms af ydelseskøb i udlandet — reverse-charge VAT on foreign services. */
-  momsAfYdelseskobUdland: number;
-  /** Købsmoms — total deductible input VAT. */
   kobsmoms: number;
-  /** Momstilsvar — salgsmoms + udenlandsk moms − købsmoms; positive = owed. */
-  momstilsvar: number;
-  /** Rubrik A — value of goods/services bought abroad without Danish VAT. */
-  rubrikA: number;
-  /** Rubrik B — value of goods/services sold abroad without Danish VAT. */
-  rubrikB: number;
-  /** Rubrik C — value of other VAT-exempt sales. */
+  momsAfVarekobUdland: number;
+  momsAfYdelseskobUdland: number;
+  rubrikAVarer: number;
+  rubrikAYdelser: number;
+  rubrikBVarerEuSalesList: number;
+  rubrikBVarerIkkeEuSalesList: number;
+  rubrikBYdelser: number;
   rubrikC: number;
+  olieOgFlaskegasafgift: number;
+  elafgift: number;
+  naturgasOgBygasafgift: number;
+  kulafgift: number;
+  co2Afgift: number;
+  vandafgift: number;
+  momsIAlt: number;
+  wholeKronerDifferenceDkk: number;
 };
 
 /** Fields common to both registered and non-registered companies. */
@@ -56,10 +58,9 @@ export type CompanyVatRegistered = CompanyVatCommon & {
   periodStart: string;
   periodEnd: string;
   /**
-   * Genuine output VAT on sales (salgsmoms) for the period, kroner — gross,
-   * before any bad-debt relief. A bad-debt write-off books a debit on the
-   * output-VAT account; surfacing the relief separately keeps this headline
-   * from going negative (#271).
+   * Gross output-VAT control position for the period, kroner, before any
+   * bad-debt relief. Filing-only salgsmoms is exposed as `rubrikker.salgsmoms`;
+   * reverse-charge VAT remains in this control total.
    */
   outputVat: number;
   /** Bad-debt (debitortab) output-VAT adjustment, ≤ 0; 0 when none, kroner. */

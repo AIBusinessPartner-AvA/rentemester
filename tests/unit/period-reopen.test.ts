@@ -9,24 +9,35 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { ensureCompanyDirs } from "../../src/core/paths";
 import { openDb, migrate } from "../../src/core/db";
+import { seedAccounts } from "../../src/core/ledger";
+import { seedNativeAccountRoles } from "../../src/core/account-roles";
 import {
-  closeAccountingPeriod,
   reopenAccountingPeriod,
   effectivePeriodState,
   validateJournalTransactionDate,
 } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
+import { createPeriodCloseReadinessPacket, reviewPeriodCloseReadiness } from "../../src/core/period-close-readiness";
 
 function freshDb(prefix: string) {
   const root = mkdtempSync(join(tmpdir(), prefix));
   const db = openDb(ensureCompanyDirs(root).db);
   migrate(db);
+  seedAccounts(db);
+  seedNativeAccountRoles(db);
   return { root, db };
+}
+
+function reviewed(db: ReturnType<typeof openDb>, packet: ReturnType<typeof createPeriodCloseReadinessPacket>) {
+  const review = reviewPeriodCloseReadiness(db, { packet, reviewerActor: "user:ejer", reviewerPrincipal: { kind: "local-trusted", subjectId: "ejer" } });
+  return { readinessPacketHash: packet.hash, readinessReviewId: review.id };
 }
 
 describe("period reopen (#247)", () => {
   test("reopens a closed period via an append-only audit event without mutating the row", () => {
     const { root, db } = freshDb("rentemester-reopen-basic-");
 
+    const readiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30" });
     const closed = closeAccountingPeriod(db, {
       periodStart: "2026-04-01",
       periodEnd: "2026-06-30",
@@ -36,6 +47,10 @@ describe("period reopen (#247)", () => {
       // requires the explicit force bypass — the test is about reopen, not the
       // future-close guard.
       force: true,
+      forceAuthorization: { principal: { kind: "local-trusted", subjectId: "ejer" }, permissions: ["company.period.force-close"] },
+      forceConfirmed: true,
+      forceReason: "synthetic future-period reopen setup",
+      ...reviewed(db, readiness),
     });
     expect(closed.ok).toBe(true);
 
@@ -84,7 +99,8 @@ describe("period reopen (#247)", () => {
   test("a re-close locks the reopened period again", () => {
     const { root, db } = freshDb("rentemester-reopen-reclose-");
 
-    closeAccountingPeriod(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30", kind: "vat_quarter", force: true });
+    const initialReadiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30" });
+    closeAccountingPeriod(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30", kind: "vat_quarter", force: true, ...reviewed(db, initialReadiness), forceAuthorization: { principal: { kind: "local-trusted", subjectId: "test" }, permissions: ["company.period.force-close"] }, forceConfirmed: true, forceReason: "synthetic future-period reclose setup", createdBy: "user:test" });
     reopenAccountingPeriod(db, {
       periodStart: "2026-04-01",
       periodEnd: "2026-06-30",
@@ -95,12 +111,17 @@ describe("period reopen (#247)", () => {
     expect(validateJournalTransactionDate(db, "2026-05-15")).toEqual([]);
 
     // Re-closing the SAME bounds is not an overlap conflict — it re-locks.
+    const rereadiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30" });
     const reclosed = closeAccountingPeriod(db, {
       periodStart: "2026-04-01",
       periodEnd: "2026-06-30",
       kind: "vat_quarter",
       createdBy: "user:ejer",
       force: true,
+      forceAuthorization: { principal: { kind: "local-trusted", subjectId: "ejer" }, permissions: ["company.period.force-close"] },
+      forceConfirmed: true,
+      forceReason: "synthetic reopened-period reclose",
+      ...reviewed(db, rereadiness),
     });
     expect(reclosed.ok).toBe(true);
     expect(validateJournalTransactionDate(db, "2026-05-15")).toEqual([
@@ -123,12 +144,14 @@ describe("period reopen (#247)", () => {
   test("refuses to reopen a reported period (already submitted to the authority)", () => {
     const { root, db } = freshDb("rentemester-reopen-reported-");
 
+    const readiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31" });
     closeAccountingPeriod(db, {
       periodStart: "2026-01-01",
       periodEnd: "2026-03-31",
       kind: "vat_quarter",
       status: "reported",
       createdBy: "user:ejer",
+      ...reviewed(db, readiness),
     });
     const result = reopenAccountingPeriod(db, {
       periodStart: "2026-01-01",
@@ -169,7 +192,8 @@ describe("period reopen (#247)", () => {
     expect(missing.errors[0]).toContain("no vat_period period");
 
     // Period exists, closed, then reopened — reopening again is a no-op error.
-    closeAccountingPeriod(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30", kind: "vat_quarter", force: true });
+    const initialReadiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30" });
+    closeAccountingPeriod(db, { periodStart: "2026-04-01", periodEnd: "2026-06-30", kind: "vat_quarter", force: true, ...reviewed(db, initialReadiness), forceAuthorization: { principal: { kind: "local-trusted", subjectId: "test" }, permissions: ["company.period.force-close"] }, forceConfirmed: true, forceReason: "synthetic reopen guard setup", createdBy: "user:test" });
     reopenAccountingPeriod(db, {
       periodStart: "2026-04-01",
       periodEnd: "2026-06-30",

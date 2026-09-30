@@ -32,8 +32,27 @@ export const serveSpec: CommandSpec[] = [
   },
 ];
 
+/** Local single-company launcher. It deliberately has no --host flag. */
+export const localSpecs: CommandSpec[] = [
+  {
+    key: "local start",
+    usage: "local start --workspace <dir> [--company-name <text> --actor <actor> --confirm yes] [--port <n>] [--no-open]",
+    description: "Åbner et lokalt, loopback-bundet cockpit for præcis én aktiv virksomhed. En ny eller tom workspace initialiseres kun med eksplicit virksomhedsnavn, actor og bekræftelse.",
+    allowedFlags: ["--workspace", "--company-name", "--port", "--no-open", "--confirm"],
+    inputNotes: [
+      "--workspace er altid påkrævet; kommandoen vælger aldrig en skjult standardmappe.",
+      "På en ny/tom workspace kræves --company-name, --actor <user:…|agent:…|system:…> og --confirm yes, før filer oprettes.",
+      "Kommandoen binder altid kun 127.0.0.1 og slår hosted Better Auth samt shared-token-auth fra, også hvis de findes i procesmiljøet.",
+      "Hvis workspacet har mere end én aktiv virksomhed, afvises launcheren. Brug 'rentemester serve --workspace <dir>' til flerfirma/hosted-drift.",
+      "--no-open springer browseråbning over og er beregnet til tests, headless brug og scripts.",
+    ],
+  },
+];
+
 export const systemSpecs: CommandSpec[] = [
   { key: "system healthcheck", usage: "system healthcheck --company <slug|path>", description: "Tjekker at virksomhedsmappen og kernefiler findes.", allowedFlags: ["--company"] },
+  { key: "system migrate", usage: "system migrate --company <slug|path> [--apply yes]", description: "Viser skemastatus read-only; kun --apply yes udfører en ledger-migrering. CLI-only.", allowedFlags: ["--company", "--apply"] },
+  { key: "system repair-schema-views", usage: "system repair-schema-views --company <slug|path> --reason <text> [--apply yes]", description: "Viser eller reparerer drift i kanoniske SQL-views. Kun --apply yes ændrer databasen; reparationen er CLI-only og audit-logges.", allowedFlags: ["--company", "--reason", "--apply"] },
   { key: "system backup", usage: "system backup --company <path> [--at <ISO-8601>] [--sign-with-ed25519] [--archive]", description: "Opretter en revisionsklar backup. Med --sign-with-ed25519 tilføjes en asymmetrisk signatur som 3.-part kan verificere uafhængigt. Med --archive pakkes backuppen straks til én .tar-fil klar til off-site placering.", allowedFlags: ["--company", "--at", "--sign-with-ed25519", "--archive"] },
   { key: "system backup-status", usage: "system backup-status --company <path> [--as-of <ISO-8601>]", description: "Viser om backup-pligten er opfyldt.", allowedFlags: ["--company", "--as-of"] },
   {
@@ -74,9 +93,9 @@ export const systemSpecs: CommandSpec[] = [
   },
   {
     key: "system backup-verify-remote-placement",
-    usage: "system backup-verify-remote-placement --company <path> --destination <dest-id> --backup-id <id> --archive-sha256 <hex> --archive-size <bytes> --remote-provider <name> --remote-object-id <id> --remote-object-name <name> --remote-parent-id <id> [--max-metadata-age-ms <ms>] [--actor-kind human|agent] [--at <ISO-8601>] [--note <text>]",
+    usage: "system backup-verify-remote-placement --company <path> --destination <dest-id> --backup-id <id> --remote-object-id <id> [--max-metadata-age-ms <ms>] [--actor-kind human|agent] [--at <ISO-8601>] [--note <text>]",
     description: "Verificerer en ekstern backup med en injiceret provider-adapter: objekt-id, navn, parent, størrelse, checksum og downloadet indhold skal matche. Uden en konfigureret adapter afvises kaldet; declared evidence opgraderes aldrig.",
-    allowedFlags: ["--company", "--destination", "--backup-id", "--archive-sha256", "--archive-size", "--remote-provider", "--remote-object-id", "--remote-object-name", "--remote-parent-id", "--max-metadata-age-ms", "--actor-kind", "--at", "--note"],
+    allowedFlags: ["--company", "--destination", "--backup-id", "--remote-object-id", "--max-metadata-age-ms", "--actor-kind", "--at", "--note"],
   },
   {
     key: "system backup-lock",

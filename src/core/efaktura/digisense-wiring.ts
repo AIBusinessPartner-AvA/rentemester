@@ -17,12 +17,29 @@ import { createDigisenseClient, type DigisenseClient, type KsefEnvironment } fro
 import { createDigisenseTransmitter } from "./digisense-transmitter";
 import { defaultDocumentDownloader, type DigisenseDocumentDownloader } from "./digisense-receive";
 import { loadDigisenseSecretConfig } from "./digisense-config";
-import { listDigisenseCompanies } from "./digisense-state";
+import { resolveBoundDigisenseCompanyKey } from "./digisense-identity";
 import type { PeppolTransmitter, PeppolAccessPointConfig } from "../public-einvoice";
 
 export type ResolveDigisenseTransmitter =
   | { ok: true; transmitter: PeppolTransmitter; companyKey: string }
   | { ok: false; errors: string[] };
+
+export type ResolveDigisenseStatusChecker =
+  | { ok: true; client: DigisenseClient; companyKey: string }
+  | { ok: false; errors: string[] };
+
+/** Resolves the status-only client for a previously queued Digisense document. */
+export function resolveDigisenseStatusChecker(
+  db: Database,
+  companyRoot: string,
+  options: { companyKey?: string } = {},
+): ResolveDigisenseStatusChecker {
+  const secret = loadDigisenseSecretConfig(companyRoot);
+  if (!secret) return { ok: false, errors: [digisenseNotConfiguredError("kontrolleres leveringsstatus")] };
+  const companyKey = resolveBoundDigisenseCompanyKey(db, options.companyKey);
+  if (!companyKey.ok) return { ok: false, errors: companyKey.errors };
+  return { ok: true, companyKey: companyKey.value, client: createDigisenseClient({ apiLicenseKey: secret.apiLicenseKey, environment: secret.environment }) };
+}
 
 /**
  * For Digisense ER access point'et Digisense selv: createDigisenseTransmitter
@@ -68,7 +85,7 @@ export function resolveDigisenseTransmitter(
     return { ok: false, errors: [digisenseNotConfiguredError("sendes")] };
   }
 
-  const companyKey = resolveCompanyKey(db, options.companyKey);
+  const companyKey = resolveBoundDigisenseCompanyKey(db, options.companyKey);
   if (!companyKey.ok) return { ok: false, errors: companyKey.errors };
 
   const client = createDigisenseClient({
@@ -76,10 +93,10 @@ export function resolveDigisenseTransmitter(
     environment: secret.environment,
   });
 
-  // ksefEnvironment defaulter til miljøet fra secret-config'en (PRODUCTION/TEST)
+  // KSeF uses PROD (not "PRODUCTION") as its production environment value.
   // hvis ikke eksplicit sat — så test-credentials aldrig rammer prod-routing.
   const ksefEnvironment =
-    options.ksefEnvironment ?? (secret.environment === "production" ? "PRODUCTION" : "TEST");
+    options.ksefEnvironment ?? (secret.environment === "production" ? "PROD" : "TEST");
 
   const transmitter = createDigisenseTransmitter(client, {
     companyKey: companyKey.value,
@@ -111,7 +128,7 @@ export function resolveDigisenseReceiver(
     return { ok: false, errors: [digisenseNotConfiguredError("modtages")] };
   }
 
-  const companyKey = resolveCompanyKey(db, options.companyKey);
+  const companyKey = resolveBoundDigisenseCompanyKey(db, options.companyKey);
   if (!companyKey.ok) return { ok: false, errors: companyKey.errors };
 
   const client = createDigisenseClient({
@@ -169,33 +186,4 @@ function digisenseNotConfiguredError(action: string): string {
     `--environment test|production\` (eller MCP-tool'et efaktura_konfigurer). Det skriver ` +
     `config/digisense.json (0600) før der kan ${action} e-fakturaer.`
   );
-}
-
-function resolveCompanyKey(
-  db: Database,
-  explicit: string | undefined,
-): { ok: true; value: string } | { ok: false; errors: string[] } {
-  const trimmed = explicit?.trim();
-  if (trimmed) return { ok: true, value: trimmed };
-
-  const companies = listDigisenseCompanies(db);
-  if (companies.length === 1) {
-    return { ok: true, value: companies[0]!.companyKey };
-  }
-  if (companies.length === 0) {
-    return {
-      ok: false,
-      errors: [
-        "Ingen Digisense-virksomhed er registreret (digisense_companies er tom). " +
-          "Registrér virksomheden hos Digisense (register-company) før der sendes.",
-      ],
-    };
-  }
-  return {
-    ok: false,
-    errors: [
-      `Flere Digisense-virksomheder er registreret (${companies.length}). ` +
-        "Angiv hvilken companyKey der skal sendes fra med --digisense-company-key.",
-    ],
-  };
 }

@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "bun:test";
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { IncomeStatementView } from "./IncomeStatementView";
@@ -47,14 +47,10 @@ describe("IncomeStatementView — Resultatopgørelse", () => {
     expect(screen.getByText("Vareforbrug")).toBeInTheDocument();
   });
 
-  test("the company sub-nav links to the other views", async () => {
+  test("the daily navigation lets the owner find reports", async () => {
     mockFetch(route());
     renderView();
-    const balanceTab = await screen.findByRole("link", { name: "Balance" });
-    expect(balanceTab).toHaveAttribute(
-      "href",
-      expect.stringContaining("/companies/acme-aps/balance"),
-    );
+    expect(await screen.findByRole("link", { name: "Rapporter" })).toHaveAttribute("href", expect.stringContaining("/companies/acme-aps/resultatopgorelse"));
   });
 
   test("the fiscal-year selector reloads for the chosen year", async () => {
@@ -62,7 +58,7 @@ describe("IncomeStatementView — Resultatopgørelse", () => {
     renderView();
     const select = await screen.findByLabelText("Vælg regnskabsår");
     await userEvent.selectOptions(select, "2025");
-    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
     const lastUrl = String(calls[calls.length - 1]![0]);
     expect(lastUrl).toContain("year=2025");
   });

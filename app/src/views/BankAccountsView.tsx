@@ -13,12 +13,14 @@ import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import { useAsync } from "../lib/useAsync";
 import type { BankAccount, CompanyBankAccounts } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
+import { LegacyBankBindingModal } from "../components/LegacyBankBindingModal";
+import { PageState, ResponsiveTable } from "../components/CockpitPrimitives";
 
 export function BankAccountsView() {
   const { slug = "" } = useParams();
   const [refresh, setRefresh] = useState(0);
   const [openCreate, setOpenCreate] = useState(false);
+  const [legacyBinding,setLegacyBinding]=useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const state = useAsync<CompanyBankAccounts>(
@@ -26,12 +28,12 @@ export function BankAccountsView() {
     [slug, refresh],
   );
 
-  if (state.loading) return <Loading />;
-  if (state.error) return <ErrorState message={state.error} />;
+  if (state.loading) return <PageState kind="loading" title="Henter bankkonti" />;
+  if (state.error) return <PageState kind="error" title="Bankkonti kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState>;
   const data = state.data!;
 
   return (
-    <section className="bank-accounts-view">
+    <section className="bank-accounts-view" data-cockpit-page="bank-accounts" data-evidence-issue="655">
       <header className="page-head">
         <div>
           <h2>{data.company.name}</h2>
@@ -62,6 +64,12 @@ export function BankAccountsView() {
           {error}
         </div>
       )}
+      {legacyBinding&&<LegacyBankBindingModal slug={slug} accounts={data.accounts} onApplied={()=>setRefresh(value=>value+1)} onClose={()=>setLegacyBinding(false)} />}
+
+      <section className="card">
+        <h3>Bankkonti til den daglige bogføring</h3>
+        <p>Registrér den konto, du bruger til at hente og afstemme bankbevægelser.</p>
+      </section>
 
       <section className="card">
         <h3>Registrerede bankkonti ({data.accounts.length})</h3>
@@ -71,7 +79,7 @@ export function BankAccountsView() {
             <code>BankImportModal</code> eller CLI'ens <code>bank import</code>.
           </p>
         ) : (
-          <table className="table">
+          <ResponsiveTable label="Registrerede bankkonti">
             <thead>
               <tr>
                 <th>Navn</th>
@@ -91,18 +99,22 @@ export function BankAccountsView() {
                 <BankAccountRow key={a.id} account={a} />
               ))}
             </tbody>
-          </table>
+          </ResponsiveTable>
         )}
       </section>
 
-      <section className="card">
+      <details className="card">
+        <summary>Avanceret: legacy-binding og importprofiler</summary>
+        <div className="row-actions">
+          <button type="button" className="btn secondary" disabled={!data.accounts.some(account=>account.ledgerAccountNo===null)} onClick={()=>setLegacyBinding(true)}>Bind ældre bankkonto</button>
+        </div>
         <h3>Indbyggede CSV-mapping-profiler ({data.profiles.length})</h3>
         <p className="muted">
           BankImportModal og CLI'ens <code>bank import --profile &lt;navn&gt;</code>
           genbruger disse hard-kodede mapping-profiler. Pr.-konto mapping-
           override er en follow-up.
         </p>
-        <table className="table">
+        <ResponsiveTable label="CSV-mapping-profiler">
           <thead>
             <tr>
               <th>Profil-navn</th>
@@ -127,8 +139,8 @@ export function BankAccountsView() {
               </tr>
             ))}
           </tbody>
-        </table>
-      </section>
+        </ResponsiveTable>
+      </details>
 
       {openCreate && (
         <CreateBankAccountModal

@@ -12,7 +12,8 @@ import { buildVatReport } from "../../src/core/vat";
 import { buildVatFiling } from "../../src/core/vat-filing";
 import { vatRubrikkerForPeriod } from "../../src/server/data/vat";
 import { buildOssReport } from "../../src/core/vat-oss";
-import { closeAccountingPeriod, setCompanyVatPeriodType } from "../../src/core/periods";
+import { setCompanyVatPeriodType } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
 import { postJournalEntry, seedAccounts } from "../../src/core/ledger";
 
 function newCompany(prefix: string) {
@@ -117,7 +118,7 @@ describe("OSS first slice (digital services to EU consumers)", () => {
     // Only the domestic sale's VAT lands in salgsmoms — the OSS sale is excluded.
     expect(filing.rubrikker.salgsmoms).toBe(250);
     // OSS sales are NOT rubrik B (that is non-OSS cross-border) nor rubrik C.
-    expect(filing.rubrikker.rubrikB).toBe(0);
+    expect(filing.rubrikker.rubrikBVarerEuSalesList).toBe(0);
     expect(filing.rubrikker.rubrikC).toBe(0);
 
     db.close();

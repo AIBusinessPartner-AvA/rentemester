@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { companyPaths } from "../core/paths";
+import { inspectLedger } from "../core/ledger-inspection";
 import {
   initialiseCompanyVolume,
   summariseCompanyVolume,
@@ -245,6 +246,7 @@ export function register(dispatch: CommandDispatch): void {
   });
 
   dispatch.on("system", "healthcheck", (ctx) => {
+    const machineOutput = ctx.hasFlag("--json") || ctx.arg("--format") === "json";
     const p = companyPaths(ctx.companyRoot());
     const checks: Array<[string, boolean]> = [
       ["company_root", existsSync(p.root)],
@@ -255,9 +257,33 @@ export function register(dispatch: CommandDispatch): void {
     ];
     let ok = true;
     for (const [name, pass] of checks) {
-      console.log(`${pass ? "OK" : "FAIL"} ${name}`);
+      if (!machineOutput) console.log(`${pass ? "OK" : "FAIL"} ${name}`);
       if (!pass) ok = false;
     }
-    if (!ok) process.exit(1);
+    let schema: ReturnType<typeof inspectLedger> | undefined;
+    if (existsSync(p.db)) {
+      schema = inspectLedger(p.db);
+      if (!machineOutput) {
+        console.log(`${schema.status === "current" ? "OK" : "FAIL"} schema_${schema.status} current=${schema.currentVersion} required=${schema.requiredVersion}`);
+      }
+      if (schema.status !== "current") ok = false;
+    }
+    const missing = checks.filter(([, pass]) => !pass).map(([name]) => name);
+    const errors = [
+      ...missing.map((name) => `missing: ${name}`),
+      ...(schema && schema.status !== "current"
+        ? [`schema_${schema.status}: current=${schema.currentVersion} required=${schema.requiredVersion}`]
+        : []),
+    ];
+    const result = {
+      ok,
+      errors,
+      checks: checks.map(([name, pass]) => ({ name, ok: pass })),
+      missing,
+      schema_outdated: schema?.status === "pending",
+      schema,
+    };
+    if (machineOutput) ctx.emitResult(result);
+    else if (!ok) process.exit(1);
   });
 }

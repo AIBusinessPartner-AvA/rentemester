@@ -1,16 +1,17 @@
 // Tests: src/core/issued-invoices.ts
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { ensureCompanyDirs, companyPaths } from "../../src/core/paths";
-import { openDb, migrate } from "../../src/core/db";
-import { issueInvoice } from "../../src/core/issued-invoices";
+import { join } from "node:path";
+import { addBankAccount } from "../../src/core/bank";
 import { issueCreditNote } from "../../src/core/credit-notes";
-import { seedAccounts } from "../../src/core/ledger";
-import { storeViesValidation } from "../../src/core/vies";
-import { readIssuedInvoicePdfText, renderIssuedInvoicePdf } from "../../src/core/invoice-pdf";
+import { migrate, openDb } from "../../src/core/db";
 import { postIssuedInvoiceToLedger } from "../../src/core/invoice-booking";
+import { readIssuedInvoicePdfText, renderIssuedInvoicePdf } from "../../src/core/invoice-pdf";
+import { issueInvoice } from "../../src/core/issued-invoices";
+import { seedAccounts } from "../../src/core/ledger";
+import { companyPaths, ensureCompanyDirs } from "../../src/core/paths";
+import { storeViesValidation } from "../../src/core/vies";
 
 function failingDocumentInsertDb(realDb: any) {
   return new Proxy(realDb, {
@@ -119,6 +120,76 @@ describe("invoice issue", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("never regenerates or replaces issued PDF evidence after master-data changes or tampering", () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-issued-pdf-immutable-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, {
+      invoiceType: "full",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0001",
+      seller: { name: "Rentemester ApS", address: "Testvej 1", vatOrCvr: "DK12345678" },
+      buyer: { name: "Kunde A/S", address: "Købervej 9" },
+      lines: [{ description: "Bogføring", quantity: 1, unitPriceExVat: 1000, lineTotalExVat: 1000 }],
+      totals: { netAmount: 1000, vatRate: 0.25, vatAmount: 250, grossAmount: 1250 },
+      currency: "DKK",
+    });
+    expect(issued.ok).toBe(true);
+    const originalBytes = readFileSync(issued.pdfStoredPath!);
+    const before = db.query("SELECT sha256_hash, stored_path FROM documents WHERE id = ?").get(issued.pdfDocumentId!) as { sha256_hash: string; stored_path: string };
+
+    // Later payment master data must not change the customer-facing evidence.
+    expect(addBankAccount(db, { name: "New bank details", accountNo: "9999999999", currency: "DKK" }).ok).toBe(true);
+    const rerender = renderIssuedInvoicePdf(db, root, { invoiceDocumentId: issued.documentId! });
+    expect(rerender).toMatchObject({ ok: true, renderDocumentId: issued.pdfDocumentId, sha256: before.sha256_hash });
+    expect(readFileSync(issued.pdfStoredPath!)).toEqual(originalBytes);
+    expect(db.query("SELECT sha256_hash, stored_path FROM documents WHERE id = ?").get(issued.pdfDocumentId!)).toEqual(before);
+    expect(() => db.run("UPDATE documents SET sha256_hash = 'changed' WHERE id = ?", issued.pdfDocumentId!)).toThrow("immutable");
+
+    // A hash mismatch is evidence of tampering, not an instruction to silently
+    // regenerate a friendlier PDF from the current master data.
+    writeFileSync(issued.pdfStoredPath!, Buffer.from("tampered PDF bytes"));
+    const tampered = renderIssuedInvoicePdf(db, root, { invoiceDocumentId: issued.documentId! });
+    expect(tampered.ok).toBe(false);
+    expect(tampered.errors.join(" ")).toContain("refusing to repair");
+    expect(readFileSync(issued.pdfStoredPath!)).toEqual(Buffer.from("tampered PDF bytes"));
+    expect(db.query("SELECT sha256_hash, stored_path FROM documents WHERE id = ?").get(issued.pdfDocumentId!)).toEqual(before);
+
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("reuses issued PDF evidence registered with a legacy absolute host path", () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-issued-pdf-legacy-path-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, {
+      invoiceType: "full",
+      vatTreatment: "standard",
+      issueDate: "2026-05-16",
+      invoiceNumber: "2026-0001",
+      seller: { name: "Synthetic seller", address: "Testvej 1", vatOrCvr: "DK12345678" },
+      buyer: { name: "Synthetic buyer", address: "Testvej 2" },
+      lines: [{ description: "Service", quantity: 1, unitPriceExVat: 100, lineTotalExVat: 100 }],
+      totals: { netAmount: 100, vatRate: 0.25, vatAmount: 25, grossAmount: 125 },
+      currency: "DKK",
+    });
+    expect(issued.ok).toBe(true);
+    const historicalPath = `/old-linux-company/invoices/issued/${issued.pdfStoredPath!.split("/").at(-1)!}`;
+    db.exec("DROP TRIGGER issued_invoice_pdf_no_update");
+    db.query("UPDATE documents SET stored_path=? WHERE id=?").run(historicalPath, issued.pdfDocumentId!);
+
+    const reused = renderIssuedInvoicePdf(db, root, { invoiceDocumentId: issued.documentId! });
+    expect(reused).toMatchObject({ ok: true, renderDocumentId: issued.pdfDocumentId, sha256: issued.pdfSha256 });
+    expect(db.query("SELECT stored_path AS storedPath FROM documents WHERE id=?").get(issued.pdfDocumentId!)).toEqual({
+      storedPath: historicalPath,
+    });
+
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("persists non-DKK issued invoices with deterministic DKK totals in the snapshot payload", () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-issue-fx-"));
     const db = openDb(ensureCompanyDirs(root).db);
@@ -173,8 +244,6 @@ describe("invoice issue", () => {
       valid: true,
       name: "EU Kunde GmbH",
       address: "Berlin",
-      validatedAt: "2026-05-15T00:00:00.000Z",
-      expiresAt: "2026-08-15T00:00:00.000Z",
       rawResponse: JSON.stringify({ valid: true })
     });
 
@@ -213,8 +282,6 @@ describe("invoice issue", () => {
     storeViesValidation(db, {
       vatOrCvr: "DE123456789",
       valid: true,
-      validatedAt: "2026-05-15T00:00:00.000Z",
-      expiresAt: "2026-08-15T00:00:00.000Z",
       rawResponse: JSON.stringify({ valid: true })
     });
 

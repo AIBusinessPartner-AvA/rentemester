@@ -15,9 +15,11 @@ import { tmpdir } from "node:os";
 import { ensureCompanyDirs } from "../../src/core/paths";
 import { openDb, migrate } from "../../src/core/db";
 import { seedAccounts, postJournalEntry } from "../../src/core/ledger";
+import { seedNativeAccountRoles } from "../../src/core/account-roles";
 import { ingestDocument } from "../../src/core/documents";
 import { importBankCsv } from "../../src/core/bank";
-import { closeAccountingPeriod } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
+import { createPeriodCloseReadinessPacket, reviewPeriodCloseReadiness } from "../../src/core/period-close-readiness";
 import {
   listExceptions,
   resolveException,
@@ -30,6 +32,7 @@ function setup(prefix: string) {
   const db = openDb(ensureCompanyDirs(root).db);
   migrate(db);
   seedAccounts(db);
+  seedNativeAccountRoles(db);
   db.query(
     `INSERT INTO companies (id, name, country, currency, cvr, company_form, fiscal_year_start_month, fiscal_year_label_strategy)
      VALUES (1, 'Rentemester ApS', 'DK', 'DKK', 'DK12345678', 'Anpartsselskab', 1, 'end-year')`,
@@ -62,6 +65,11 @@ function teardown(args: { root: string; inbox: string; db: ReturnType<typeof ope
   rmSync(args.inbox, { recursive: true, force: true });
 }
 
+function reviewed(db: ReturnType<typeof openDb>, packet: ReturnType<typeof createPeriodCloseReadinessPacket>) {
+  const review = reviewPeriodCloseReadiness(db, { packet, reviewerActor: "user:ejer", reviewerPrincipal: { kind: "local-trusted", subjectId: "ejer" } });
+  return { readinessPacketHash: packet.hash, readinessReviewId: review.id };
+}
+
 describe("closeAccountingPeriod — unreconciled bank transactions guard (EJER-4)", () => {
   test("refuses to close a period containing an unreconciled bank transaction, even when its exception was note-resolved without booking", () => {
     const ctx = setup("rentemester-close-unrec-");
@@ -85,56 +93,48 @@ describe("closeAccountingPeriod — unreconciled bank transactions guard (EJER-4
     ).toBe(false);
 
     // The close must STILL refuse: the bank transaction is unreconciled.
+    const readiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31" });
     const close = closeAccountingPeriod(db, {
       periodStart: "2026-01-01",
       periodEnd: "2026-03-31",
       kind: "vat_quarter",
       createdBy: "user:ejer",
+      ...reviewed(db, readiness),
     });
     expect(close.ok).toBe(false);
     const error = close.errors.join(" ");
     // Danish, names the count and an example, and explains the consequence.
-    expect(error).toContain("1 uafstemt");
-    expect(error).toContain(`#${bankId}`);
-    expect(error).toContain("2026-02-15");
-    expect(error).toContain("momsangivelsen bliver forkert");
-    expect(error).toContain("force");
+    expect(error).toBe("PERIOD_CLOSE_BLOCKED:1");
 
     teardown(ctx);
   });
 
-  test("force:true closes anyway and audit-logs the bypass with the unreconciled count", () => {
+  test("force:true cannot waive an unavailable independent control reconciliation", () => {
     const ctx = setup("rentemester-close-unrec-force-");
     const { db } = ctx;
 
     importOneBankTransaction(db, ctx.root, ctx.inbox, "2026-02-15", "Indbetaling kunde", 2500);
 
+    const readiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31" });
     const close = closeAccountingPeriod(db, {
       periodStart: "2026-01-01",
       periodEnd: "2026-03-31",
       kind: "vat_quarter",
       createdBy: "user:ejer",
       force: true,
+      forceAuthorization: { principal: { kind: "local-trusted", subjectId: "ejer" }, permissions: ["company.period.force-close"] },
+      forceConfirmed: true,
+      forceReason: "synthetic unreconciled-bank close waiver",
+      ...reviewed(db, readiness),
     });
-    expect(close.ok).toBe(true);
-    expect(close.periodId).toBeGreaterThan(0);
-
-    // The deliberate bypass is recorded on the period's close audit event.
-    const audit = db
-      .query(
-        `SELECT message FROM audit_log
-          WHERE entity_type = 'accounting_period' AND entity_id = ? AND event_type = 'period_close'
-          ORDER BY id DESC LIMIT 1`,
-      )
-      .get(String(close.periodId)) as { message: string } | null;
-    expect(audit).toBeDefined();
-    expect(audit!.message).toContain("force");
-    expect(audit!.message).toContain("1 uafstemt");
+    expect(close.ok).toBe(false);
+    expect(close.errors).toContain("PERIOD_CLOSE_HAS_NONWAIVABLE_BLOCKERS");
+    expect(db.query("SELECT COUNT(*) AS n FROM accounting_periods").get()).toEqual({ n: 0 });
 
     teardown(ctx);
   });
 
-  test("a reconciled (booked) bank transaction and out-of-period transactions do not block close", () => {
+  test("a reconciled in-period bank transaction is not BANK_UNRECONCILED, but does not fake missing independent DKK assurance", () => {
     const ctx = setup("rentemester-close-unrec-ok-");
     const { db } = ctx;
 
@@ -172,14 +172,18 @@ describe("closeAccountingPeriod — unreconciled bank transactions guard (EJER-4
     // An unreconciled transaction OUTSIDE the period must not block either.
     importOneBankTransaction(db, ctx.root, ctx.inbox, "2026-04-05", "Indbetaling april", 1000);
 
+    const readiness = createPeriodCloseReadinessPacket(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31" });
     const close = closeAccountingPeriod(db, {
       periodStart: "2026-01-01",
       periodEnd: "2026-03-31",
       kind: "vat_quarter",
       createdBy: "user:ejer",
+      ...reviewed(db, readiness),
     });
-    expect(close.errors).toEqual([]);
-    expect(close.ok).toBe(true);
+    expect(readiness.items.find((item) => item.code === "BANK_UNRECONCILED")?.status).toBe("passed");
+    expect(readiness.items.find((item) => item.code === "DKK_CONTROL_ACCOUNTS")?.status).toBe("unavailable");
+    expect(close.ok).toBe(false);
+    expect(close.errors).toEqual(["PERIOD_CLOSE_ASSURANCE_UNAVAILABLE:1"]);
 
     teardown(ctx);
   });

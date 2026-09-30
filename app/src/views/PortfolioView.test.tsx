@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test } from "bun:test";
 import { screen } from "@testing-library/react";
 import { PortfolioView } from "./PortfolioView";
 import { renderAt } from "../test/render";
@@ -20,7 +20,7 @@ function portfolioRoute(companies: ReturnType<typeof summary>[]) {
         workspace: "/ws",
         asOf: "2026-05-20",
         companyCount: companies.length,
-        rollup,
+        rollup: { ...rollup, liquidityComplete: companies.every((c) => c.actualBankBalance !== null) },
         totals: {},
         companies,
       },
@@ -73,6 +73,12 @@ describe("PortfolioView", () => {
     renderAt(<PortfolioView />);
     expect(await screen.findByText(/Samlet resultat/i)).toBeInTheDocument();
     expect(screen.getByText(/Samlet likviditet/i)).toBeInTheDocument();
+  });
+
+  test("a single visible company opens its overview directly", async () => {
+    mockFetch(portfolioRoute([summary({ actualBankBalance: null, bankStatementStatus: "ambiguous", bankStatementDiagnostics: ["source collision"] })]));
+    renderAt(<PortfolioView />);
+    expect(await screen.findByText(/Åbner virksomhedsoverblik/)).toBeInTheDocument();
   });
 
   test("surfaces an API error with a retry affordance", async () => {

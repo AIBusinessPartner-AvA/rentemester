@@ -7,10 +7,11 @@
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { bookExpenseFromBank } from "../../core/expense-booking";
+import { bookExpenseFromBankInCurrentTransaction } from "../../core/expense-booking";
 import { withActor } from "../actor";
 import { envelopeShape, wrapCoreResult } from "../envelope";
-import { withCompanyDbConfirmed, confirmField } from "../tool-runtime";
+import { withCompanyDbConfirmed, confirmField, idempotencyKeyField, withCompanyReadOnlyDb } from "../tool-runtime";
+import { applyPurchaseVatPreflight, purchaseVatPreflightSnapshot } from "../../cli/purchase-vat-preflight";
 
 const vatTreatmentEnum = z
   .enum(["standard", "reverse_charge", "representation", "exempt", "non_deductible"])
@@ -40,6 +41,27 @@ const vatTreatmentEnum = z
   );
 
 export function registerExpenseTools(server: McpServer): void {
+  server.registerTool(
+    "expense_vat_preflight",
+    {
+      title: "Inspect purchase VAT preflight",
+      description: "Read-only dry-run for a purchase document. Shows derived region, required validation, evidence freshness/cache reuse and whether apply would contact the VAT provider. It never writes or calls a provider.",
+      inputSchema: { company: z.string().min(1), documentId: z.number().int().positive() }, outputSchema: envelopeShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    withCompanyReadOnlyDb<{ company: string; documentId: number }>(({ db, args }) => wrapCoreResult(purchaseVatPreflightSnapshot(db, args.documentId))),
+  );
+  server.registerTool(
+    "expense_vat_preflight_apply",
+    {
+      title: "Apply purchase VAT preflight",
+      description: "Obtains required EU VAT validation evidence before purchase posting. Requires confirm:true and actor attribution; records safe durable evidence and a resumable exception when blocked. write-reversible.",
+      inputSchema: { company: z.string().min(1), documentId: z.number().int().positive(), confirm: confirmField }, outputSchema: envelopeShape,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    withCompanyDbConfirmed<{ company: string; documentId: number; confirm?: boolean }>(server, "expense_vat_preflight_apply", async ({ db, actor, args }) => wrapCoreResult(await applyPurchaseVatPreflight(db, args.documentId, actor.createdBy))),
+  );
+
   server.registerTool(
     "expense_book",
     {
@@ -91,6 +113,7 @@ export function registerExpenseTools(server: McpServer): void {
           .optional()
           .describe("Optional free-text description of the expense posting."),
         confirm: confirmField,
+        idempotencyKey: idempotencyKeyField,
       },
       outputSchema: envelopeShape,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -105,12 +128,13 @@ export function registerExpenseTools(server: McpServer): void {
       date?: string;
       text?: string;
       confirm?: boolean;
+      idempotencyKey?: string;
     }>(server, "expense_book", ({ db, actor, args }) => {
       // Actor-invariant (#63/#76): thread the MCP-client identity into the
       // hash-chained ledger so created_by/created_by_program + audit_log.actor
       // are attributed to the booking agent, not the OS user (resolveActor's
       // process.env.USER fallback). withActor never overwrites explicit values.
-      const result = bookExpenseFromBank(
+      const result = bookExpenseFromBankInCurrentTransaction(
         db,
         withActor(
           {
@@ -126,6 +150,6 @@ export function registerExpenseTools(server: McpServer): void {
         ),
       );
       return wrapCoreResult(result);
-    }),
+    }, { keyIdempotent: "expense_book" }),
   );
 }

@@ -23,6 +23,7 @@
 import type {
   DigisenseClient,
   DigisenseDocumentStatus,
+  DigisenseError,
   KsefEnvironment,
   ValidateDocumentError,
 } from "./digisense-client";
@@ -81,6 +82,55 @@ function formatValidationErrors(errors: ValidateDocumentError[]): string {
   return shown || "ukendt schematron-fejl";
 }
 
+const SAFE_DELIVERY_ERROR_KEYS = new Set([
+  "documentStatus",
+  "status",
+  "message",
+  "title",
+  "detail",
+  "description",
+  "error",
+]);
+
+function redactDiagnostic(value: string): string {
+  return value
+    .replace(/https?:\/\/\S+/gi, "[url redacted]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "[id redacted]")
+    .replace(/\b\d{8,}\b/g, "[number redacted]")
+    .replace(/\b[A-Za-z0-9_-]{20,}\b/g, "[token redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function collectSafeDiagnostic(value: unknown, output: string[]): void {
+  if (output.length >= 4 || value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectSafeDiagnostic(item, output);
+    return;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (output.length >= 4) return;
+    if (SAFE_DELIVERY_ERROR_KEYS.has(key) && typeof item === "string") {
+      const sanitized = redactDiagnostic(item);
+      if (sanitized) output.push(`${key}: ${sanitized}`);
+    } else if (typeof item === "object") {
+      collectSafeDiagnostic(item, output);
+    }
+  }
+}
+
+function safeDeliveryError(error: DigisenseError): string {
+  if (!error.body) return error.message;
+  try {
+    const diagnostic: string[] = [];
+    collectSafeDiagnostic(JSON.parse(error.body), diagnostic);
+    return diagnostic.length > 0 ? `${error.message}; ${diagnostic.join("; ")}` : error.message;
+  } catch {
+    return error.message;
+  }
+}
+
 /**
  * Bygger en `PeppolTransmitter` oven på en (allerede konfigureret) DigisenseClient.
  *
@@ -108,12 +158,13 @@ export function createDigisenseTransmitter(
     // 1. Schematron-gate. Afvis ved success=false — uden at røre deliver.
     const validation = await client.validateDocument(xml);
     if (!validation.ok) {
-      return { ok: false, error: `digisense validate-document failed: ${validation.error.message}` };
+      return { ok: false, error: `digisense validate-document failed: ${validation.error.message}`, retryableBeforeDelivery: true };
     }
     if (!validation.data.success) {
       return {
         ok: false,
         error: `digisense schematron rejected the invoice: ${formatValidationErrors(validation.data.errors ?? [])}`,
+        retryableBeforeDelivery: true,
       };
     }
 
@@ -123,10 +174,24 @@ export function createDigisenseTransmitter(
       ksefEnvironment: deps.ksefEnvironment,
     });
     if (!delivered.ok) {
-      return { ok: false, error: `digisense deliver-document failed: ${delivered.error.message}` };
+      return {
+        ok: false,
+        error: `digisense deliver-document failed: ${safeDeliveryError(delivered.error)}`,
+        // The POST may have reached DigiSense even when its response was lost,
+        // timed out, failed 5xx, or could not be parsed. Without a trustworthy
+        // document id, automatic retry would risk duplicate delivery.
+        deliveryUncertain: true,
+      };
     }
 
     const { documentId, documentStatus, statusCode } = delivered.data;
+    if (!documentId || !documentStatus || !Number.isFinite(statusCode)) {
+      return {
+        ok: false,
+        error: "digisense deliver-document returned an incomplete response after the delivery POST",
+        deliveryUncertain: true,
+      };
+    }
 
     // 200/delivered => kvitteret med det samme; documentId er transmissionId'et.
     if (documentStatus === "delivered") {
@@ -138,6 +203,8 @@ export function createDigisenseTransmitter(
       return {
         ok: false,
         error: `digisense delivery rejected (${documentStatus}) for document ${documentId}: ${delivered.data.message}`,
+        acceptedDocumentId: documentId,
+        acceptedStatus: documentStatus,
       };
     }
 
@@ -148,26 +215,37 @@ export function createDigisenseTransmitter(
       return {
         ok: false,
         error: `digisense delivery returned an unexpected status (${documentStatus}, code ${statusCode}) for document ${documentId}`,
+        queuedDocumentId: documentId,
       };
     }
 
-    for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
-      await sleep(pollIntervalMs);
-      const status = await client.documentStatus(documentId, companyKey);
-      if (!status.ok) {
-        return { ok: false, error: `digisense document-status failed: ${status.error.message}` };
+    try {
+      for (let attempt = 0; attempt < maxPollAttempts; attempt += 1) {
+        await sleep(pollIntervalMs);
+        const status = await client.documentStatus(documentId, companyKey);
+        if (!status.ok) {
+          return { ok: false, error: `digisense document-status failed: ${status.error.message}`, queuedDocumentId: documentId };
+        }
+        const current = status.data.documentStatus;
+        if (current === "delivered") {
+          return { ok: true, transmissionId: documentId, transmittedAt: clock() };
+        }
+        if (TERMINAL_FAILURE_STATUSES.has(current)) {
+          return {
+            ok: false,
+            error: `digisense delivery failed (${current}) for document ${documentId}: ${status.data.message}`,
+            acceptedDocumentId: documentId,
+            acceptedStatus: current,
+          };
+        }
+        // queued-for-delivery / temporary-upstream-error => prøv igen.
       }
-      const current = status.data.documentStatus;
-      if (current === "delivered") {
-        return { ok: true, transmissionId: documentId, transmittedAt: clock() };
-      }
-      if (TERMINAL_FAILURE_STATUSES.has(current)) {
-        return {
-          ok: false,
-          error: `digisense delivery failed (${current}) for document ${documentId}: ${status.data.message}`,
-        };
-      }
-      // queued-for-delivery / temporary-upstream-error => prøv igen.
+    } catch (error) {
+      return {
+        ok: false,
+        error: `digisense document-status failed: ${error instanceof Error ? error.message : String(error)}`,
+        queuedDocumentId: documentId,
+      };
     }
 
     // Budget brugt op uden terminal status. Dokumentet er ACCEPTERET af

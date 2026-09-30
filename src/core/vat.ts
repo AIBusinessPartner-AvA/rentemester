@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite";
-import { postJournalEntry, type JournalPostResult } from "./ledger";
+import { postJournalEntry, postJournalEntryInCurrentTransaction, type JournalPostResult } from "./ledger";
 import { getCompanySettings } from "./company";
+import { validNonEuReverseChargeReview } from "./document-non-eu-reverse-charge-review";
 import { isValidIsoDate as looksLikeIsoDate } from "./dates";
 import { requireCachedViesValidation, normalizeEuVatNumber } from "./vies";
 import { addDkk, compareDkk, fromOre, percentOfDkk, roundDkk, subtractDkk, sumDkk, toOre } from "./money";
@@ -68,9 +69,13 @@ export type VatPeriodReport = {
    * A.B.3.3.1.5.
    */
   domesticReverseChargeSalesBase: number;
-  /** EU service reverse-charge purchase base only. This feeds rubrik A and the
-   * EU-goods limitation warning; non-EU services are kept separate below. */
+  /** EU service reverse-charge purchase base only. This feeds rubrik A;
+   * non-EU services are kept separate below. */
   reverseChargePurchaseBase: number;
+  /** EU goods acquisitions (§11), kept separate from service purchases (§46). */
+  euGoodsAcquisitionPurchaseBase: number;
+  /** Output VAT arising from §11 goods acquisitions, for the goods rubric. */
+  euGoodsAcquisitionOutputVat: number;
   /** Service-purchase base from suppliers outside the EU. It contributes to
    * foreign-service reverse-charge VAT, but never to EU-only rubrik A. */
   nonEuServiceReverseChargePurchaseBase: number;
@@ -196,14 +201,20 @@ function postServiceReverseChargeLines(
   vatCode: "EU_SERVICE_REVERSE_CHARGE" | "NON_EU_SERVICE_REVERSE_CHARGE",
   ruleId: string,
   sourceLabel: string,
+  inCurrentTransaction = false,
+  deductionPercent = 100,
 ): JournalPostResult {
   const vatAmount = percentOfDkk(input.netAmount, 25);
+  const deductibleVat = roundDkk(vatAmount * deductionPercent / 100);
+  const nonDeductibleVat = roundDkk(vatAmount - deductibleVat);
   const inputVat = resolveAccountRole(db, "input_vat");
   const outputVat = resolveAccountRole(db, "reverse_charge_vat");
   const bank = input.paymentAccountNo ? { ok: true as const, accountNo: input.paymentAccountNo } : resolveAccountRole(db, "bank");
-  const roleErrors = [inputVat, outputVat, bank].flatMap((resolution) => resolution.ok ? [] : [resolution.error]);
-  if (roleErrors.length > 0) return { ok: false, appliedRules: [ruleId], errors: roleErrors };
-  const result = postJournalEntry(db, {
+  if (!inputVat.ok) return { ok: false, appliedRules: [ruleId], errors: [inputVat.error] };
+  if (!outputVat.ok) return { ok: false, appliedRules: [ruleId], errors: [outputVat.error] };
+  if (!bank.ok) return { ok: false, appliedRules: [ruleId], errors: [bank.error] };
+  const post = inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry;
+  const result = post(db, {
     transactionDate: input.transactionDate,
     text: input.text.trim(),
     documentId: input.documentId,
@@ -216,7 +227,8 @@ function postServiceReverseChargeLines(
     createdByProgram: input.createdByProgram,
     lines: [
       { accountNo: input.expenseAccountNo, debitAmount: roundDkk(input.netAmount), vatCode, text: `${sourceLabel} service purchase base` },
-      { accountNo: inputVat.accountNo, debitAmount: vatAmount, text: "Deductible reverse-charge input VAT" },
+      ...(nonDeductibleVat > 0 ? [{ accountNo: input.expenseAccountNo, debitAmount: nonDeductibleVat, text: "Non-deductible reverse-charge VAT" }] : []),
+      { accountNo: inputVat.accountNo, debitAmount: deductibleVat, text: "Deductible reverse-charge input VAT" },
       { accountNo: bank.accountNo, creditAmount: roundDkk(input.netAmount), text: "Payment / liability" },
       { accountNo: outputVat.accountNo, creditAmount: vatAmount, text: "Reverse-charge output VAT" },
     ],
@@ -225,6 +237,48 @@ function postServiceReverseChargeLines(
     ...result,
     appliedRules: result.ok ? [...new Set([...(result.appliedRules ?? []), ruleId])] : [...new Set([ruleId, ...(result.appliedRules ?? [])])],
   };
+}
+
+/** §11 acquisition VAT for goods bought from another EU member state. */
+function postEuGoodsAcquisitionPurchaseInternal(db: Database, input: ReverseChargePurchaseInput, inCurrentTransaction: boolean): JournalPostResult {
+  const errors = reverseChargeInputErrors(input);
+  if (errors.length > 0) return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors };
+  if (!companyIsVatRegistered(db)) return { ok: false, appliedRules: [REGISTRATION_RULE_ID, REVERSE_CHARGE_RULE_ID], errors: [NON_REGISTERED_EU_SERVICE_MSG] };
+  const identity = resolveDocumentSupplierIdentity(db, input.documentId);
+  if (!identity?.ok || identity.identifierKind !== "eu_vat") return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors: ["EU goods acquisition requires documented non-Danish EU supplier VAT identity"] };
+  const viesCheck = requireCachedViesValidation(db, identity.identifier, "document sender_vat_cvr");
+  if (!viesCheck.ok) return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID, ...viesCheck.appliedRules], errors: viesCheck.errors };
+  const vatAmount = percentOfDkk(input.netAmount, 25);
+  const inputVat = resolveAccountRole(db, "input_vat");
+  const outputVat = resolveAccountRole(db, "reverse_charge_vat");
+  const bank = input.paymentAccountNo
+    ? { ok: true as const, accountNo: input.paymentAccountNo }
+    : resolveAccountRole(db, "bank");
+  if (!inputVat.ok) {
+    return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors: [inputVat.error] };
+  }
+  if (!outputVat.ok) {
+    return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors: [outputVat.error] };
+  }
+  if (!bank.ok) {
+    return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors: [bank.error] };
+  }
+  const post = inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry;
+  const result = post(db, { transactionDate: input.transactionDate, text: input.text, documentId: input.documentId, sourceBankTransactionId: input.sourceBankTransactionId, createdBy: input.createdBy, createdByProgram: input.createdByProgram, lines: [
+    { accountNo: input.expenseAccountNo, debitAmount: roundDkk(input.netAmount), vatCode: "EU_GOODS_ACQUISITION", text: "EU goods acquisition base" },
+    { accountNo: inputVat.accountNo, debitAmount: vatAmount, text: "Deductible acquisition input VAT" },
+    { accountNo: bank.accountNo, creditAmount: roundDkk(input.netAmount), text: "Payment / liability" },
+    { accountNo: outputVat.accountNo, creditAmount: vatAmount, text: "Acquisition output VAT" },
+  ] });
+  return { ...result, appliedRules: [...new Set([REVERSE_CHARGE_RULE_ID, ...result.appliedRules])] };
+}
+
+export function postEuGoodsAcquisitionPurchaseInCurrentTransaction(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return postEuGoodsAcquisitionPurchaseInternal(db, input, true);
+}
+
+export function postEuGoodsAcquisitionPurchase(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return db.transaction(() => postEuGoodsAcquisitionPurchaseInternal(db, input, true)).immediate();
 }
 
 function resolveDocumentSupplierIdentity(
@@ -306,7 +360,10 @@ function documentDanishInputVatSupplierErrors(db: Database, documentId: number):
  * the purchase remains available for human resolution without creating a VAT
  * journal entry.
  */
-function nonEuReverseChargeEvidenceErrors(db: Database, documentId: number): string[] {
+/** Shared documentary gate for both the read-only purchase preflight and
+ * posting. Keep this source-of-truth here: preflight must never present a
+ * green purchase-eligibility result that booking will immediately reject. */
+export function nonEuReverseChargeEvidenceErrors(db: Database, documentId: number): string[] {
   const row = db.query(
     `SELECT sender_vat_cvr, recipient_vat_cvr, payload_json
        FROM documents
@@ -318,6 +375,8 @@ function nonEuReverseChargeEvidenceErrors(db: Database, documentId: number): str
   } | null;
   if (!row) return [`documentId ${documentId} does not exist`];
 
+  const reviewed = validNonEuReverseChargeReview(db, documentId);
+  if (reviewed) return [];
   const errors: string[] = [];
   if (!row.sender_vat_cvr?.trim()) {
     errors.push("non-EU reverse-charge input-VAT deduction requires the supplier's home-country registration number on the invoice");
@@ -341,17 +400,26 @@ function nonEuReverseChargeEvidenceErrors(db: Database, documentId: number): str
   let wordingConfirmed = false;
   try {
     const payload = row.payload_json ? JSON.parse(row.payload_json) as unknown : null;
+    const record = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : null;
+    const evidence = record?.reverseChargeWordingEvidence;
+    const sourceEvidence = evidence && typeof evidence === "object" && !Array.isArray(evidence)
+      ? evidence as Record<string, unknown>
+      : null;
+    // A historical boolean may remain in immutable metadata, but it is not
+    // documentary evidence. Only a cited source statement can unlock the
+    // same booking gate that preflight reports.
     wordingConfirmed = Boolean(
       payload
-      && typeof payload === "object"
-      && !Array.isArray(payload)
-      && (payload as Record<string, unknown>).reverseChargeWordingConfirmed === true,
+      && typeof sourceEvidence?.excerpt === "string" && sourceEvidence.excerpt.trim()
+      && typeof sourceEvidence.location === "string" && sourceEvidence.location.trim(),
     );
   } catch {
     wordingConfirmed = false;
   }
   if (!wordingConfirmed) {
-    errors.push("non-EU reverse-charge input-VAT deduction requires confirmed reverse-charge wording on the invoice");
+    errors.push("non-EU reverse-charge input-VAT deduction requires confirmed reverse-charge wording evidenced by a source excerpt/location on the invoice");
   }
   return errors;
 }
@@ -394,7 +462,7 @@ export function postEuServiceReverseChargePurchase(db: Database, input: ReverseC
  * Country + non_eu classification is enough to ingest and retain a voucher,
  * while automatic input-VAT deduction additionally requires invoice evidence
  * checked below. */
-export function postNonEuServiceReverseChargePurchase(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+function postNonEuServiceReverseChargePurchaseInternal(db: Database, input: ReverseChargePurchaseInput, inCurrentTransaction: boolean): JournalPostResult {
   const errors = reverseChargeInputErrors(input);
   if (errors.length > 0) return { ok: false, appliedRules: [NON_EU_REVERSE_CHARGE_RULE_ID], errors };
   const splitErrors = unsupportedStructuredPurchaseLinesErrors(db, input.documentId, "reverse_charge");
@@ -415,7 +483,16 @@ export function postNonEuServiceReverseChargePurchase(db: Database, input: Rever
       errors: ["document requires human resolution before non-EU reverse-charge input-VAT deduction", ...evidenceErrors],
     };
   }
-  return postServiceReverseChargeLines(db, input, "NON_EU_SERVICE_REVERSE_CHARGE", NON_EU_REVERSE_CHARGE_RULE_ID, "Non-EU");
+  const reviewed = validNonEuReverseChargeReview(db, input.documentId);
+  return postServiceReverseChargeLines(db, input, "NON_EU_SERVICE_REVERSE_CHARGE", NON_EU_REVERSE_CHARGE_RULE_ID, "Non-EU", inCurrentTransaction, reviewed?.deductionPercent ?? 100);
+}
+
+export function postNonEuServiceReverseChargePurchaseInCurrentTransaction(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return postNonEuServiceReverseChargePurchaseInternal(db, input, true);
+}
+
+export function postNonEuServiceReverseChargePurchase(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return db.transaction(() => postNonEuServiceReverseChargePurchaseInternal(db, input, true)).immediate();
 }
 
 /**
@@ -423,7 +500,7 @@ export function postNonEuServiceReverseChargePurchase(db: Database, input: Rever
  * reverse-charge action; the immutable supplier identity on the document
  * decides whether EU/VIES or non-EU provenance and VAT codes apply.
  */
-export function postForeignServiceReverseChargePurchase(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+function postForeignServiceReverseChargePurchaseInternal(db: Database, input: ReverseChargePurchaseInput, inCurrentTransaction: boolean): JournalPostResult {
   const errors = reverseChargeInputErrors(input);
   if (errors.length > 0) return { ok: false, appliedRules: [REVERSE_CHARGE_RULE_ID], errors };
   const splitErrors = unsupportedStructuredPurchaseLinesErrors(db, input.documentId, "reverse_charge");
@@ -440,14 +517,22 @@ export function postForeignServiceReverseChargePurchase(db: Database, input: Rev
     return { ok: false, appliedRules: [REGISTRATION_RULE_ID, ruleId], errors: [message] };
   }
   if (identity.identifierKind === "non_eu") {
-    return postNonEuServiceReverseChargePurchase(db, input);
+    return postNonEuServiceReverseChargePurchaseInternal(db, input, inCurrentTransaction);
   }
   const viesCheck = requireCachedViesValidation(db, identity.identifier, "document sender_vat_cvr");
   if (!viesCheck.ok) return { ok: false, appliedRules: [...new Set([REVERSE_CHARGE_RULE_ID, ...viesCheck.appliedRules])], errors: viesCheck.errors };
-  return postServiceReverseChargeLines(db, input, "EU_SERVICE_REVERSE_CHARGE", REVERSE_CHARGE_RULE_ID, "EU");
+  return postServiceReverseChargeLines(db, input, "EU_SERVICE_REVERSE_CHARGE", REVERSE_CHARGE_RULE_ID, "EU", inCurrentTransaction);
 }
 
-export function postRepresentationPurchase(db: Database, input: RepresentationPurchaseInput): JournalPostResult {
+export function postForeignServiceReverseChargePurchaseInCurrentTransaction(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return postForeignServiceReverseChargePurchaseInternal(db, input, true);
+}
+
+export function postForeignServiceReverseChargePurchase(db: Database, input: ReverseChargePurchaseInput): JournalPostResult {
+  return db.transaction(() => postForeignServiceReverseChargePurchaseInternal(db, input, true)).immediate();
+}
+
+function postRepresentationPurchaseInternal(db: Database, input: RepresentationPurchaseInput, inCurrentTransaction: boolean): JournalPostResult {
   const errors: string[] = [];
   if (!looksLikeIsoDate(input.transactionDate)) errors.push("transactionDate must be YYYY-MM-DD");
   if (typeof input.text !== "string" || input.text.trim().length === 0) errors.push("text is required");
@@ -472,9 +557,11 @@ export function postRepresentationPurchase(db: Database, input: RepresentationPu
   const grossAmount = addDkk(input.netAmount, fullVatAmount);
   const inputVat = resolveAccountRole(db, "input_vat");
   const payment = input.paymentAccountNo ? { ok: true as const, accountNo: input.paymentAccountNo } : resolveAccountRole(db, "bank");
-  if (!inputVat.ok || !payment.ok) return { ok: false, appliedRules: [REPRESENTATION_RULE_ID], errors: [!inputVat.ok ? inputVat.error : payment.error] };
+  if (!inputVat.ok) return { ok: false, appliedRules: [REPRESENTATION_RULE_ID], errors: [inputVat.error] };
+  if (!payment.ok) return { ok: false, appliedRules: [REPRESENTATION_RULE_ID], errors: [payment.error] };
 
-  const result = postJournalEntry(db, {
+  const post = inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry;
+  const result = post(db, {
     transactionDate: input.transactionDate,
     text: input.text.trim(),
     documentId: input.documentId,
@@ -512,6 +599,14 @@ export function postRepresentationPurchase(db: Database, input: RepresentationPu
   };
 }
 
+export function postRepresentationPurchaseInCurrentTransaction(db: Database, input: RepresentationPurchaseInput): JournalPostResult {
+  return postRepresentationPurchaseInternal(db, input, true);
+}
+
+export function postRepresentationPurchase(db: Database, input: RepresentationPurchaseInput): JournalPostResult {
+  return db.transaction(() => postRepresentationPurchaseInternal(db, input, true)).immediate();
+}
+
 export function buildVatReport(db: Database, periodStart: string, periodEnd: string): VatPeriodReport {
   const errors: string[] = [];
   const vatPeriodType = getCompanySettings(db).vatPeriodType;
@@ -543,6 +638,8 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
       foreignReverseChargeSalesBase: 0,
       domesticReverseChargeSalesBase: 0,
       reverseChargePurchaseBase: 0,
+      euGoodsAcquisitionPurchaseBase: 0,
+      euGoodsAcquisitionOutputVat: 0,
       nonEuServiceReverseChargePurchaseBase: 0,
       reverseChargePurchaseOutputVat: 0,
       representationPurchaseBase: 0,
@@ -637,6 +734,7 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
     legacyEvidence.inferredVatCodeByLineId,
   );
   const trustedDineroInputLineIds = new Set<number>();
+  const legacyRepresentationBaseByLineId = new Map<number, number>();
   const legacyReverseChargeToleranceByEntry = new Map(
     legacyEvidence.reverseChargeToleranceByEntry,
   );
@@ -700,9 +798,22 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
 
     const expenseRows = entryRows.filter((row) => row.account_type === "expense");
     const explicitCode = (row: (typeof rows)[number]): string => row.vat_code?.trim() || "";
+    const reverseChargeCodes = new Set([
+      "EU_SERVICE_REVERSE_CHARGE",
+      "NON_EU_SERVICE_REVERSE_CHARGE",
+    ]);
     let baseRows = expenseRows.filter(
-      (row) => explicitCode(row) === "EU_SERVICE_REVERSE_CHARGE",
+      (row) => reverseChargeCodes.has(explicitCode(row)),
     );
+    const explicitReverseChargeCodes = new Set(
+      baseRows.map((row) => explicitCode(row)),
+    );
+    if (explicitReverseChargeCodes.size > 1) {
+      errors.push(
+        `journal entry ${entryId} mixes EU and non-EU reverse-charge bases; human resolution is required`,
+      );
+      continue;
+    }
     if (baseRows.length === 0) {
       // An explicit historical line code wins. Account defaults are not
       // source-line evidence and may be overridden only by this exact,
@@ -766,6 +877,68 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
     );
   }
 
+  // Dinero's historical representation vouchers can collapse the net expense
+  // and the 75% non-deductible VAT into one REPRESENTATION_SPECIAL expense
+  // line. Rentemester's native shape keeps those amounts on two lines. Recover
+  // the net base only for the exact trusted import shape: one representation
+  // expense, one input-VAT control, no other P/L line, and the statutory
+  // 25%-of-VAT deduction reconciling within one øre. Anything else continues
+  // through the ordinary mismatch gate instead of being guessed.
+  for (const [entryId, entryRows] of historicalRowsByEntry) {
+    const representationRows = entryRows.filter(
+      (row) =>
+        row.account_type === "expense" &&
+        row.vat_code?.trim() === "REPRESENTATION_SPECIAL",
+    );
+    const hasSeparateNonDeductibleLine = entryRows.some(
+      (row) => row.vat_code?.trim() === "REPRESENTATION_NON_DEDUCTIBLE_VAT",
+    );
+    if (representationRows.length === 0 || hasSeparateNonDeductibleLine) continue;
+    const otherProfitLossRows = entryRows.filter(
+      (row) =>
+        (row.account_type === "expense" || row.account_type === "income") &&
+        !representationRows.some((candidate) => candidate.line_id === row.line_id),
+    );
+    const inputRows = entryRows.filter(
+      (row) => vatAmountSideByAccountNo.get(row.account_no) === "input",
+    );
+    if (
+      representationRows.length !== 1 ||
+      otherProfitLossRows.length > 0 ||
+      inputRows.length !== 1
+    ) continue;
+
+    const expense = roundDkk(
+      Number(representationRows[0]!.debit_amount ?? 0) -
+        Number(representationRows[0]!.credit_amount ?? 0),
+    );
+    const bookedInput = roundDkk(
+      Number(inputRows[0]!.debit_amount ?? 0) -
+        Number(inputRows[0]!.credit_amount ?? 0),
+    );
+    if (expense <= 0 || bookedInput <= 0) continue;
+    const recoveredNet = roundDkk(addDkk(expense, bookedInput) / 1.25);
+    const fullVat = percentOfDkk(recoveredNet, 25);
+    const expectedInput = percentOfDkk(fullVat, 25);
+    const expectedExpense = addDkk(
+      recoveredNet,
+      subtractDkk(fullVat, expectedInput),
+    );
+    if (
+      oreDifference(expectedInput, bookedInput) > 1 ||
+      oreDifference(expectedExpense, expense) > 1
+    ) {
+      errors.push(
+        `journal entry ${entryId} has a collapsed Dinero representation purchase that does not reconcile to the statutory partial VAT deduction; human resolution is required`,
+      );
+      continue;
+    }
+    legacyRepresentationBaseByLineId.set(
+      representationRows[0]!.line_id,
+      recoveredNet,
+    );
+  }
+
   // A pure transfer between VAT amount accounts and a confirmed settlement
   // account settles an earlier return; it is not fresh output/input VAT for
   // the transaction-date period. Identify the shape per journal before the
@@ -807,6 +980,8 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
   let foreignReverseChargeSalesBase = 0;
   let domesticReverseChargeSalesBase = 0;
   let reverseChargePurchaseBase = 0;
+  let euGoodsAcquisitionPurchaseBase = 0;
+  let euGoodsAcquisitionOutputVat = 0;
   let nonEuServiceReverseChargePurchaseBase = 0;
   let representationPurchaseBase = 0;
   // Reverse-charge output VAT is booked per purchase on account 1200, øre-
@@ -975,6 +1150,15 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
         foreignReverseChargeOutputVatBaseLines += 1;
       }
     }
+    if (isVatBaseLine && effectiveVatCode === "EU_GOODS_ACQUISITION") {
+      markClassified(row.entry_id, trustedHistoricalImport);
+      euGoodsAcquisitionPurchaseBase += debit - credit;
+      euGoodsAcquisitionOutputVat += percentOfDkk(debit - credit, 25);
+      reverseChargeEntryIds.add(row.entry_id);
+      reverseChargeExpectedVatByEntry.set(row.entry_id, addDkk(reverseChargeExpectedVatByEntry.get(row.entry_id) ?? 0, percentOfDkk(debit - credit, 25)));
+      inputVatBaseLines += 1; outputVatBaseLines += 1;
+      if (isForeignCurrencyEntry) { foreignInputVatBaseLines += 1; foreignOutputVatBaseLines += 1; foreignReverseChargeOutputVatBaseLines += 1; }
+    }
     if (isVatBaseLine && effectiveVatCode === "NON_EU_SERVICE_REVERSE_CHARGE") {
       markClassified(row.entry_id, trustedHistoricalImport);
       nonEuServiceReverseChargePurchaseBase += debit - credit;
@@ -996,7 +1180,8 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
     }
     if (isVatBaseLine && effectiveVatCode === "REPRESENTATION_SPECIAL") {
       markClassified(row.entry_id, trustedHistoricalImport);
-      representationPurchaseBase += debit - credit;
+      representationPurchaseBase +=
+        legacyRepresentationBaseByLineId.get(row.line_id) ?? debit - credit;
       inputVatBaseLines += 1;
       if (isForeignCurrencyEntry) foreignInputVatBaseLines += 1;
     }
@@ -1044,6 +1229,8 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
   domesticReverseChargeSalesBase = roundDkk(domesticReverseChargeSalesBase);
   const reverseChargeSalesBase = addDkk(foreignReverseChargeSalesBase, domesticReverseChargeSalesBase);
   reverseChargePurchaseBase = roundDkk(reverseChargePurchaseBase);
+  euGoodsAcquisitionPurchaseBase = roundDkk(euGoodsAcquisitionPurchaseBase);
+  euGoodsAcquisitionOutputVat = roundDkk(euGoodsAcquisitionOutputVat);
   nonEuServiceReverseChargePurchaseBase = roundDkk(nonEuServiceReverseChargePurchaseBase);
   const historicalAmountOnlyEntryIds = [...historicalVatControlEntryIds].filter(
     (entryId) => !classifiedHistoricalVatEntryIds.has(entryId),
@@ -1096,8 +1283,9 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
   ossConsumerSalesBase = roundDkk(ossConsumerSalesBase);
 
   const foreignServiceReverseChargeBase = addDkk(reverseChargePurchaseBase, nonEuServiceReverseChargePurchaseBase);
-  const expectedOutputVat = subtractDkk(addDkk(percentOfDkk(salesBase25, 25), percentOfDkk(foreignServiceReverseChargeBase, 25)), percentOfDkk(badDebtReliefBase25, 25));
-  const expectedInputVat = addDkk(addDkk(percentOfDkk(purchaseBase25, 25), percentOfDkk(foreignServiceReverseChargeBase, 25)), percentOfDkk(percentOfDkk(representationPurchaseBase, 25), 25));
+  const foreignPurchaseReverseChargeBase = addDkk(foreignServiceReverseChargeBase, euGoodsAcquisitionPurchaseBase);
+  const expectedOutputVat = subtractDkk(addDkk(percentOfDkk(salesBase25, 25), percentOfDkk(foreignPurchaseReverseChargeBase, 25)), percentOfDkk(badDebtReliefBase25, 25));
+  const expectedInputVat = addDkk(addDkk(percentOfDkk(purchaseBase25, 25), percentOfDkk(foreignPurchaseReverseChargeBase, 25)), percentOfDkk(percentOfDkk(representationPurchaseBase, 25), 25));
   const warnings: string[] = [];
   // Each VAT-bearing base line is rounded to øre independently when booked,
   // so the booked aggregate can differ from "25% of the summed base" by up to
@@ -1219,6 +1407,8 @@ export function buildVatReport(db: Database, periodStart: string, periodEnd: str
     foreignReverseChargeSalesBase,
     domesticReverseChargeSalesBase,
     reverseChargePurchaseBase,
+    euGoodsAcquisitionPurchaseBase,
+    euGoodsAcquisitionOutputVat,
     nonEuServiceReverseChargePurchaseBase,
     reverseChargePurchaseOutputVat,
     representationPurchaseBase,

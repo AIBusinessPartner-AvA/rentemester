@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test } from "bun:test";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ContactsView } from "./ContactsView";
@@ -19,6 +19,16 @@ function renderView() {
 }
 
 describe("ContactsView — Kontakter", () => {
+  test("links only contacts with an explicit canonical party ID", async () => {
+    mockFetch(route({ customers: [
+      { ...contacts().customers[0], id: 11, name: "Samme navn", partyId: "party-customer" },
+      { ...contacts().customers[0], id: 12, name: "Samme navn", partyId: null },
+    ], vendors: [] }));
+    renderView();
+    expect(await screen.findByRole("link", { name: "Samme navn" })).toHaveAttribute("href", "/companies/acme-aps/parter/party-customer");
+    expect(screen.getAllByText("Samme navn").some((element) => element.closest("a") === null)).toBe(true);
+  });
+
   test("lists customers and vendors", async () => {
     mockFetch(route());
     renderView();
@@ -38,14 +48,10 @@ describe("ContactsView — Kontakter", () => {
     ).toBeInTheDocument();
   });
 
-  test("the company sub-nav exposes the Kontakter tab", async () => {
+  test("the daily navigation groups contacts under knowledge", async () => {
     mockFetch(route());
     renderView();
-    const tab = await screen.findByRole("link", { name: "Kontakter" });
-    expect(tab).toHaveAttribute(
-      "href",
-      expect.stringContaining("/companies/acme-aps/kontakter"),
-    );
+    expect(await screen.findByRole("link", { name: "Viden" })).toHaveAttribute("href", expect.stringContaining("/companies/acme-aps/parter"));
   });
 
   test("offers an Importér action", async () => {

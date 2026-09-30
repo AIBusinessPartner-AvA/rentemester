@@ -9,7 +9,9 @@ import { HISTORICAL_IMPORT_PROGRAM } from "../../src/core/import-provenance";
 import { postDineroPostings } from "../../src/core/import/dinero-postings";
 import { buildVatReport } from "../../src/core/vat";
 import { buildVatFiling } from "../../src/core/vat-filing";
-import { closeAccountingPeriod, effectivePeriodState, reopenAccountingPeriod, setCompanyVatPeriodType } from "../../src/core/periods";
+import { effectivePeriodState, reopenAccountingPeriod, setCompanyVatPeriodType } from "../../src/core/periods";
+import { closeAccountingPeriod, seedHistoricalClosedPeriod } from "../helpers/close-period";
+import { closeAccountingPeriod as closeAccountingPeriodCore } from "../../src/core/periods";
 import { vatRubrikkerForPeriod } from "../../src/server/data/vat";
 import { vatPositionForPeriod } from "../../src/server/data/vat";
 import { resolveAccountRole } from "../../src/core/account-roles";
@@ -182,12 +184,11 @@ test("legacy manual amount-only VAT is blocking in report and cockpit projection
   const cockpit = vatPositionForPeriod(db, "2026-05-01", "2026-05-31");
   expect(cockpit.reportOk).toBe(false);
   expect(cockpit.reportErrors).toEqual(report.errors);
-  const closed = closeAccountingPeriod(db, {
+  const closed = seedHistoricalClosedPeriod(db, {
     periodStart: "2026-04-01",
     periodEnd: "2026-06-30",
     kind: "vat_period",
   });
-  expect(closed.ok).toBe(true);
   const filing = buildVatFiling(db, "2026-04-01", "2026-06-30");
   expect(filing.ok).toBe(false);
   expect(filing.periodStatus).toBe("closed");
@@ -280,7 +281,7 @@ test("exact Dinero 64040/64060 reverse-charge controls override one matching acc
   const report = buildVatReport(db, "2026-05-01", "2026-05-31");
   expect(report.ok).toBe(true);
   expect(report.reverseChargePurchaseBase).toBe(100);
-  expect(report.rubrikker.rubrikA).toBe(100);
+  expect(report.rubrikker.rubrikAYdelser).toBe(100);
   expect(report.rubrikker.momsAfYdelseskobUdland).toBe(25);
   expect(report.rubrikker.kobsmoms).toBe(25);
   db.close(); rmSync(root, { recursive: true, force: true });
@@ -310,10 +311,59 @@ test("normalized Dinero VAT controls classify a blank-Momstype reverse-charge vo
   expect(report.ok).toBe(true);
   expect(report.reverseChargePurchaseBase).toBe(100.03);
   expect(report.rubrikker).toMatchObject({
-    rubrikA: 100.03,
-    momsAfYdelseskobUdland: 25.01,
-    kobsmoms: 25.01,
+    rubrikAYdelser: 100,
+    momsAfYdelseskobUdland: 25,
+    kobsmoms: 25,
   });
+  db.close(); rmSync(root, { recursive: true, force: true });
+});
+
+test("normalized Dinero VAT controls preserve an explicit non-EU service classification end to end", () => {
+  const { root, db } = freshDb();
+  db.run("INSERT INTO accounts (account_no,name,type,normal_balance,default_vat_code) VALUES ('3090','Imported service','expense','debit','DK_PURCHASE_25'),('64040','Dinero reverse','vat','credit',NULL),('64060','Dinero input','vat','debit',NULL)");
+  const imported = postDineroPostings(db, [{
+    transactionDate: "2026-05-06",
+    text: "Normalized Dinero non-EU reverse charge",
+    voucherRef: "D-RC-NON-EU",
+    lines: [
+      { accountNo: "3090", debitAmount: 100.03, vatCode: "NON_EU_SERVICE_REVERSE_CHARGE" },
+      { accountNo: "64060", debitAmount: 25.01, vatCode: "NON_EU_SERVICE_REVERSE_CHARGE" },
+      { accountNo: "2000", creditAmount: 100.03 },
+      { accountNo: "64040", creditAmount: 25.01, vatCode: "NON_EU_SERVICE_REVERSE_CHARGE" },
+    ],
+  }], new Set(["3090", "64060", "2000", "64040"]));
+  expect(imported.ok).toBe(true);
+  const report = buildVatReport(db, "2026-05-01", "2026-05-31");
+  expect(report.ok).toBe(true);
+  expect(report.reverseChargePurchaseBase).toBe(0);
+  expect(report.nonEuServiceReverseChargePurchaseBase).toBe(100.03);
+  expect(report.rubrikker).toMatchObject({
+    rubrikAYdelser: 0,
+    momsAfYdelseskobUdland: 25,
+    kobsmoms: 25,
+  });
+  db.close(); rmSync(root, { recursive: true, force: true });
+});
+
+test("report recovers the net base from Dinero's collapsed representation shape", () => {
+  const { root, db } = freshDb();
+  db.run("INSERT INTO accounts (account_no,name,type,normal_balance,default_vat_code) VALUES ('4140','Imported representation','expense','debit','REPRESENTATION_SPECIAL'),('64060','Dinero input','vat','debit',NULL)");
+  const imported = postDineroPostings(db, [{
+    transactionDate: "2026-05-22",
+    text: "Dinero collapsed representation purchase",
+    voucherRef: "D-REP-COLLAPSED",
+    lines: [
+      { accountNo: "4140", debitAmount: 286.90, vatCode: "REPRESENTATION_SPECIAL" },
+      { accountNo: "64060", debitAmount: 15.10, vatCode: "REPRESENTATION_SPECIAL" },
+      { accountNo: "2000", creditAmount: 302 },
+    ],
+  }], new Set(["4140", "64060", "2000"]));
+  expect(imported.ok).toBe(true);
+  const report = buildVatReport(db, "2026-05-01", "2026-05-31");
+  expect(report.ok).toBe(true);
+  expect(report.inputVat).toBe(15.10);
+  expect(report.representationPurchaseBase).toBe(241.60);
+  expect(report.rubrikker.kobsmoms).toBe(15);
   db.close(); rmSync(root, { recursive: true, force: true });
 });
 
@@ -417,7 +467,7 @@ test("report infers an exact reverse-charge base in an already-imported Dinero l
   const report = buildVatReport(db, "2026-05-01", "2026-05-31");
   expect(report.ok).toBe(true);
   expect(report.reverseChargePurchaseBase).toBe(100);
-  expect(report.rubrikker.rubrikA).toBe(100);
+  expect(report.rubrikker.rubrikAYdelser).toBe(100);
   expect(report.rubrikker.momsAfYdelseskobUdland).toBe(25);
   expect(report.rubrikker.salgsmoms).toBe(0);
   db.close(); rmSync(root, { recursive: true, force: true });
@@ -454,13 +504,13 @@ test("sanitized pre-normalization Dinero 64060 liability credit is trusted only 
   expect(report.inputVat).toBe(25);
   expect(report.reverseChargePurchaseBase).toBe(100.03);
   expect(report.rubrikker).toMatchObject({
-    rubrikA: 100.03,
+    rubrikAYdelser: 100,
     momsAfYdelseskobUdland: 25,
     kobsmoms: 25,
   });
-  expect(closeAccountingPeriod(db, {
-    periodStart: "2026-05-01", periodEnd: "2026-05-31", kind: "vat_period", force: true,
-  }).ok).toBe(true);
+  seedHistoricalClosedPeriod(db, {
+    periodStart: "2026-05-01", periodEnd: "2026-05-31", kind: "vat_period",
+  });
   const filing = buildVatFiling(db, "2026-05-01", "2026-05-31");
   expect(filing.ok).toBe(true);
   expect(filing.rubrikker).toEqual(report.rubrikker);
@@ -578,19 +628,18 @@ test("legacy VAT roles are recovered from voucher evidence without depending on 
     netVatPayable: 3396.2,
   });
   expect(report.rubrikker).toMatchObject({
-    salgsmoms: 4457.25,
-    momsAfYdelseskobUdland: 62.5,
-    kobsmoms: 1123.55,
-    momstilsvar: 3396.2,
-    rubrikA: 250,
+    salgsmoms: 4457,
+    momsAfYdelseskobUdland: 62,
+    kobsmoms: 1123,
+    momsIAlt: 3396,
+    rubrikAYdelser: 250,
   });
 
-  expect(closeAccountingPeriod(db, {
+  seedHistoricalClosedPeriod(db, {
     periodStart: "2026-05-01",
     periodEnd: "2026-05-31",
     kind: "vat_period",
-    force: true,
-  }).ok).toBe(true);
+  });
   const filing = buildVatFiling(db, "2026-05-01", "2026-05-31");
   expect(filing.ok, filing.errors.join("\n")).toBe(true);
   expect(filing.rubrikker).toEqual(report.rubrikker);
@@ -764,8 +813,8 @@ test("a mixed Dinero voucher keeps ordinary sales VAT out of the reverse-charge 
     salgsmoms: 25,
     momsAfYdelseskobUdland: 25,
     kobsmoms: 25,
-    momstilsvar: 25,
-    rubrikA: 100,
+    momsIAlt: 25,
+    rubrikAYdelser: 100,
   });
   db.close(); rmSync(root, { recursive: true, force: true });
 });
@@ -861,12 +910,14 @@ test("a closed VAT period can be marked reported once and remains terminal", () 
     status: "closed",
   });
   expect(closed.ok).toBe(true);
-  const reported = closeAccountingPeriod(db, {
+  const reported = closeAccountingPeriodCore(db, {
     periodStart: "2026-01-01",
     periodEnd: "2026-03-31",
     kind: "vat_period",
     status: "reported",
     reference: "SKAT-RECEIPT-42",
+    readinessPacketHash: closed.readinessPacket!.hash,
+    createdBy: "user:test",
   });
   expect(reported.ok).toBe(true);
   expect(reported.reference).toBe("SKAT-RECEIPT-42");
@@ -880,12 +931,13 @@ test("a closed VAT period can be marked reported once and remains terminal", () 
     periodStatus: "reported",
     periodReference: "SKAT-RECEIPT-42",
   });
-  expect(closeAccountingPeriod(db, {
+  expect(closeAccountingPeriodCore(db, {
     periodStart: "2026-01-01",
     periodEnd: "2026-03-31",
     kind: "vat_period",
     status: "reported",
     reference: "SKAT-RECEIPT-42",
+    readinessPacketHash: closed.readinessPacket!.hash,
   }).ok).toBe(true);
   expect(reopenAccountingPeriod(db, {
     periodStart: "2026-01-01",

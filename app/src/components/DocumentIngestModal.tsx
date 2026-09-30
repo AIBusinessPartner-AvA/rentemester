@@ -70,8 +70,14 @@ export function DocumentIngestModal({
   const [recipientName, setRecipientName] = useState("");
   const [recipientAddress, setRecipientAddress] = useState("");
   const [recipientVat, setRecipientVat] = useState("");
-  const [reverseChargeWordingConfirmed, setReverseChargeWordingConfirmed] = useState(false);
+  const [reverseChargeWordingExcerpt, setReverseChargeWordingExcerpt] = useState("");
+  const [reverseChargeWordingLocation, setReverseChargeWordingLocation] = useState("");
   const [purchaseVatLines, setPurchaseVatLines] = useState<EditablePurchaseVatLine[]>([]);
+  const [sourceBankTransactionId, setSourceBankTransactionId] = useState("");
+  const [internalVoucherKind, setInternalVoucherKind] = useState<"bank_evidenced" | "non_cash_balance_correction">("bank_evidenced");
+  const [accountingRationale, setAccountingRationale] = useState("");
+  const [payrollPeriod, setPayrollPeriod] = useState("");
+  const [payrollReference, setPayrollReference] = useState("");
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -110,6 +116,9 @@ export function DocumentIngestModal({
   // A cash-register receipt is exempt from the full statutory field set, so
   // those inputs are only required (and only shown as required) for køb/salg.
   const isPurchaseSale = documentType === "purchase_sale";
+  const isInternalVoucher = documentType === "internal_voucher";
+  const isExternalPayroll = documentType === "external_accounting_evidence";
+  const isNonCashBalanceCorrection = isInternalVoucher && internalVoucherKind === "non_cash_balance_correction";
 
   async function handleIngest() {
     if (!fileBase64 || !fileName) {
@@ -128,6 +137,31 @@ export function DocumentIngestModal({
     }
     if (vatNum !== undefined && !Number.isFinite(vatNum)) {
       setError("Momsbeløb skal være et tal.");
+      return;
+    }
+    const bankTransactionId = sourceBankTransactionId.trim()
+      ? Number(sourceBankTransactionId)
+      : undefined;
+    if (
+      isInternalVoucher && !isNonCashBalanceCorrection &&
+      (!Number.isInteger(bankTransactionId) || Number(bankTransactionId) <= 0)
+    ) {
+      setError("Angiv den importerede banktransaktions id.");
+      return;
+    }
+    if (
+      isInternalVoucher &&
+      (!issueDate.trim() || !deliveryDescription.trim() || !(Number(amountNum) > 0))
+    ) {
+      setError("Internt bilag kræver dato, beskrivelse og et positivt beløb.");
+      return;
+    }
+    if (isInternalVoucher && !accountingRationale.trim()) {
+      setError("Angiv den regnskabsmæssige begrundelse.");
+      return;
+    }
+    if (isExternalPayroll && (!issueDate.trim() || !recipientName.trim() || !senderName.trim() || !/^\d{4}-(0[1-9]|1[0-2])$/.test(payrollPeriod) || !payrollReference.trim() || !(Number(amountNum) > 0))) {
+      setError("Eksternt lønbilag kræver rapportdato, udsteder, virksomhed, lønperiode, ekstern reference og samlet beløb.");
       return;
     }
     let parsedPurchaseVatLines: NonNullable<DocumentIngestMetadata["purchaseVatLines"]> = [];
@@ -162,12 +196,26 @@ export function DocumentIngestModal({
     if (deliveryDescription.trim())
       metadata.deliveryDescription = deliveryDescription.trim();
     if (amountNum !== undefined) metadata.amountIncVat = amountNum;
-    if (vatNum !== undefined) metadata.vatAmount = vatNum;
+    if (isInternalVoucher || isExternalPayroll) metadata.vatAmount = 0;
+    else if (vatNum !== undefined) metadata.vatAmount = vatNum;
+    if (isInternalVoucher) {
+      metadata.internalVoucherKind = internalVoucherKind;
+      if (!isNonCashBalanceCorrection) metadata.sourceBankTransactionId = bankTransactionId!;
+      metadata.accountingRationale = accountingRationale.trim();
+    }
+    if (isExternalPayroll) metadata.externalAccountingEvidence = { category: "payroll", accountingPeriod: payrollPeriod, externalReference: payrollReference.trim(), totals: { debitAmount: amountNum!, creditAmount: amountNum! } };
     if (isPurchaseSale && parsedPurchaseVatLines.length > 0) {
       metadata.purchaseVatLines = parsedPurchaseVatLines;
     }
-    if (isPurchaseSale && reverseChargeWordingConfirmed) {
-      metadata.reverseChargeWordingConfirmed = true;
+    if (isPurchaseSale && (reverseChargeWordingExcerpt.trim() || reverseChargeWordingLocation.trim())) {
+      if (!reverseChargeWordingExcerpt.trim() || !reverseChargeWordingLocation.trim()) {
+        setError("Angiv både ordlyd og placering på bilaget for omvendt betalingspligt.");
+        return;
+      }
+      metadata.reverseChargeWordingEvidence = {
+        excerpt: reverseChargeWordingExcerpt.trim(),
+        location: reverseChargeWordingLocation.trim(),
+      };
     }
     if (senderName.trim() || senderAddress.trim() || senderVat.trim() || senderCountryCode.trim() || senderIdentifierKind) {
       metadata.sender = {
@@ -252,8 +300,8 @@ export function DocumentIngestModal({
             <div className="modal-body">
               <p>
                 Vælg en bilagsfil (PDF, billede eller tekst) og udfyld
-                oplysningerne. Et køb/salg-bilag kræver de lovpligtige felter;
-                en kassebon kan indlæses med mindre.
+                oplysningerne. Interne bilag skal bindes til den importerede
+                bankpost, der udgør det primære bevis.
               </p>
             </div>
 
@@ -289,6 +337,8 @@ export function DocumentIngestModal({
                 >
                   <option value="purchase_sale">Køb/salg</option>
                   <option value="cash_register_receipt">Kassebon</option>
+                  <option value="internal_voucher">Internt bilag</option>
+                  <option value="external_accounting_evidence">Eksternt lønbilag</option>
                 </select>
               </label>
               <label className="modal-field">
@@ -302,9 +352,11 @@ export function DocumentIngestModal({
               </label>
             </div>
 
+            {isExternalPayroll && <div className="modal-field-grid"><label className="modal-field">Lønperiode<input type="month" value={payrollPeriod} onChange={(e) => setPayrollPeriod(e.target.value)} disabled={busy} /></label><label className="modal-field">Ekstern lønreference<input type="text" value={payrollReference} onChange={(e) => setPayrollReference(e.target.value)} disabled={busy} /></label></div>}
+
             <div className="modal-field-grid">
               <label className="modal-field">
-                Bilagsdato{isPurchaseSale ? "" : " (valgfri)"}
+                Bilagsdato{isPurchaseSale || isInternalVoucher || isExternalPayroll ? "" : " (valgfri)"}
                 <input
                   type="date"
                   value={issueDate}
@@ -325,7 +377,11 @@ export function DocumentIngestModal({
 
             <div className="modal-field-grid">
               <label className="modal-field">
-                Beløb inkl. moms{isPurchaseSale ? "" : " (valgfri)"}
+                {isInternalVoucher
+                  ? "Beløb"
+                  : isExternalPayroll
+                    ? "Samlet lønrapport (debet/kredit)"
+                  : `Beløb inkl. moms${isPurchaseSale ? "" : " (valgfri)"}`}
                 <input
                   type="number"
                   inputMode="decimal"
@@ -335,13 +391,14 @@ export function DocumentIngestModal({
                 />
               </label>
               <label className="modal-field">
-                Momsbeløb{isPurchaseSale ? "" : " (valgfri)"}
+                Momsbeløb{isInternalVoucher || isExternalPayroll ? " (altid 0)" : isPurchaseSale ? "" : " (valgfri)"}
                 <input
                   type="number"
                   inputMode="decimal"
                   value={vatAmount}
                   onChange={(e) => setVatAmount(e.target.value)}
-                  disabled={busy}
+                  disabled={busy || isInternalVoucher || isExternalPayroll}
+                  placeholder={isInternalVoucher || isExternalPayroll ? "0" : undefined}
                 />
               </label>
             </div>
@@ -356,9 +413,9 @@ export function DocumentIngestModal({
               />
             </label>
 
-            {isPurchaseSale && (
+            {(isPurchaseSale || isInternalVoucher) && (
               <label className="modal-field">
-                Beskrivelse af leverance
+                {isInternalVoucher ? "Beskrivelse" : "Beskrivelse af leverance"}
                 <input
                   type="text"
                   value={deliveryDescription}
@@ -368,7 +425,42 @@ export function DocumentIngestModal({
               </label>
             )}
 
-            {isPurchaseSale && (
+            {isInternalVoucher && (
+              <>
+                <label className="modal-field">
+                  Intern bilagstype
+                  <select value={internalVoucherKind} onChange={(e) => setInternalVoucherKind(e.target.value as "bank_evidenced" | "non_cash_balance_correction")} disabled={busy}>
+                    <option value="bank_evidenced">Bankdokumenteret</option>
+                    <option value="non_cash_balance_correction">Balancekorrektion uden bankbevægelse</option>
+                  </select>
+                </label>
+                {isNonCashBalanceCorrection && <p className="muted">Kun to balancekonti, dato, valuta og beløb skal senere stemme præcist med journalen. Moms er altid 0.</p>}
+                {!isNonCashBalanceCorrection &&
+                <label className="modal-field">
+                  Banktransaktions-id
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={sourceBankTransactionId}
+                    onChange={(e) => setSourceBankTransactionId(e.target.value)}
+                    disabled={busy}
+                  />
+                </label>
+                }
+                <label className="modal-field">
+                  Regnskabsmæssig begrundelse
+                  <textarea
+                    value={accountingRationale}
+                    onChange={(e) => setAccountingRationale(e.target.value)}
+                    disabled={busy}
+                    maxLength={2000}
+                  />
+                </label>
+              </>
+            )}
+
+            {(isPurchaseSale || isExternalPayroll) && (
               <fieldset className="modal-field">
                 <legend>Momsfordeling (valgfri)</legend>
                 <p className="muted">
@@ -430,7 +522,7 @@ export function DocumentIngestModal({
               </fieldset>
             )}
 
-            {isPurchaseSale && (
+            {(isPurchaseSale || isExternalPayroll) && (
               <>
                 <div className="modal-field-grid">
                   <label className="modal-field">
@@ -502,16 +594,17 @@ export function DocumentIngestModal({
                     disabled={busy}
                   />
                 </label>
-                {senderIdentifierKind === "non_eu" && (
-                  <label className="modal-field checkbox-field">
-                    <input
-                      type="checkbox"
-                      checked={reverseChargeWordingConfirmed}
-                      onChange={(e) => setReverseChargeWordingConfirmed(e.target.checked)}
-                      disabled={busy}
-                    />
-                    Jeg har kontrolleret, at bilaget indeholder ordlyd om omvendt betalingspligt
-                  </label>
+                {isPurchaseSale && senderIdentifierKind === "non_eu" && (
+                  <div className="modal-field-grid">
+                    <label className="modal-field">
+                      Ordlyd om omvendt betalingspligt (valgfri)
+                      <input value={reverseChargeWordingExcerpt} onChange={(e) => setReverseChargeWordingExcerpt(e.target.value)} placeholder="Citat fra bilaget" disabled={busy} />
+                    </label>
+                    <label className="modal-field">
+                      Placering på bilaget
+                      <input value={reverseChargeWordingLocation} onChange={(e) => setReverseChargeWordingLocation(e.target.value)} placeholder="Fx side 1" disabled={busy} />
+                    </label>
+                  </div>
                 )}
               </>
             )}

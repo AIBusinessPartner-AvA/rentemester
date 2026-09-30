@@ -11,9 +11,14 @@ import {
   exportPublicEInvoicePreview,
   submitPublicEInvoicePeppol,
   transmitPublicEInvoicePeppol,
+  resumePublicEInvoicePeppolSubmission,
   type PeppolTransmitter,
 } from "../../src/core/public-einvoice";
 import { digisenseAccessPointIdentity } from "../../src/core/efaktura/digisense-wiring";
+import { createDigisenseTransmitter } from "../../src/core/efaktura/digisense-transmitter";
+import type { DigisenseClient } from "../../src/core/efaktura/digisense-client";
+import { buildInvoiceList } from "../../src/core/invoice-list";
+import { wrapCoreResult } from "../../src/mcp/envelope";
 
 const PUBLIC_INVOICE = {
   invoiceType: "full" as const,
@@ -141,22 +146,20 @@ describe("public e-invoice preview export", () => {
     expect(first.sha256).toBe(second.sha256);
     expect(first.xml).toBe(second.xml);
     expect(readFileSync(outPath, "utf8")).toBe(first.xml);
+    expect(first.xml).toContain("<cbc:CustomizationID>OIOUBL-2.02</cbc:CustomizationID>");
+    expect(first.xml).toContain('schemeID="urn:oioubl:id:profileid-1.2" schemeAgencyID="320">Procurement-BilSim-1.0</cbc:ProfileID>');
+    expect(first.xml).toContain('<cbc:EndpointID schemeID="GLN">5790000000001</cbc:EndpointID>');
+    expect(first.xml).toContain('<cbc:EndpointID schemeID="DK:CVR">DK12345678</cbc:EndpointID>');
     expect(first.xml).toContain(
-      "<cbc:CustomizationID>urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0</cbc:CustomizationID>",
+      '<cac:PartyTaxScheme>\n        <cbc:CompanyID schemeID="DK:SE">DK12345678</cbc:CompanyID>',
     );
-    expect(first.xml).toContain("<cbc:ProfileID>urn:fdc:peppol.eu:2017:poacc:billing:01:1.0</cbc:ProfileID>");
-    // Buyer (public authority) addressed by its EAN/GLN under Peppol scheme 0088.
-    expect(first.xml).toContain('<cbc:EndpointID schemeID="0088">5790000000001</cbc:EndpointID>');
-    // Seller electronic address is mandatory in Peppol BIS (BR-62), DK CVR scheme
-    // 0184. schemeID 0184 carries the bare 8-digit CVR — the "DK" prefix is
-    // stripped (JUR-9), so it must NOT render as "DK12345678".
-    expect(first.xml).toContain('<cbc:EndpointID schemeID="0184">12345678</cbc:EndpointID>');
+    expect(first.xml).toContain(
+      '<cac:PartyLegalEntity>\n        <cbc:RegistrationName>Rentemester ApS</cbc:RegistrationName>\n        <cbc:CompanyID schemeID="DK:CVR">DK12345678</cbc:CompanyID>',
+    );
     // BuyerReference (BT-10) is mandatory for public recipients (PEPPOL-EN16931-R003).
     expect(first.xml).toContain("<cbc:BuyerReference>");
-    // Country code is mandatory on both postal addresses (BR-09 / BR-11).
-    expect(first.xml).toContain("<cbc:IdentificationCode>DK</cbc:IdentificationCode>");
-    // Buyer name carried as the legal RegistrationName (BT-44).
-    expect(first.xml).toContain("<cbc:RegistrationName>Københavns Kommune</cbc:RegistrationName>");
+    expect(first.xml).toContain('listID="urn:oioubl:codelist:addressformatcode-1.1" listAgencyID="320">Unstructured</cbc:AddressFormatCode>');
+    expect(first.xml).toContain("<cbc:Name>Københavns Kommune</cbc:Name>");
     // VAT percent follows the canonical 0..1→×100 contract: a 0.25 rate renders
     // as "25" (BT-119/BT-152), never "0.25" — and a 1.0 rate would be "100",
     // never "1" (the old heuristic's bug).
@@ -249,11 +252,43 @@ describe("public e-invoice preview export", () => {
   });
 });
 
-// JUR-9 — Peppol BIS 3.0 conformance: BuyerReference (PEPPOL-EN16931-R003),
+// OIOUBL 2.02 conformance: BuyerReference,
 // a tax category derived from the VAT treatment (not hardcoded "S"), a
 // configurable unit code, and the seller EndpointID under schemeID 0184 as a
 // bare 8-digit CVR.
-describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
+describe("public e-invoice OIOUBL 2.02 conformance", () => {
+  test("maps OIOUBL TaxExclusiveAmount to the document VAT total", () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-oioubl-f-inv127-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const payload = {
+      ...PUBLIC_INVOICE,
+      invoiceNumber: "2026-F-INV127",
+      lines: [{ description: "Syntetisk testlinje", quantity: 1, unitPriceExVat: 1, lineTotalExVat: 1 }],
+      totals: { netAmount: 1, vatRate: 0.25, vatAmount: 0.25, grossAmount: 1.25 },
+    };
+    db.run(
+      `INSERT INTO documents (source, sha256_hash, invoice_no, invoice_date, document_type, payload_json)
+       VALUES ('test', ?, ?, ?, 'issued_invoice', ?)`,
+      "oioubl-f-inv127-1-00",
+      payload.invoiceNumber,
+      payload.issueDate,
+      JSON.stringify(payload),
+    );
+    const documentId = Number((db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id);
+
+    const exported = exportPublicEInvoiceOioUbl(db, { invoiceDocumentId: documentId });
+    expect(exported.ok).toBe(true);
+    expect(exported.xml).toContain('<cbc:LineExtensionAmount currencyID="DKK">1.00</cbc:LineExtensionAmount>');
+    expect(exported.xml).toContain('<cac:TaxTotal>\n    <cbc:TaxAmount currencyID="DKK">0.25</cbc:TaxAmount>');
+    expect(exported.xml).toContain('<cbc:TaxExclusiveAmount currencyID="DKK">0.25</cbc:TaxExclusiveAmount>');
+    expect(exported.xml).toContain('<cbc:TaxInclusiveAmount currencyID="DKK">1.25</cbc:TaxInclusiveAmount>');
+    expect(exported.xml).toContain('<cbc:PayableAmount currencyID="DKK">1.25</cbc:PayableAmount>');
+
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("emits BuyerReference, OrderReference and a configurable unit code", () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-jur9-ref-"));
     const db = openDb(ensureCompanyDirs(root).db);
@@ -278,8 +313,7 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
     expect(exported.xml).toContain("<cbc:ID>ORDRE-987</cbc:ID>");
     // The configurable unit code overrides the H87 default.
     expect(exported.xml).toContain('<cbc:InvoicedQuantity unitCode="DAY">');
-    // Seller EndpointID is the bare 8-digit CVR (no "DK") under scheme 0184.
-    expect(exported.xml).toContain('<cbc:EndpointID schemeID="0184">12345678</cbc:EndpointID>');
+    expect(exported.xml).toContain('<cbc:EndpointID schemeID="DK:CVR">DK12345678</cbc:EndpointID>');
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -299,8 +333,7 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
 
     const exported = exportPublicEInvoiceOioUbl(db, { invoiceDocumentId: issued.documentId! });
     expect(exported.ok).toBe(true);
-    // A standard 25% line keeps category S with its real percent.
-    expect(exported.xml).toContain("<cbc:ID>S</cbc:ID>");
+    expect(exported.xml).toContain(">StandardRated</cbc:ID>");
     expect(exported.xml).toContain("<cbc:Percent>25</cbc:Percent>");
     // JUR-9: a standard-rated invoice must NOT carry an exemption reason
     // (BR-S-* forbids BT-120/BT-121 on category S).
@@ -339,7 +372,7 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
     expect(exported.ok).toBe(true);
     // Reverse charge => category AE, and the invoice still validates/exports
     // despite carrying no VAT amount/rate.
-    expect(exported.xml).toContain("<cbc:ID>AE</cbc:ID>");
+    expect(exported.xml).toContain(">ReverseCharge</cbc:ID>");
     expect(exported.xml).toContain("<cbc:BuyerReference>EAN-REF-RC</cbc:BuyerReference>");
     // TaxAmount renders as 0.00 so cac:TaxTotal stays well-formed.
     expect(exported.xml).toContain('<cbc:TaxAmount currencyID="DKK">0.00</cbc:TaxAmount>');
@@ -351,6 +384,34 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
     );
     expect(exported.xml).toContain("<cbc:TaxExemptionReason>");
     expect(exported.xml).toContain("DK_MOMSLOVEN_§46_STK_1_NR_6");
+
+    // Historical reverse-charge rows without line classifications are still
+    // subject to the OIOUBL arithmetic boundary. They must not be exported
+    // merely because the seller VAT is zero.
+    const legacyPayload = JSON.parse(
+      (db.query("SELECT payload_json FROM documents WHERE id = ?").get(issued.documentId) as { payload_json: string }).payload_json,
+    );
+    legacyPayload.invoiceNumber = "2026-RC-LEGACY-BAD";
+    legacyPayload.totals = { ...legacyPayload.totals, netAmount: 1000, grossAmount: 1000 };
+    db.run(
+      `INSERT INTO documents (source, sha256_hash, invoice_no, invoice_date, document_type, payload_json)
+       VALUES ('test', ?, ?, ?, 'issued_invoice', ?)`,
+      "jur9-rc-legacy-bad",
+      legacyPayload.invoiceNumber,
+      legacyPayload.issueDate,
+      JSON.stringify(legacyPayload),
+    );
+    const contradictoryDocumentId = Number(
+      (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
+    );
+    const contradictory = exportPublicEInvoiceOioUbl(db, { invoiceDocumentId: contradictoryDocumentId });
+    expect(contradictory.ok).toBe(false);
+    expect(contradictory.errors).toContain(
+      "invoice 2026-RC-LEGACY-BAD totals.netAmount must equal rounded OIOUBL line bases (1500)",
+    );
+    expect(contradictory.errors).toContain(
+      "invoice 2026-RC-LEGACY-BAD totals.grossAmount must equal rounded OIOUBL line totals (1500)",
+    );
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -367,7 +428,6 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
     // reads id/invoice_no/invoice_date/document_type/payload_json.
     const payload = {
       invoiceNumber: "2026-EXEMPT",
-      vatTreatment: "standard",
       issueDate: "2026-05-20",
       dueDate: "2026-06-19",
       currency: "DKK",
@@ -397,8 +457,33 @@ describe("public e-invoice OIOUBL — JUR-9 Peppol conformance", () => {
     const exported = exportPublicEInvoiceOioUbl(db, { invoiceDocumentId: documentId });
     expect(exported.ok).toBe(true);
     // A 0% line is treated as exempt (E); BR-E-10 requires an exemption reason.
-    expect(exported.xml).toContain("<cbc:ID>E</cbc:ID>");
+    expect(exported.xml).toContain(">ZeroRated</cbc:ID>");
     expect(exported.xml).toContain("<cbc:TaxExemptionReason>");
+
+    // The backwards-compatible interpretation is deliberately limited to
+    // payloads without an explicit line classification. A source that says
+    // "taxable" at 0% remains contradictory and must fail closed.
+    const contradictoryPayload = {
+      ...payload,
+      invoiceNumber: "2026-EXEMPT-CONTRADICTORY",
+      lines: payload.lines.map((line) => ({ ...line, taxClassification: "taxable" as const })),
+    };
+    db.run(
+      `INSERT INTO documents (source, sha256_hash, invoice_no, invoice_date, document_type, payload_json)
+       VALUES ('test', ?, ?, ?, 'issued_invoice', ?)`,
+      `jur9-exempt-${contradictoryPayload.invoiceNumber}`,
+      contradictoryPayload.invoiceNumber,
+      contradictoryPayload.issueDate,
+      JSON.stringify(contradictoryPayload),
+    );
+    const contradictoryDocumentId = Number(
+      (db.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
+    );
+    const contradictory = exportPublicEInvoiceOioUbl(db, { invoiceDocumentId: contradictoryDocumentId });
+    expect(contradictory.ok).toBe(false);
+    expect(contradictory.errors).toContain(
+      `invoice ${contradictoryPayload.invoiceNumber} lines[0].vatRate is required for taxable lines`,
+    );
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -583,6 +668,7 @@ describe("public e-invoice PEPPOL transmission", () => {
   const failTransmitter: PeppolTransmitter = () => ({
     ok: false,
     error: "access point unavailable",
+    retryableBeforeDelivery: true,
   });
 
   test("transmits an invoice and records it as an acknowledged submission", async () => {
@@ -611,9 +697,10 @@ describe("public e-invoice PEPPOL transmission", () => {
       transmission_id: string | null;
       acknowledged_at: string | null;
     };
-    expect(row.status).toBe("acknowledged");
-    expect(row.transmission_id).toBe("tx-test-0001");
-    expect(row.acknowledged_at).toBe("2026-05-22T10:00:00Z");
+    expect(row.status).toBe("prepared");
+    expect(row.transmission_id).toBeNull();
+    expect(row.acknowledged_at).toBeNull();
+    expect(db.query("SELECT document_id FROM peppol_submission_events WHERE event_type = 'delivered'").get()).toMatchObject({ document_id: "tx-test-0001" });
 
     const audit = db
       .query("SELECT message FROM audit_log WHERE event_type = 'public_einvoice_peppol_transmission'")
@@ -662,7 +749,46 @@ describe("public e-invoice PEPPOL transmission", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("records a failed transmission in the audit log without writing a submission row", async () => {
+  test("preserves a legacy row acknowledgement without status lookup or redelivery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-peppol-legacy-ack-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
+    expect(issued.ok).toBe(true);
+    const prepared = submitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ACCESS_POINT });
+    expect(prepared.ok).toBe(true);
+
+    // Model a database written by the pre-event implementation.
+    db.run("DROP TRIGGER peppol_submissions_no_update");
+    db.run(
+      "UPDATE peppol_submissions SET status = 'acknowledged', transmission_id = 'legacy-tx', acknowledged_at = '2026-05-22T10:00:00Z'",
+    );
+
+    let deliveryCalls = 0;
+    const result = await transmitPublicEInvoicePeppol(
+      db,
+      { invoiceDocumentId: issued.documentId!, accessPoint: ACCESS_POINT },
+      () => { deliveryCalls += 1; return { ok: true, transmissionId: "must-not-send", transmittedAt: "2026-05-23T10:00:00Z" }; },
+    );
+    expect(result.status).toBe("acknowledged");
+    expect(result.transmissionId).toBe("legacy-tx");
+    expect(deliveryCalls).toBe(0);
+
+    let statusCalls = 0;
+    const resumed = await resumePublicEInvoicePeppolSubmission(
+      db,
+      { invoiceDocumentId: issued.documentId!, accessPoint: ACCESS_POINT },
+      async () => { statusCalls += 1; return { ok: true, status: "delivered" }; },
+    );
+    expect(resumed.status).toBe("acknowledged");
+    expect(statusCalls).toBe(0);
+    expect(buildInvoiceList(db).rows[0]?.peppolStatus?.status).toBe("acknowledged");
+
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("records a failed transmission as retryable append-only evidence", async () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-peppol-transmit-fail-"));
     const db = openDb(ensureCompanyDirs(root).db);
     migrate(db);
@@ -679,7 +805,9 @@ describe("public e-invoice PEPPOL transmission", () => {
     expect(result.errors.join(" ")).toContain("access point unavailable");
 
     const rows = db.query("SELECT id FROM peppol_submissions").all() as Array<{ id: number }>;
-    expect(rows).toHaveLength(0);
+    expect(rows).toHaveLength(1);
+    expect(db.query("SELECT event_type FROM peppol_submission_events WHERE event_type = 'delivery_failed'").get()).not.toBeNull();
+    expect(buildInvoiceList(db).rows[0]?.peppolStatus?.status).toBe("retryable");
 
     const audit = db
       .query("SELECT message FROM audit_log WHERE event_type = 'public_einvoice_peppol_transmission'")
@@ -715,7 +843,7 @@ describe("public e-invoice PEPPOL transmission", () => {
 
     const rows = db.query("SELECT status FROM peppol_submissions").all() as Array<{ status: string }>;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.status).toBe("acknowledged");
+    expect(rows[0]!.status).toBe("prepared");
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -750,14 +878,16 @@ describe("public e-invoice PEPPOL transmission", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("treats a thrown transmitter error as a failed transmission", async () => {
+  test("treats a thrown transmitter error as uncertain and blocks retry", async () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-peppol-transmit-throw-"));
     const db = openDb(ensureCompanyDirs(root).db);
     migrate(db);
     const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
     expect(issued.ok).toBe(true);
 
+    let calls = 0;
     const throwingTransmitter: PeppolTransmitter = () => {
+      calls += 1;
       throw new Error("socket reset by access point");
     };
 
@@ -767,11 +897,17 @@ describe("public e-invoice PEPPOL transmission", () => {
       throwingTransmitter,
     );
 
-    expect(result.ok).toBe(false);
-    expect(result.errors.join(" ")).toContain("socket reset by access point");
+    const retry = await transmitPublicEInvoicePeppol(
+      db,
+      { invoiceDocumentId: issued.documentId!, accessPoint: ACCESS_POINT },
+      throwingTransmitter,
+    );
+    expect(result).toMatchObject({ ok: true, status: "uncertain" });
+    expect(retry).toMatchObject({ ok: true, status: "uncertain", duplicate: true });
+    expect(calls).toBe(1);
 
     const rows = db.query("SELECT id FROM peppol_submissions").all() as Array<{ id: number }>;
-    expect(rows).toHaveLength(0);
+    expect(rows).toHaveLength(1);
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -813,6 +949,32 @@ describe("public e-invoice PEPPOL transmission — Digisense double-send safety"
     rmSync(root, { recursive: true, force: true });
   });
 
+  test("atomically reserves delivery before an async transport so concurrent callers deliver once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-digisense-concurrent-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
+    let calls = 0;
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const transmitter: PeppolTransmitter = async () => {
+      calls += 1;
+      await hold;
+      return { ok: true, transmissionId: "ds-concurrent-1", transmittedAt: "2026-06-01T00:00:00Z" };
+    };
+    const ap = digisenseAccessPointIdentity(COMPANY_KEY);
+    const first = transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, transmitter);
+    const second = transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, transmitter);
+    await Promise.resolve();
+    release();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(calls).toBe(1);
+    expect(firstResult.ok).toBe(true);
+    expect(secondResult.errors.join(" ")).toContain("in progress");
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   test("a queued-but-not-delivered timeout records a pending row and refuses to re-deliver", async () => {
     const root = mkdtempSync(join(tmpdir(), "rentemester-digisense-queued-"));
     const db = openDb(ensureCompanyDirs(root).db);
@@ -831,28 +993,136 @@ describe("public e-invoice PEPPOL transmission — Digisense double-send safety"
     const ap = digisenseAccessPointIdentity(COMPANY_KEY);
     const first = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, queuedTimeoutTransmitter);
 
-    expect(first.ok).toBe(false);
+    expect(first.ok).toBe(true);
     expect(first.status).toBe("prepared");
     expect(first.transmissionId).toBe("ds-queued-7");
-    // A pending submission row was recorded (status prepared + the queued id).
+    // A pending submission row and append-only queued event were recorded.
     const pendingRow = db
       .query("SELECT status, transmission_id FROM peppol_submissions WHERE invoice_document_id = ?")
       .get(issued.documentId!) as { status: string; transmission_id: string | null };
     expect(pendingRow.status).toBe("prepared");
-    expect(pendingRow.transmission_id).toBe("ds-queued-7");
+    expect(pendingRow.transmission_id).toBeNull();
+    expect(db.query("SELECT document_id FROM peppol_submission_events WHERE event_type = 'queued'").get()).toMatchObject({ document_id: "ds-queued-7" });
+    expect(buildInvoiceList(db).rows[0]?.peppolStatus?.status).toBe("queued");
 
     // A naive retry MUST NOT call deliver again — that would deliver the invoice
-    // a second time. The double-send guard refuses and points at the queued id.
+    // a second time. It is a successful pending result for status-only UI mode.
     const retry = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, queuedTimeoutTransmitter);
-    expect(retry.ok).toBe(false);
-    expect(retry.errors.join(" ")).toContain("ds-queued-7");
-    expect(retry.errors.join(" ").toLowerCase()).toContain("re-deliver");
+    expect(retry.ok).toBe(true);
+    expect(retry.status).toBe("prepared");
+    expect(retry.transmissionId).toBe("ds-queued-7");
     // deliver ran exactly ONCE across both attempts.
     expect(deliverCalls).toBe(1);
     // Still exactly one submission row.
     const rows = db.query("SELECT id FROM peppol_submissions").all() as Array<{ id: number }>;
     expect(rows).toHaveLength(1);
 
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("an accepted terminal failure is never re-delivered", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-digisense-terminal-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
+    let deliverCalls = 0;
+    const ap = digisenseAccessPointIdentity(COMPANY_KEY);
+    const client = {
+      validateDocument: async () => ({
+        ok: true as const,
+        status: 200,
+        data: { statusCode: 200, success: true, errors: [] },
+      }),
+      deliverDocument: async () => {
+        deliverCalls += 1;
+        return {
+          ok: true as const,
+          status: 202,
+          data: { statusCode: 202, documentStatus: "queued-for-delivery" as const, documentId: "ds-terminal-1", message: "queued", publicUrl: "" },
+        };
+      },
+      documentStatus: async () => ({
+        ok: true as const,
+        status: 422,
+        data: { statusCode: 422, documentStatus: "unable-to-deliver" as const, documentId: "ds-terminal-1", message: "receiver rejected", publicUrl: "" },
+      }),
+    } as unknown as DigisenseClient;
+    const acceptedThenRejected = createDigisenseTransmitter(client, {
+      companyKey: COMPANY_KEY,
+      sleep: async () => {},
+      maxPollAttempts: 2,
+    });
+
+    const first = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, acceptedThenRejected);
+    const retry = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, acceptedThenRejected);
+
+    expect(first.ok).toBe(true);
+    expect(retry.ok).toBe(true);
+    expect(first.status).toBe("failed");
+    expect(retry.status).toBe("failed");
+    expect(wrapCoreResult(first)).toMatchObject({
+      ok: true,
+      data: { status: "failed", transmissionId: "ds-terminal-1" },
+      errors: [],
+    });
+    expect(deliverCalls).toBe(1);
+    expect(buildInvoiceList(db).rows[0]?.peppolStatus).toMatchObject({
+      status: "failed",
+      transmissionId: "ds-terminal-1",
+    });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("an ambiguous delivery response becomes uncertain and is never re-delivered", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-digisense-uncertain-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
+    let deliverCalls = 0;
+    const ambiguous: PeppolTransmitter = () => {
+      deliverCalls += 1;
+      // No explicit pre-delivery proof: generic failures fail closed as
+      // uncertain even if the adapter forgot to set deliveryUncertain.
+      return { ok: false, error: "transport timed out after POST" };
+    };
+    const ap = digisenseAccessPointIdentity(COMPANY_KEY);
+
+    const first = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, ambiguous);
+    const retry = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, ambiguous);
+
+    expect(first).toMatchObject({ ok: true, status: "uncertain" });
+    expect(retry).toMatchObject({ ok: true, status: "uncertain", duplicate: true });
+    expect(deliverCalls).toBe(1);
+    expect(buildInvoiceList(db).rows[0]?.peppolStatus?.status).toBe("uncertain");
+    expect(wrapCoreResult(first)).toMatchObject({ ok: true, data: { status: "uncertain" }, errors: [] });
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("status resume records append-only evidence and makes later transmit acknowledged without re-delivery", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rentemester-digisense-resume-"));
+    const db = openDb(ensureCompanyDirs(root).db);
+    migrate(db);
+    const issued = issueInvoice(db, root, { ...PUBLIC_INVOICE });
+    const ap = digisenseAccessPointIdentity(COMPANY_KEY);
+    let deliverCalls = 0;
+    await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, () => {
+      deliverCalls += 1;
+      return { ok: false, error: "queued", queuedDocumentId: "ds-resume-1" };
+    });
+    const resumed = await resumePublicEInvoicePeppolSubmission(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, () => ({ ok: true, status: "delivered", message: "done", observedAt: "2026-06-01T00:00:00Z" }));
+    expect(resumed.ok).toBe(true);
+    expect(resumed.status).toBe("acknowledged");
+    expect(db.query("SELECT id FROM peppol_submission_events WHERE event_type = 'status_observed'").all()).toHaveLength(1);
+    const retry = await transmitPublicEInvoicePeppol(db, { invoiceDocumentId: issued.documentId!, accessPoint: ap }, () => {
+      deliverCalls += 1;
+      return { ok: true, transmissionId: "should-not-run", transmittedAt: "2026-06-01T00:00:00Z" };
+    });
+    expect(retry.ok).toBe(true);
+    expect(retry.status).toBe("acknowledged");
+    expect(deliverCalls).toBe(1);
     db.close();
     rmSync(root, { recursive: true, force: true });
   });

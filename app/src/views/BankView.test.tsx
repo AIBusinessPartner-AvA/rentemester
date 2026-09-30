@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test } from "bun:test";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { BankView } from "./BankView";
@@ -19,6 +19,17 @@ function renderView(path = "/companies/acme-aps/bank") {
 }
 
 describe("BankView — Bank", () => {
+  test("links only bank rows with an explicit canonical party decision", async () => {
+    const row = bank().transactions[0];
+    mockFetch(route({ transactions: [
+      { ...row, id: 11, text: "Samme navn", partyId: "party-bank" },
+      { ...row, id: 12, text: "Samme navn", partyId: null },
+    ] }));
+    renderView();
+    expect(await screen.findByRole("link", { name: "Samme navn" })).toHaveAttribute("href", "/companies/acme-aps/parter/party-bank");
+    expect(screen.getAllByText("Samme navn").some((element) => element.closest("a") === null)).toBe(true);
+  });
+
   test("shows the booked balance and the bank account", async () => {
     mockFetch(route());
     renderView();
@@ -139,6 +150,48 @@ describe("BankView — Bank", () => {
     expect(screen.getAllByText(/Gebyr/).length).toBeGreaterThan(0);
   });
 
+  test("a matched row exposes the reviewed bank-correction flow", async () => {
+    mockFetch({
+      ...route(),
+      "GET /api/companies/acme-aps/bank/reconciliation-correction-plan": {
+        plan: {
+          ok: true,
+          plan: {
+            reconciliationId: "direct:17",
+            planHash: "a".repeat(64),
+            currentJournalEntryNo: "B-2026-0001",
+            replacementJournalEntryNo: "B-2026-0002",
+            bankAccountNo: "55000",
+            bankAmountDkk: 22286.28,
+          },
+        },
+      },
+      "POST /api/companies/acme-aps/bank/reconciliation-correction": {
+        correction: { ok: true, reconciliationId: "correction:1" },
+      },
+    });
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "Ret" }));
+    expect(screen.getByRole("dialog", { name: "Ret afstemt bankpost" })).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Erstatningsjournal-id"), "18");
+    await userEvent.click(screen.getByRole("button", { name: "Kontrollér plan" }));
+    expect(await screen.findByText(/direct:17/)).toBeInTheDocument();
+    expect(screen.getByText(/B-2026-0002/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Begrundelse"), "Gennemgået korrektion");
+    await userEvent.type(screen.getByLabelText("Idempotensnøgle"), "bank-correction-1");
+    await userEvent.click(screen.getByRole("checkbox"));
+    await userEvent.click(screen.getByRole("button", { name: "Anvend korrektion" }));
+    expect(await screen.findByText("Indbetaling faktura 1001")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Ret afstemt bankpost" })).not.toBeInTheDocument();
+  });
+
+  test("an archived year exposes no correction action", async () => {
+    mockFetch(route({ archived: true, selectedYear: "2025" }));
+    renderView();
+    await screen.findByText(/2025 er et arkiveret regnskabsår/);
+    expect(screen.queryByRole("button", { name: "Ret" })).not.toBeInTheDocument();
+  });
+
   test("an archived year shows no Bogfør action — there is no live ledger to post into", async () => {
     mockFetch(route({ archived: true, selectedYear: "2025" }));
     renderView();
@@ -243,17 +296,35 @@ describe("BankView — Bank", () => {
     expect(screen.queryByText("Gebyr Danske Bank")).not.toBeInTheDocument();
   });
 
-  test("Ryd filtre-knappen er kun synlig når et filter er aktivt (#451)", async () => {
+  test("Nulstil filtre er kun synlig når et filter er aktivt (#451)", async () => {
     mockFetch(route(MULTI_TX));
     renderView();
     await screen.findByText("Indbetaling Energinet");
     expect(
-      screen.queryByRole("button", { name: /Ryd filtre/i }),
+      screen.queryByRole("button", { name: /Nulstil filtre/i }),
     ).not.toBeInTheDocument();
     const search = screen.getByPlaceholderText(/Søg på tekst/i);
     await userEvent.type(search, "energinet");
     expect(
-      screen.getByRole("button", { name: /Ryd filtre/i }),
+      screen.getByRole("button", { name: /Nulstil filtre/i }),
     ).toBeInTheDocument();
+  });
+
+  test("uses the shared labelled filter bar and keeps advanced date filters available", async () => {
+    mockFetch(route(MULTI_TX));
+    renderView();
+    await screen.findByText("Indbetaling Energinet");
+    expect(screen.getByLabelText("Søg")).toHaveAttribute("type", "search");
+    await userEvent.click(screen.getByText("Avancerede filtre"));
+    expect(screen.getByLabelText("Fra")).toBeInTheDocument();
+    expect(screen.getByLabelText("Til")).toBeInTheDocument();
+  });
+
+  test("keeps bank structure while a request fails and offers retry", async () => {
+    mockFetch({ "GET /api/companies/acme-aps/bank": { __error: { code: "unavailable", message: "Midlertidig fejl" } } });
+    renderView();
+    expect(await screen.findByRole("heading", { name: "Bankposter kunne ikke hentes" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Prøv igen" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Bank" })).toBeInTheDocument();
   });
 });

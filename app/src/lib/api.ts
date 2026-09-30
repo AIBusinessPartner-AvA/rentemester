@@ -25,6 +25,7 @@ export type {
   DocumentBookExpenseSummary,
   DocumentBookingOptions,
   DocumentBookingOptionsDocument,
+  DocumentVatPreflight,
   DocumentIngestInput,
   DocumentIngestMetadata,
   ExpenseAccountOption,
@@ -50,6 +51,8 @@ export type {
 } from "./api/invoices";
 
 import { accountantApi } from "./api/accountant";
+import { accountingDraftsApi } from "./api/accounting-drafts";
+import { accountingApprovalPolicyApi } from "./api/accounting-approval-policy";
 import { accountsApi } from "./api/accounts";
 import { accrualsApi } from "./api/accruals";
 import { agentSuggestionsApi, exceptionsApi } from "./api/exceptions";
@@ -63,6 +66,7 @@ import { contactsApi } from "./api/contacts";
 import { dashboardApi } from "./api/dashboard";
 import { documentsApi } from "./api/documents";
 import { gdprApi } from "./api/gdpr";
+import { groupApi } from "./api/group";
 import { integrityApi } from "./api/integrity";
 import { invoicesApi } from "./api/invoices";
 import { mileageApi } from "./api/mileage";
@@ -72,11 +76,21 @@ import { retentionApi } from "./api/retention";
 import { statementsApi } from "./api/statements";
 import { systemApi } from "./api/system";
 import { vatApi } from "./api/vat";
+import { workspaceApi } from "./api/workspace";
+import { postingRulesApi } from "./api/posting-rules";
+import { bookkeepingBatchApi } from "./api/bookkeeping-batch";
+import { workspaceRegistryApi } from "./api/workspace-registry";
+import { cfoAnalyticsApi } from "./api/cfo-analytics";
+import { supplierCommitmentsApi } from "./api/supplier-commitments";
+import { dimensionsApi } from "./api/dimensions";
+import { purchaseCasesApi } from "./api/purchase-cases";
 
 // One method per key — the earlier legacy `closePeriod` / `reopenPeriod` /
 // `resolveException` duplicates (#UI-9) have been deleted, so no spread-order
 // shadowing is load-bearing any more.
 export const api = {
+  ...accountingDraftsApi,
+  ...accountingApprovalPolicyApi,
   ...systemApi,
   ...retentionApi,
   ...integrityApi,
@@ -101,4 +115,13 @@ export const api = {
   ...assetsApi,
   ...payablesApi,
   ...agentSuggestionsApi,
+  ...groupApi,
+  ...workspaceApi,
+  ...postingRulesApi,
+  ...bookkeepingBatchApi,
+  ...workspaceRegistryApi,
+  ...cfoAnalyticsApi,
+  ...supplierCommitmentsApi,
+  ...dimensionsApi,
+  ...purchaseCasesApi,
 };

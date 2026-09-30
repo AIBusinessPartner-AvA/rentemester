@@ -16,6 +16,7 @@ import type { CompanyVat, CompanyVatRegistered, VatRubrikker } from "../lib/type
 import { Banner, ErrorState, Loading } from "../components/Feedback";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { PageState, StatusChip } from "../components/CockpitPrimitives";
 
 export function VatView() {
   const { slug = "" } = useParams();
@@ -30,9 +31,9 @@ export function VatView() {
   // Set after a successful period close / reopen — surfaced as a success banner.
   const [closedNotice, setClosedNotice] = useState<string | null>(null);
 
-  if (state.loading && !state.data) return <Loading label="Henter moms…" />;
+  if (state.loading && !state.data) return <section data-evidence-issue="656"><h2 data-evidence-heading>Moms og lukkeparathed</h2><p data-evidence-status="loading">Henter momsparathed</p><Loading label="Henter moms…" /></section>;
   if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <section data-evidence-issue="656"><h2 data-evidence-heading>Moms og lukkeparathed</h2><p data-evidence-status={/403|forbudt|adgang/i.test(state.error) ? "warning-or-blocked" : "error"}>{/403|forbudt|adgang/i.test(state.error) ? "Moms kræver afklaring" : "Momsparathed kunne ikke hentes"}</p><ErrorState message={state.error} onRetry={state.reload} /></section>;
 
   const v = state.data!;
   const currency = v.company.currency || "DKK";
@@ -44,7 +45,7 @@ export function VatView() {
   // below.
   if (!v.vatRegistered) {
     return (
-      <section className="statement">
+      <section className="statement" data-cockpit-page="vat" data-evidence-issue="656">
         <div className="page-head">
           <div>
             <h2>{v.company.name}</h2>
@@ -71,6 +72,10 @@ export function VatView() {
     );
   }
 
+  if (v.outputVat === 0 && v.inputVat === 0 && v.payable === 0 && v.rubrikker.momsIAlt === 0) {
+    return <section className="statement" data-cockpit-page="vat" data-evidence-issue="656"><div className="page-head"><div><h2>{v.company.name}</h2><h3 data-evidence-heading>Moms og lukkeparathed</h3><p className="muted" data-evidence-status="empty">Ingen momsforpligtelser i perioden</p></div></div><PageState kind="empty" title="Ingen momsforpligtelser i perioden">Der er ingen momsbeløb at gennemgå for den valgte periode.</PageState></section>;
+  }
+
   // TypeScript narrows v to CompanyVatRegistered after the !v.vatRegistered
   // early return above — every period/deadline/rubrikker field is non-null
   // from here on. No `!` or `?? ""` shims needed.
@@ -82,12 +87,20 @@ export function VatView() {
   const canReopen = !v.archived && v.periodStatus === "closed";
   // #303: a momsangivelse is only filing-ready for a closed/reported period.
   const provisional = !v.archived && !v.momsangivelseReady;
+  const filingStatus = v.periodStatus === "reported" || v.periodStatus === "closed"
+    ? "Lukket/endelig"
+    : v.vatReportErrors.length > 0 ? "Ikke klar"
+    : v.vatReportWarnings.length > 0 ? "Kræver stillingtagen"
+    : "Klar";
+  const statusTone = filingStatus === "Ikke klar" ? "danger" : filingStatus === "Kræver stillingtagen" ? "warning" : "success";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="vat" data-evidence-issue="656">
       <div className="page-head">
         <div>
-          <h2>{v.company.name}</h2>
+            <h2>{v.company.name}</h2>
+            <h3 data-evidence-heading>Moms og lukkeparathed</h3>
+            <p className="muted" data-evidence-status={v.vatReportErrors.length || v.vatReportWarnings.length ? "warning-or-blocked" : "normal"}>{v.vatReportErrors.length || v.vatReportWarnings.length ? "Moms kræver afklaring" : "Momsparathed klar"}</p>
           <p className="muted">
             {v.company.cvr ? `CVR ${v.company.cvr} · ` : ""}
             {v.company.country} · {currency} · Moms
@@ -143,16 +156,27 @@ export function VatView() {
 
       {closedNotice && <Banner kind="success">{closedNotice}</Banner>}
 
+      <details data-evidence-progressive><summary data-evidence-core-action>Gennemgå momsparathed</summary><p data-evidence-task-outcome>Se lukkegrundlag</p></details>
+
+      <section className="card" aria-label="Indberetningsklarhed">
+        <div className="statement-card-head"><h3>Indberetning</h3><StatusChip tone={statusTone}>{filingStatus}</StatusChip></div>
+        <div className="filter-bar">
+          <span><strong>{payablePositive ? "Moms at betale" : "Moms tilgode"}:</strong> {formatKroner(v.payable, currency)}</span>
+          <span><strong>Frist:</strong> {formatDateDa(v.deadline)}</span>
+        </div>
+        <p className="muted">{provisional ? "Luk og review først; en åben periode kan ikke indberettes." : "Tallene er endelige. Kontrollér og overfør derefter felterne i TastSelv."}</p>
+      </section>
+
       {v.vatReportErrors.length > 0 && (
-        <Banner kind="error">
-          Momsrapporten kan ikke indberettes endnu: {v.vatReportErrors.join(" ")}
-        </Banner>
+        <PageState kind="blocked" title="Momsrapporten kan ikke indberettes">
+          Påvirkning: SKAT-felterne er ikke et sikkert indberetningsgrundlag. Beslutning: ret fejlene og genberegn. <Link to={`/companies/${slug}/opmaerksomhed`}>Åbn opgaver der kræver opmærksomhed</Link>. {v.vatReportErrors.join(" ")}
+        </PageState>
       )}
 
       {v.vatReportWarnings.length > 0 && (
-        <Banner kind="warning">
-          Kontrollér før indberetning: {v.vatReportWarnings.join(" ")}
-        </Banner>
+        <PageState kind="warning" title="Moms kræver stillingtagen">
+          Påvirkning: beløbet kan være korrekt, men kræver faglig gennemgang. Beslutning: gennemgå advarslerne før indberetning. <Link to={`/companies/${slug}/opmaerksomhed`}>Åbn opgaver der kræver opmærksomhed</Link>. {v.vatReportWarnings.join(" ")}
+        </PageState>
       )}
 
       {closing && (
@@ -210,10 +234,20 @@ export function VatView() {
                   "Bekræft først at du vil lukke en periode der ikke er afsluttet endnu — sæt flueben i feltet ovenfor.",
               };
             }
+            const packet = await api.closeReadiness(slug, v.periodStart, v.periodEnd);
+            if (packet.blockers > 0) {
+              throw { code: "bad_request", message: "Momsperioden har blokerende close-kontroller. Åbn Periodelås for at gennemgå dem." };
+            }
+            const review = await api.reviewCloseReadiness(slug, v.periodStart, v.periodEnd);
+            if (review.packet.hash !== packet.hash) {
+              throw { code: "conflict", message: "Grundlaget ændrede sig under review. Kontrollér momsperioden igen før lukning." };
+            }
             await api.closePeriod(slug, {
               periodStart: v.periodStart,
               periodEnd: v.periodEnd,
               kind: "vat_period",
+              packetHash: review.packet.hash,
+              reviewId: review.id,
             });
             setClosedNotice(`Momsperioden er lukket — tallene genindlæses nu.`);
             state.reload();
@@ -253,11 +287,11 @@ export function VatView() {
               forbi, for at få de endelige tal.
             </Banner>
           )}
-          <div className="card statement-card">
+          <div className="card statement-card" data-evidence-data>
             <table className="data statement-table">
               <tbody>
                 <tr>
-                  <td>Salgsmoms (udgående moms)</td>
+                  <td>Udgående moms før tab (kontrol)</td>
                   <td className="num">
                     {formatKroner(v.outputVat, currency)}
                   </td>
@@ -308,8 +342,8 @@ export function VatView() {
 
           <p className="statement-check ok">
             {payablePositive
-              ? "Salgsmoms minus købsmoms — beløbet skal afregnes til SKAT."
-              : "Købsmoms overstiger salgsmoms — beløbet udbetales fra SKAT."}
+              ? "Momstilsvaret nedenfor er det samlede beløb, der skal afregnes til SKAT."
+              : "Momstilsvaret nedenfor er det samlede beløb, der udbetales fra SKAT."}
           </p>
         </>
       )}
@@ -333,9 +367,9 @@ export function VatView() {
 function rubrikkerCsvRows(
   rubrikker: VatRubrikker,
 ): Array<[string, string]> {
-  const owedPositive = rubrikker.momstilsvar >= 0;
   return [
     ["Salgsmoms", tastSelvNumber(rubrikker.salgsmoms)],
+    ["Købsmoms", tastSelvNumber(rubrikker.kobsmoms)],
     [
       "Moms af varekøb i udlandet",
       tastSelvNumber(rubrikker.momsAfVarekobUdland),
@@ -344,20 +378,19 @@ function rubrikkerCsvRows(
       "Moms af ydelseskøb i udlandet",
       tastSelvNumber(rubrikker.momsAfYdelseskobUdland),
     ],
-    ["Købsmoms", tastSelvNumber(rubrikker.kobsmoms)],
-    [
-      owedPositive ? "Momstilsvar" : "Negativt momstilsvar",
-      tastSelvNumber(rubrikker.momstilsvar),
-    ],
-    [
-      "Rubrik A - varer og ydelser købt i udlandet",
-      tastSelvNumber(rubrikker.rubrikA),
-    ],
-    [
-      "Rubrik B - varer og ydelser solgt til udlandet",
-      tastSelvNumber(rubrikker.rubrikB),
-    ],
+    ["Rubrik A - varer", tastSelvNumber(rubrikker.rubrikAVarer)],
+    ["Rubrik A - ydelser", tastSelvNumber(rubrikker.rubrikAYdelser)],
+    ["Rubrik B - varer / EU-salg uden moms", tastSelvNumber(rubrikker.rubrikBVarerEuSalesList)],
+    ["Rubrik B - varer / ikke EU-salg-listen", tastSelvNumber(rubrikker.rubrikBVarerIkkeEuSalesList)],
+    ["Rubrik B - ydelser", tastSelvNumber(rubrikker.rubrikBYdelser)],
     ["Rubrik C - øvrige momsfrie salg", tastSelvNumber(rubrikker.rubrikC)],
+    ["Olie- og flaskegasafgift", tastSelvNumber(rubrikker.olieOgFlaskegasafgift)],
+    ["Elafgift", tastSelvNumber(rubrikker.elafgift)],
+    ["Naturgas- og bygasafgift", tastSelvNumber(rubrikker.naturgasOgBygasafgift)],
+    ["Kulafgift", tastSelvNumber(rubrikker.kulafgift)],
+    ["CO2-afgift", tastSelvNumber(rubrikker.co2Afgift)],
+    ["Vandafgift", tastSelvNumber(rubrikker.vandafgift)],
+    ["Moms i alt", tastSelvNumber(rubrikker.momsIAlt)],
   ];
 }
 
@@ -424,7 +457,7 @@ function RubrikkerCard({
   currency: string;
   provisional: boolean;
 }) {
-  const owedPositive = rubrikker.momstilsvar >= 0;
+  const owedPositive = rubrikker.momsIAlt >= 0;
   // The label of the row most recently copied — drives the "Kopieret"
   // confirmation, scoped per row so two adjacent buttons don't share state.
   const [copiedLabel, setCopiedLabel] = useState<string | null>(null);
@@ -473,6 +506,7 @@ function RubrikkerCard({
         <button
           type="button"
           className="rubrik-copy-csv"
+          aria-label="Kopier alle som CSV"
           onClick={copyAllAsCsv}
           disabled={provisional}
           title={
@@ -481,7 +515,7 @@ function RubrikkerCard({
               : "Kopier alle rubrikker som CSV (label;beløb) til regneark"
           }
         >
-          {copiedLabel === "__csv__" ? "Kopieret" : "Kopier alle som CSV"}
+          {copiedLabel === "__csv__" ? "Kopieret" : "Kopiér alle SKAT-felter"}
         </button>
       </div>
       <p className="muted statement-note">
@@ -494,15 +528,15 @@ function RubrikkerCard({
           </>
         ) : (
           <>
-            Disse felter svarer 1:1 til momsangivelsen på skat.dk (TastSelv
-            Erhverv) — udfyld dem som vist. Perioden er lukket, så tallene er
-            endelige.
+            Feltværdierne følger TastSelv-formens rækkefølge og hele kroner.
+            Perioden er lukket, så tallene er endelige.
           </>
         )}
       </p>
       <table className="data statement-table">
         <tbody>
           {rubrikRow("Salgsmoms", rubrikker.salgsmoms)}
+          {rubrikRow("Købsmoms", rubrikker.kobsmoms)}
           {rubrikRow(
             "Moms af varekøb i udlandet (både EU og lande uden for EU)",
             rubrikker.momsAfVarekobUdland,
@@ -511,25 +545,34 @@ function RubrikkerCard({
             "Moms af ydelseskøb i udlandet med omvendt betalingspligt",
             rubrikker.momsAfYdelseskobUdland,
           )}
-          {rubrikRow("Købsmoms", rubrikker.kobsmoms)}
           {rubrikRow(
-            owedPositive ? "Momstilsvar" : "Negativt momstilsvar",
-            rubrikker.momstilsvar,
+            owedPositive ? "Moms i alt" : "Moms til gode i alt",
+            rubrikker.momsIAlt,
             `statement-result ${owedPositive ? "positive" : "negative"}`,
           )}
+          {rubrikRow("Afrundingsdifference mod rå momsrapport", rubrikker.wholeKronerDifferenceDkk)}
         </tbody>
       </table>
       <table className="data statement-table">
         <tbody>
           {rubrikRow(
-            "Rubrik A — varer og ydelser købt i udlandet",
-            rubrikker.rubrikA,
+            "Rubrik A — varer købt i EU",
+            rubrikker.rubrikAVarer,
           )}
           {rubrikRow(
-            "Rubrik B — varer og ydelser solgt til udlandet",
-            rubrikker.rubrikB,
+            "Rubrik A — ydelser købt i EU",
+            rubrikker.rubrikAYdelser,
           )}
+          {rubrikRow("Rubrik B — varer / EU-salg uden moms", rubrikker.rubrikBVarerEuSalesList)}
+          {rubrikRow("Rubrik B — varer / ikke EU-salg-listen", rubrikker.rubrikBVarerIkkeEuSalesList)}
+          {rubrikRow("Rubrik B — ydelser", rubrikker.rubrikBYdelser)}
           {rubrikRow("Rubrik C — øvrige momsfrie salg", rubrikker.rubrikC)}
+          {rubrikRow("Olie- og flaskegasafgift", rubrikker.olieOgFlaskegasafgift)}
+          {rubrikRow("Elafgift", rubrikker.elafgift)}
+          {rubrikRow("Naturgas- og bygasafgift", rubrikker.naturgasOgBygasafgift)}
+          {rubrikRow("Kulafgift", rubrikker.kulafgift)}
+          {rubrikRow("CO2-afgift", rubrikker.co2Afgift)}
+          {rubrikRow("Vandafgift", rubrikker.vandafgift)}
         </tbody>
       </table>
     </div>

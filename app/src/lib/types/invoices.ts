@@ -2,7 +2,7 @@
 //
 // All money fields below are kroner (DKK with decimals) — use `formatKroner`.
 
-import type { FiscalYearEntry, StatementCompany } from "./common";
+import type { DataCoverage, FiscalYearEntry, StatementCompany } from "./common";
 
 // --- invoices / Fakturaer (GET .../invoices?year=) — cockpit-redesign it. 5 --
 
@@ -17,11 +17,14 @@ export type InvoiceStatus =
 
 /**
  * Cockpit-facing PEPPOL/e-faktura status (#428) — `null` when the invoice
- * has never been sent as an e-faktura. `prepared` means an envelope has been
- * recorded; `acknowledged` means the access point confirmed receipt.
+ * has never been attempted as an e-faktura. `queued` has an accepted document
+ * id and permits status-only polling; `failed` is a terminal remote result and
+ * `uncertain` means the POST outcome cannot safely be retried. Neither may be
+ * redelivered. `retryable` failed before delivery; `in_progress` is reserved by
+ * another sender; `acknowledged` is delivered.
  */
 export type InvoicePeppolStatus = {
-  status: "prepared" | "acknowledged";
+  status: "queued" | "failed" | "uncertain" | "retryable" | "in_progress" | "acknowledged";
   submissionReference: string;
   transmissionId: string | null;
   acknowledgedAt: string | null;
@@ -32,6 +35,7 @@ export type CompanyInvoiceRow = {
   invoiceNo: string;
   invoiceDate: string | null;
   customerName: string | null;
+  partyId?: string | null;
   /**
    * Customer's e-mail when set on the kontaktkort (#429). The cockpit row
    * offers "Send på mail" only when this is present so the dialog can
@@ -40,7 +44,7 @@ export type CompanyInvoiceRow = {
   customerEmail: string | null;
   /**
    * Buyer's EAN-number (13 digits) when set on the invoice payload. The
-   * cockpit row offers "Forbered e-faktura" only when this is present.
+   * cockpit row offers "Send e-faktura" only when this is present.
    */
   buyerEanNumber: string | null;
   /** True when the buyer is marked as a public recipient. */
@@ -90,12 +94,44 @@ export type CompanyInvoices = {
   totalGross: number;
   totalOpen: number;
   overdueCount: number;
+  coverage: DataCoverage;
 };
 
 export type InvoicesResponse = {
   ok: true;
   invoices: CompanyInvoices;
 };
+
+/** Source-evidenced opening debtors.  Kept separate from `CompanyInvoices`: a
+ * native issued invoice is never an import continuation or a duplicate row. */
+export type ImportedReceivableRow = {
+  source: "imported";
+  externalInvoiceId: string;
+  customerExternalId: string | null;
+  customerName: string | null;
+  invoiceDate: string;
+  dueDate: string | null;
+  grossAmount: number;
+  paidAmount: number;
+  openBalance: number;
+  controlAccountNo: string;
+  sourceRecognitionRef: string;
+  sourceDocumentHash: string;
+  scheduleHash: string;
+  archiveBoundary: string;
+};
+
+export type ImportedReceivables = {
+  ok: true;
+  asOfDate: string;
+  boundary: string;
+  count: number;
+  totalOpen: number;
+  rows: ImportedReceivableRow[];
+  errors: string[];
+};
+
+export type ImportedReceivablesResponse = { ok: true; importedReceivables: ImportedReceivables };
 
 /** One previously generated invoice for a recurring-invoice template. */
 export type RecurringInvoiceGenerationRow = {
@@ -112,7 +148,10 @@ export type RecurringInvoiceGenerationRow = {
 export type RecurringInvoiceTemplateRow = {
   id: number;
   name: string;
-  interval: "monthly" | "quarterly" | "yearly";
+  interval: "weekly" | "monthly" | "quarterly" | "yearly";
+  /** Present for v3 templates; absent legacy API payloads mean 1/manual. */
+  intervalCount?: number;
+  deliveryChannel?: "manual" | "email" | "digisense";
   firstIssueDate: string;
   nextIssueDate: string;
   paymentTermsDays: number;
@@ -124,7 +163,8 @@ export type RecurringInvoiceTemplateRow = {
 };
 
 /** Public alias used by the create modal (#386). */
-export type RecurringInterval = "monthly" | "quarterly" | "yearly";
+export type RecurringInterval = "weekly" | "monthly" | "quarterly" | "yearly";
+export type RecurringDeliveryChannel = "manual" | "email" | "digisense";
 export type DeliveryPeriodMode = "issue_month" | "interval_window" | "none";
 
 /**
@@ -136,6 +176,8 @@ export type DeliveryPeriodMode = "issue_month" | "interval_window" | "none";
 export type RecurringInvoiceTemplateInput = {
   name: string;
   interval: RecurringInterval;
+  intervalCount?: number;
+  deliveryChannel?: RecurringDeliveryChannel;
   firstIssueDate: string;
   paymentTermsDays: number;
   deliveryPeriodMode?: DeliveryPeriodMode;
@@ -157,6 +199,8 @@ export type RecurringInvoiceTemplateCreatedResult = {
   templateId: number;
   name: string;
   interval: RecurringInterval;
+  intervalCount: number;
+  deliveryChannel: RecurringDeliveryChannel;
   firstIssueDate: string;
 };
 

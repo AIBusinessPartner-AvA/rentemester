@@ -11,7 +11,7 @@ import { existsSync } from "node:fs";
 import type { Database } from "bun:sqlite";
 import { companyPaths } from "../../core/paths";
 import { diffDaysSafe as daysBetween } from "../../core/dates";
-import { openDb, migrate } from "../../core/db";
+import { openCurrentLedgerReadOnly, openLedgerReadOnly } from "../../core/ledger-inspection";
 import { getCompanySettings } from "../../core/company";
 import { buildInvoiceList, buildOverdueInvoiceList } from "../../core/invoice-list";
 import { listBankTransactions } from "../../core/reconciliation";
@@ -24,14 +24,16 @@ import { verifyAuditChain } from "../../core/ledger";
 import {
   companyRootForSlug,
   findWorkspaceCompany,
+  listWorkspaceCompanies,
+  requireCanonicalLiveCompanies,
   type WorkspaceCompanyEntry,
 } from "../../core/workspace";
-import { discoverWorkspaceCompanies } from "../discovery";
 import { ApiError } from "../errors";
-import { currentFiscalYear, roundKroner, todayIsoDate } from "./shared";
-import { actualBankBalanceAsOf, bankStatementStatusAsOf } from "./bank";
-import { selectVatPeriod } from "./vat";
+import { currentFiscalYear, roundKroner } from "./shared";
+import { resolveActualBankBalanceAsOf } from "./bank";
+import { selectVatPeriod, vatPeriodEffectiveStatus } from "./vat";
 import { groupExceptions, type ExceptionGroup } from "./exceptions";
+import { buildCompanyAttention } from "./attention";
 
 // --------------------------------------------------------------------------
 // Per-company summary (one row in the portfolio overview)
@@ -71,11 +73,13 @@ export type CompanySummary = {
    * its CSV had no balance column" — so it never wrongly says "intet kontoudtog
    * importeret" for a company whose import simply lacked a balance column.
    */
-  bankStatementStatus: "known" | "no-balance-column" | "none";
+  bankStatementStatus: "known" | "no-balance-column" | "none" | "ambiguous";
+  bankStatementDiagnostics: string[];
   /** Current registered VAT-period position + deadline; null when unknown. */
   vat: CompanyVatSummary | null;
   /** Open tasks — open exceptions, grouped into Danish summary lines. */
   openTaskCount: number;
+  attentionStatus: "clear" | "requires-attention";
   taskGroups: ExceptionGroup[];
   auditChainOk: boolean;
   // --- legacy fields retained for the MCP/older consumers -----------------
@@ -92,6 +96,7 @@ export type CompanySummary = {
 function summariseCompany(
   workspaceRoot: string,
   entry: WorkspaceCompanyEntry,
+  asOfDate: string,
 ): CompanySummary {
   const companyRoot = companyRootForSlug(workspaceRoot, entry.slug);
   const dbPath = companyPaths(companyRoot).db;
@@ -107,8 +112,10 @@ function summariseCompany(
       omsaetning: 0,
       actualBankBalance: null,
       bankStatementStatus: "none",
+      bankStatementDiagnostics: [],
       vat: null,
       openTaskCount: 0,
+      attentionStatus: "clear",
       taskGroups: [],
       auditChainOk: false,
       openInvoiceCount: 0,
@@ -122,7 +129,7 @@ function summariseCompany(
 
   let db: Database;
   try {
-    db = openDb(dbPath);
+    db = openLedgerReadOnly(dbPath);
   } catch {
     // An unreadable ledger degrades gracefully — treated as "missing".
     return {
@@ -136,8 +143,10 @@ function summariseCompany(
       omsaetning: 0,
       actualBankBalance: null,
       bankStatementStatus: "none",
+      bankStatementDiagnostics: [],
       vat: null,
       openTaskCount: 0,
+      attentionStatus: "clear",
       taskGroups: [],
       auditChainOk: false,
       openInvoiceCount: 0,
@@ -149,7 +158,6 @@ function summariseCompany(
     };
   }
   try {
-    migrate(db);
     const company = getCompanySettings(db);
     const { label: fyLabel, year: yearNum } = currentFiscalYear(db, company);
     const yearStart = `${yearNum}-01-01`;
@@ -161,8 +169,9 @@ function summariseCompany(
     // Actual bank balance from the imported statement (what the bank shows),
     // plus WHY it is (or is not) known so the card never wrongly claims "intet
     // kontoudtog importeret" for a balance-column-less import (EJER-12).
-    const actualBankBalance = actualBankBalanceAsOf(db, yearEnd);
-    const bankStatementStatus = bankStatementStatusAsOf(db, yearEnd);
+    const statementBalance = resolveActualBankBalanceAsOf(db, yearEnd);
+    const actualBankBalance = statementBalance.balance;
+    const bankStatementStatus = statementBalance.status;
 
     // VAT: the booked position for the company's actual VAT period — the
     // period (month / quarter / half-year, per `vatPeriodType`) that is due
@@ -175,16 +184,23 @@ function summariseCompany(
       vatPeriodType === null
         ? null
         : (() => {
-            const vatPeriod = selectVatPeriod(db, yearNum, vatPeriodType);
+            const vatYear = Number(asOfDate.slice(0, 4));
+            const vatPeriod = selectVatPeriod(
+              db,
+              vatYear,
+              vatPeriodType,
+              asOfDate,
+            );
             return {
               payable: vatPeriod.position.payable,
               deadline: vatPeriod.deadline,
-              daysRemaining: daysBetween(todayIsoDate(), vatPeriod.deadline),
+              daysRemaining: daysBetween(asOfDate, vatPeriod.deadline),
             };
           })();
 
     // Open tasks — open exceptions grouped into Danish summary lines.
     const exceptions = listExceptions(db, { status: "open" });
+    const attention = buildCompanyAttention(workspaceRoot, entry.slug);
     const taskGroups = groupExceptions(
       exceptions.rows.map((row: any) => ({
         type: row.type,
@@ -199,7 +215,7 @@ function summariseCompany(
     const invoices = buildInvoiceList(db, { status: "open", asOfDate: yearEnd });
     const overdue = buildOverdueInvoiceList(db, {});
     const unlinked = listBankTransactions(db, { status: "unmatched" });
-    const audit = verifyAuditChain(db);
+    const audit = verifyAuditChain(db, { companyRoot });
 
     return {
       slug: entry.slug,
@@ -212,8 +228,10 @@ function summariseCompany(
       omsaetning: pl.totalIncome,
       actualBankBalance,
       bankStatementStatus,
+      bankStatementDiagnostics: statementBalance.diagnostics,
       vat,
-      openTaskCount: exceptions.count,
+      openTaskCount: attention.count,
+      attentionStatus: attention.status,
       taskGroups,
       auditChainOk: audit.ok,
       openInvoiceCount: invoices.count,
@@ -244,8 +262,9 @@ export type PortfolioOverview = {
   rollup: {
     /** Combined year-to-date result across all companies, kroner. */
     resultat: number;
-    /** Combined liquidity — actual bank balance across all companies, kroner. */
-    liquidity: number;
+    /** Combined liquidity, null unless every company has a provable balance. */
+    liquidity: number | null;
+    liquidityComplete: boolean;
     /** Combined VAT owed across all companies, kroner. */
     vatPayable: number;
     /** Total open tasks across all companies. */
@@ -263,6 +282,14 @@ export type PortfolioOverview = {
   companies: CompanySummary[];
 };
 
+export type PortfolioOverviewOptions = {
+  /**
+   * An explicit hosted authorization filter. Passing it disables discovery so
+   * a read cannot adopt an unlisted company before access is evaluated.
+   */
+  companySlugs?: readonly string[];
+};
+
 /**
  * Aggregates one real-figure summary per workspace company plus a
  * workspace-wide roll-up. Each company's figures cover its current fiscal
@@ -274,13 +301,16 @@ export type PortfolioOverview = {
 export function buildPortfolioOverview(
   workspaceRoot: string,
   asOfDate: string,
+  options: PortfolioOverviewOptions = {},
 ): PortfolioOverview {
-  // Discover-and-adopt any present-but-unlisted company directory first
-  // (#256): the portfolio is the cockpit's landing page, so an owner who set
-  // a company up via the CLI must land on that real company — not onboarding.
-  const entries = discoverWorkspaceCompanies(workspaceRoot);
+  const entries = options.companySlugs
+    ? (() => {
+      const allowed = new Set(options.companySlugs);
+      return requireCanonicalLiveCompanies(workspaceRoot).map((item) => item.entry).filter((entry) => allowed.has(entry.slug));
+    })()
+    : requireCanonicalLiveCompanies(workspaceRoot).map((item) => item.entry);
   const companies = entries.map((entry) =>
-    summariseCompany(workspaceRoot, entry),
+    summariseCompany(workspaceRoot, entry, asOfDate),
   );
   const rollup = companies.reduce(
     (acc, c) => ({
@@ -309,13 +339,15 @@ export function buildPortfolioOverview(
       netVatPayable: 0,
     },
   );
+  const liquidityComplete = companies.every((company) => company.actualBankBalance !== null);
   return {
     workspace: workspaceRoot,
     asOf: asOfDate,
     companyCount: companies.length,
     rollup: {
       resultat: roundKroner(rollup.resultat),
-      liquidity: roundKroner(rollup.liquidity),
+      liquidity: liquidityComplete ? roundKroner(rollup.liquidity) : null,
+      liquidityComplete,
       vatPayable: roundKroner(rollup.vatPayable),
       openTaskCount: rollup.openTaskCount,
     },
@@ -359,9 +391,8 @@ export function buildCompanyDashboardData(
     throw ApiError.notFound(`virksomheden '${slug}' har ingen ledger`);
   }
 
-  const db = openDb(dbPath);
+  const db = openCurrentLedgerReadOnly(dbPath);
   try {
-    migrate(db);
     const company = getCompanySettings(db);
     const invoices = buildInvoiceList(db, { status: "open", asOfDate });
     const overdueInvoices = buildOverdueInvoiceList(db, { asOfDate });
@@ -374,24 +405,39 @@ export function buildCompanyDashboardData(
     // A non-registered company has no VAT period — the `vat` block is emitted
     // with null period bounds and zero figures so the dashboard renderer can
     // branch on it.
-    const { year: vatYear } = currentFiscalYear(db, company);
+    const vatYear = Number(asOfDate.slice(0, 4));
     const vatPeriodTypeForBlock = company.vatPeriodType;
     const vatBlock =
       vatPeriodTypeForBlock === null
         ? {
             periodStart: null as string | null,
             periodEnd: null as string | null,
+            periodLabel: null as string | null,
+            deadline: null as string | null,
+            periodStatus: null as null,
             netVatPayable: 0,
             daysRemaining: null as number | null,
             errors: [] as string[],
           }
         : (() => {
-            const vatSelection = selectVatPeriod(db, vatYear, vatPeriodTypeForBlock);
+            const vatSelection = selectVatPeriod(
+              db,
+              vatYear,
+              vatPeriodTypeForBlock,
+              asOfDate,
+            );
             const period = { start: vatSelection.start, end: vatSelection.end };
             const vatPeriod = buildVatReport(db, period.start, period.end);
             return {
               periodStart: period.start as string | null,
               periodEnd: period.end as string | null,
+              periodLabel: vatSelection.label as string | null,
+              deadline: vatSelection.deadline as string | null,
+              periodStatus: vatPeriodEffectiveStatus(
+                db,
+                period.start,
+                period.end,
+              ),
               netVatPayable: vatPeriod.netVatPayable,
               daysRemaining: daysBetween(asOfDate, vatSelection.deadline) as
                 | number
@@ -401,7 +447,7 @@ export function buildCompanyDashboardData(
           })();
     const recentActivity = listRecentAuditLog(db, 10);
     const backup = getBackupComplianceStatus(db, companyRoot, asOfDate);
-    const audit = verifyAuditChain(db);
+    const audit = verifyAuditChain(db, { companyRoot });
 
     return {
       slug: entry.slug,

@@ -1,0 +1,129 @@
+/** Workspace-scoped party and corporate-record lifecycle (#573/#575).
+ *
+ * These commands deliberately open only the workspace control database: they
+ * never open or mutate a company ledger.  `--actor` is enforced centrally for
+ * every write and `--confirm yes` makes the append-only boundary explicit.
+ */
+import { readFileSync } from "node:fs";
+import { companyRootForSlug, resolveWorkspaceRoot, resolveWorkspaceSlug } from "../core/workspace";
+import { openWorkspaceControlDb, openWorkspaceControlReadOnlyDb } from "../core/workspace-control";
+import { approvePartyMerge, createParty, inspectParty, linkPartyRole, proposePartyMerge, searchParties } from "../core/party-registry";
+import { enrichCorporateRecord, ingestCorporateRecord, inspectCorporateRecord, linkCorporateRecord, listCorporateRecords, readCorporateRecordBytes, supersedeCorporateRecord } from "../core/corporate-records";
+import { companyKnowledgeHistory, proposeCompanyKnowledge, queryCompanyKnowledge, reviewCompanyKnowledge, supersedeCompanyKnowledge } from "../core/company-knowledge";
+import { applyOwnershipSnapshot, ownershipHistory, projectExactCompanyOwnership, proposeOwnershipSnapshot, queryOwnershipGraph, reviewOwnershipSnapshot } from "../core/ownership-graph";
+import { getAccountingApprovalPolicy, setAccountingApprovalPolicy } from "../core/accounting-approval-policy";
+import { approveWorkspaceInboxAssignment, completeWorkspaceInboxAssignment, ingestWorkspaceInboxSource, inspectWorkspaceInboxSource, listWorkspaceInboxSources } from "../core/workspace-document-inbox";
+import { companyPaths } from "../core/paths";
+import { migrate, openDb } from "../core/db";
+import { openLedgerReadOnly } from "../core/ledger-inspection";
+import { applyLegacyPartyMapping, inspectLegacyPartyMappings, planLegacyPartyMapping, supersedeLegacyPartyMapping } from "../core/legacy-party-mapping";
+import { applyVendorIdentityEnrichment, listVendorIdentityEnrichments, planVendorIdentityEnrichment } from "../core/vendor-identity-enrichment";
+import { partyHub, partyProfile } from "../core/party-hub";
+import type { CommandContext, CommandDispatch } from "../cli-dispatch";
+import { authorizeMcpTool, createMcpSecurityContextFromEnv } from "../mcp/security";
+
+const need = (ctx: CommandContext, flag: string) => { const v = ctx.trimToNull(ctx.arg(flag)); if (!v) ctx.fatal(`${flag} is required`); return v!; };
+const actor = (ctx: CommandContext) => ctx.cliActor ?? process.env.RENTEMESTER_ACTOR ?? ctx.inferredMutationActor() ?? (() => { ctx.fatal("actor required for mutations"); })();
+const confirm = (ctx: CommandContext) => { if (ctx.arg("--confirm") !== "yes") ctx.fatal("--confirm must be exactly yes"); };
+const json = (ctx: CommandContext, flag: string): Record<string, unknown> => { try { const v = JSON.parse(readFileSync(need(ctx, flag), "utf8")); if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("must be an object"); return v as Record<string, unknown>; } catch (e) { ctx.fatal(`${flag} must be a readable JSON object: ${e instanceof Error ? e.message : String(e)}`); } };
+const workspace = (ctx: CommandContext) => resolveWorkspaceRoot(need(ctx, "--workspace"));
+const principal=(ctx:CommandContext)=>({kind:"local_operator" as const,id:need(ctx,"--principal-id")});
+
+export function register(dispatch: CommandDispatch): void {
+  const enrichmentInput = (ctx: CommandContext) => ({
+    companySlug: need(ctx, "--company"),
+    vendorId: Number(need(ctx, "--vendor-id")),
+    documentId: Number(need(ctx, "--document-id")),
+    countryCode: need(ctx, "--country-code"),
+    identifierKind: need(ctx, "--identifier-kind") as any,
+    identifier: ctx.arg("--identifier"),
+    reviewedReference: need(ctx, "--reviewed-reference"),
+  });
+  dispatch.on("vendor-identity-enrichment", "plan", (ctx) => {
+    const root = workspace(ctx);
+    const input = enrichmentInput(ctx);
+    const companyRoot = resolveWorkspaceSlug(root, input.companySlug);
+    if (!companyRoot) ctx.fatal("--company is not a workspace company");
+    const db = openLedgerReadOnly(companyPaths(companyRoot!).db);
+    try { ctx.emitResult(planVendorIdentityEnrichment(db, companyRoot!, input)); }
+    finally { db.close(); }
+  });
+  dispatch.on("vendor-identity-enrichment", "list", (ctx) => {
+    const root = workspace(ctx);
+    const companyRoot = resolveWorkspaceSlug(root, need(ctx, "--company"));
+    if (!companyRoot) ctx.fatal("--company is not a workspace company");
+    const db = openLedgerReadOnly(companyPaths(companyRoot!).db);
+    try {
+      ctx.emitResult({ ok: true, rows: listVendorIdentityEnrichments(db, {
+        vendorId: ctx.arg("--vendor-id") ? Number(ctx.arg("--vendor-id")) : undefined,
+      }) });
+    } finally { db.close(); }
+  });
+  dispatch.on("vendor-identity-enrichment", "apply", async (ctx) => {
+    confirm(ctx);
+    const root = workspace(ctx);
+    const input = enrichmentInput(ctx);
+    const companyRoot = resolveWorkspaceSlug(root, input.companySlug);
+    if (!companyRoot) ctx.fatal("--company is not a workspace company");
+    const security = createMcpSecurityContextFromEnv();
+    if (!security) ctx.fatal("vendor-identity-enrichment apply requires RENTEMESTER_SERVICE_PRINCIPAL_TOKEN and RENTEMESTER_WORKSPACE");
+    const allowed = await authorizeMcpTool(security!, "vendor_identity_enrichment_apply", { company: companyRoot! });
+    if (!allowed) ctx.fatal("vendor-identity-enrichment apply requires an active service principal with company.master-data membership");
+    const db = openDb(companyPaths(companyRoot!).db);
+    try {
+      migrate(db);
+      ctx.emitResult(applyVendorIdentityEnrichment(db, companyRoot!, {
+        ...input,
+        planHash: need(ctx, "--plan-hash"),
+        idempotencyKey: need(ctx, "--idempotency-key"),
+        confirm: true,
+        actor: actor(ctx),
+        principal: allowed!.principal.subjectId,
+      }));
+    } finally { db.close(); }
+  });
+  const legacyInput=(ctx:CommandContext)=>({companySlug:need(ctx,"--company"),legacyKind:need(ctx,"--legacy-kind") as any,legacyId:need(ctx,"--legacy-id"),partyId:need(ctx,"--party-id"),role:need(ctx,"--role") as any,documentId:Number(need(ctx,"--document-id")),reviewedLegacyReference:need(ctx,"--reviewed-legacy-reference")});
+  const legacyRead=(ctx:CommandContext,fn:(ledger:ReturnType<typeof openLedgerReadOnly>,control:ReturnType<typeof openWorkspaceControlReadOnlyDb>)=>void)=>{const root=workspace(ctx),slug=need(ctx,"--company"),companyRoot=resolveWorkspaceSlug(root,slug);if(!companyRoot)ctx.fatal("--company is not a workspace company");const ledger=openLedgerReadOnly(companyPaths(companyRoot!).db),control=openWorkspaceControlReadOnlyDb(root);try{fn(ledger,control);}finally{ledger.close();control.close();}};
+  dispatch.on("legacy-party-mapping","plan",ctx=>legacyRead(ctx,(ledger,control)=>ctx.emitResult(planLegacyPartyMapping(ledger,control,legacyInput(ctx)))));
+  dispatch.on("legacy-party-mapping","list",ctx=>{const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,rows:inspectLegacyPartyMappings(db,{companySlug:need(ctx,"--company"),legacyKind:ctx.arg("--legacy-kind") as any,legacyId:ctx.arg("--legacy-id")})});}finally{db.close();}});
+  dispatch.on("legacy-party-mapping","apply",async ctx=>{confirm(ctx);const root=workspace(ctx),input=legacyInput(ctx),companyRoot=resolveWorkspaceSlug(root,input.companySlug);if(!companyRoot)ctx.fatal("--company is not a workspace company");const security=createMcpSecurityContextFromEnv();if(!security)ctx.fatal("legacy-party-mapping apply requires RENTEMESTER_SERVICE_PRINCIPAL_TOKEN and RENTEMESTER_WORKSPACE");const allowed=await authorizeMcpTool(security!,"legacy_party_mapping_apply",{company:companyRoot!});if(!allowed)ctx.fatal("legacy-party-mapping apply requires an active service principal with company.master-data membership");const ledger=openDb(companyPaths(companyRoot!).db),control=openWorkspaceControlDb(root);try{migrate(ledger);ctx.emitResult(applyLegacyPartyMapping(ledger,control,{...input,planHash:need(ctx,"--plan-hash"),idempotencyKey:need(ctx,"--idempotency-key"),confirm:true,actor:actor(ctx),principal:allowed!.principal.subjectId}));}finally{ledger.close();control.close();}});
+  dispatch.on("legacy-party-mapping","supersede",async ctx=>{confirm(ctx);const root=workspace(ctx),slug=need(ctx,"--company"),companyRoot=resolveWorkspaceSlug(root,slug);if(!companyRoot)ctx.fatal("--company is not a workspace company");const security=createMcpSecurityContextFromEnv();if(!security)ctx.fatal("legacy-party-mapping supersede requires RENTEMESTER_SERVICE_PRINCIPAL_TOKEN and RENTEMESTER_WORKSPACE");const allowed=await authorizeMcpTool(security!,"legacy_party_mapping_supersede",{company:companyRoot!});if(!allowed)ctx.fatal("legacy-party-mapping supersede requires an active service principal with company.master-data membership");const db=openWorkspaceControlDb(root);try{ctx.emitResult(supersedeLegacyPartyMapping(db,{companySlug:slug,legacyKind:need(ctx,"--legacy-kind") as any,legacyId:need(ctx,"--legacy-id"),planHash:need(ctx,"--plan-hash"),reason:need(ctx,"--reason"),idempotencyKey:need(ctx,"--idempotency-key"),confirm:true,actor:actor(ctx),principal:allowed!.principal.subjectId}));}finally{db.close();}});
+  dispatch.on("approval-policy", "get", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,policy:getAccountingApprovalPolicy(db,need(ctx,"--company"),ctx.arg("--risk-class") as any ?? "normal")});}finally{db.close();} });
+  dispatch.on("approval-policy", "set", async (ctx) => { confirm(ctx); const root=workspace(ctx), company=need(ctx,"--company"); const security=createMcpSecurityContextFromEnv(); if(!security)ctx.fatal("approval-policy set requires RENTEMESTER_SERVICE_PRINCIPAL_TOKEN and RENTEMESTER_WORKSPACE"); const allowed=await authorizeMcpTool(security!,"accounting_approval_policy_set",{company:companyRootForSlug(root,company)}); if(!allowed)ctx.fatal("approval-policy set requires an active authenticated service principal with company-admin membership"); const db=openWorkspaceControlDb(root);try{const expected=ctx.arg("--expected-event-hash");ctx.emitResult({ok:true,...setAccountingApprovalPolicy(db,root,{scope:{kind:"company",companySlug:company},riskClass:(ctx.arg("--risk-class")??"normal") as any,reviewMode:need(ctx,"--review-mode") as any,expectedEventHash:expected??null,principalId:allowed!.principal.subjectId,actor:actor(ctx),confirm:true})});}finally{db.close();} });
+  dispatch.on("party", "create", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { const input=json(ctx,"--input"); ctx.emitResult({ok:true,party:createParty(db,{...input, actor:actor(ctx) } as any)}); } finally { db.close(); } });
+  dispatch.on("party", "search", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx)); try { ctx.emitResult({ok:true,...searchParties(db,{query:ctx.arg("--query"),companySlugs:new Set([need(ctx,"--company")]),cursor:Number(ctx.arg("--cursor")??0),limit:Number(ctx.arg("--limit")??25)})}); } finally {db.close();} });
+  dispatch.on("party", "inspect", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx)); try { const party=inspectParty(db,need(ctx,"--party-id")); ctx.emitResult(party?{ok:true,party}:{ok:false,errors:["party not found"]}); } finally {db.close();} });
+  dispatch.on("party", "hub", (ctx) => { const root=workspace(ctx),slug=need(ctx,"--company"),companyRoot=resolveWorkspaceSlug(root,slug);if(!companyRoot)ctx.fatal("--company is not a workspace company");const ledger=openLedgerReadOnly(companyPaths(companyRoot!).db),control=openWorkspaceControlReadOnlyDb(root);try{ctx.emitResult({ok:true,...partyHub(ledger,control,{companySlug:slug,visibleCompanies:new Set([slug]),query:ctx.arg("--query"),sort:ctx.arg("--sort") as any,from:ctx.arg("--from"),asOf:ctx.arg("--as-of"),cursor:Number(ctx.arg("--cursor")??0),limit:Number(ctx.arg("--limit")??25)})});}finally{control.close();ledger.close();} });
+  dispatch.on("party", "profile", (ctx) => { const root=workspace(ctx),slug=need(ctx,"--company"),companyRoot=resolveWorkspaceSlug(root,slug);if(!companyRoot)ctx.fatal("--company is not a workspace company");const ledger=openLedgerReadOnly(companyPaths(companyRoot!).db),control=openWorkspaceControlReadOnlyDb(root);try{const profile=partyProfile(ledger,control,{companySlug:slug,partyId:need(ctx,"--party-id"),visibleCompanies:new Set([slug]),from:ctx.arg("--from"),asOf:ctx.arg("--as-of")});ctx.emitResult(profile?{ok:true,...profile}:{ok:false,errors:["party not found"]});}finally{control.close();ledger.close();} });
+  dispatch.on("party", "link-role", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,party:linkPartyRole(db,{partyId:need(ctx,"--party-id"),companySlug:need(ctx,"--company"),role:need(ctx,"--role") as any,defaults:ctx.arg("--defaults")?json(ctx,"--defaults") as any:undefined,actor:actor(ctx)})}); } finally {db.close();} });
+  dispatch.on("party", "propose-merge", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,proposalHash:proposePartyMerge(db,{fromPartyId:need(ctx,"--from-party-id"),intoPartyId:need(ctx,"--into-party-id"),reviewAssertion:need(ctx,"--review-assertion"),actor:actor(ctx)})}); } finally {db.close();} });
+  dispatch.on("party", "approve-merge", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,party:approvePartyMerge(db,{fromPartyId:need(ctx,"--from-party-id"),proposalHash:need(ctx,"--proposal-hash"),actor:actor(ctx)})}); } finally {db.close();} });
+
+  dispatch.on("corporate-record", "ingest", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { const input=json(ctx,"--input"); const bytes=readFileSync(need(ctx,"--file")); ctx.emitResult({ok:true,record:ingestCorporateRecord(db,{...input,bytes,actor:actor(ctx)} as any)}); } finally {db.close();} });
+  dispatch.on("corporate-record", "list", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx)); try { ctx.emitResult({ok:true,...listCorporateRecords(db,{companySlugs:new Set([need(ctx,"--company")]),cursor:Number(ctx.arg("--cursor")??0),limit:Number(ctx.arg("--limit")??25)})}); } finally {db.close();} });
+  dispatch.on("corporate-record", "inspect", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx)); try { const record=inspectCorporateRecord(db,need(ctx,"--record-id")); ctx.emitResult(record?{ok:true,record}:{ok:false,errors:["corporate record not found"]}); } finally {db.close();} });
+  dispatch.on("corporate-record", "download", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx)); try { const bytes=readCorporateRecordBytes(db,need(ctx,"--record-id")); ctx.emitResult({ok:true,bytesBase64:Buffer.from(bytes).toString("base64"),sha256:inspectCorporateRecord(db,need(ctx,"--record-id"))?.sha256}); } finally {db.close();} });
+  dispatch.on("corporate-record", "link", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,record:linkCorporateRecord(db,{recordId:need(ctx,"--record-id"),type:need(ctx,"--link-type") as any,id:need(ctx,"--link-id"),actor:actor(ctx)})}); } finally {db.close();} });
+  dispatch.on("corporate-record", "enrich", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,payloadHash:enrichCorporateRecord(db,{recordId:need(ctx,"--record-id"),assertion:need(ctx,"--assertion"),actor:actor(ctx)})}); } finally {db.close();} });
+  dispatch.on("corporate-record", "supersede", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx)); try { ctx.emitResult({ok:true,payloadHash:supersedeCorporateRecord(db,{recordId:need(ctx,"--record-id"),replacementRecordId:need(ctx,"--replacement-record-id"),reason:need(ctx,"--reason"),actor:actor(ctx)})}); } finally {db.close();} });
+  dispatch.on("company-knowledge", "context", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{const company=need(ctx,"--company");ctx.emitResult({ok:true,context:queryCompanyKnowledge(db,{companySlug:company,asOf:need(ctx,"--as-of"),includeProposed:ctx.arg("--include-proposed")==="yes"}),history:companyKnowledgeHistory(db,company)});}finally{db.close();} });
+  dispatch.on("company-knowledge", "propose", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{ctx.emitResult({ok:true,assertion:proposeCompanyKnowledge(db,{...json(ctx,"--input"),companySlug:need(ctx,"--company"),actor:actor(ctx),principal:principal(ctx)}as any)});}finally{db.close();} });
+  dispatch.on("company-knowledge", "review", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{ctx.emitResult({ok:true,assertion:reviewCompanyKnowledge(db,{assertionId:need(ctx,"--assertion-id"),decision:need(ctx,"--decision") as any,reason:ctx.arg("--reason")??undefined,actor:actor(ctx),principal:principal(ctx)})});}finally{db.close();} });
+  dispatch.on("company-knowledge", "supersede", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{ctx.emitResult({ok:true,...supersedeCompanyKnowledge(db,{assertionId:need(ctx,"--assertion-id"),replacement:json(ctx,"--replacement") as any,actor:actor(ctx),principal:principal(ctx)})});}finally{db.close();} });
+  // Ownership is workspace control-plane data. These commands never alter a
+  // company ledger or the v1 group manifest; apply only accepts exact hashes.
+  dispatch.on("ownership", "query", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,...queryOwnershipGraph(db,{asOf:need(ctx,"--as-of"),visibleCompanySlugs:new Set([need(ctx,"--company")])})});}finally{db.close();} });
+  dispatch.on("ownership", "propose", (ctx) => { confirm(ctx); const db=openWorkspaceControlDb(workspace(ctx));try{const input=json(ctx,"--input");ctx.emitResult({ok:true,snapshot:proposeOwnershipSnapshot(db,{...input,actor:actor(ctx),principal:principal(ctx)}as any)});}finally{db.close();} });
+  dispatch.on("ownership", "review", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{ctx.emitResult({ok:true,snapshot:reviewOwnershipSnapshot(db,{snapshotId:need(ctx,"--snapshot-id"),decision:need(ctx,"--decision") as any,actor:actor(ctx),principal:principal(ctx)})});}finally{db.close();} });
+  dispatch.on("ownership", "apply", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{ctx.emitResult({ok:true,...applyOwnershipSnapshot(db,{snapshotId:need(ctx,"--snapshot-id"),snapshotHash:need(ctx,"--snapshot-hash"),diffHash:need(ctx,"--diff-hash"),actor:actor(ctx),principal:principal(ctx),authorized:true})});}finally{db.close();} });
+  dispatch.on("ownership", "history", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,history:ownershipHistory(db,ctx.arg("--snapshot-id"))});}finally{db.close();} });
+  dispatch.on("ownership", "projection", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,projection:projectExactCompanyOwnership(db,need(ctx,"--as-of"))});}finally{db.close();} });
+  // #577: workspace inbox sources are immutable control-plane evidence. No
+  // ledger opens before `complete`, which targets one explicit company.
+  dispatch.on("workspace-inbox", "list", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{ctx.emitResult({ok:true,...listWorkspaceInboxSources(db,{visibilityAnchorSlug:need(ctx,"--company"),cursor:Number(ctx.arg("--cursor")??0),limit:Number(ctx.arg("--limit")??25)})});}finally{db.close();} });
+  dispatch.on("workspace-inbox", "inspect", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{const source=inspectWorkspaceInboxSource(db,need(ctx,"--source-id"),need(ctx,"--company"));ctx.emitResult(source?{ok:true,source}:{ok:false,errors:["workspace inbox source not found"]});}finally{db.close();} });
+  dispatch.on("workspace-inbox", "status", (ctx) => { const db=openWorkspaceControlReadOnlyDb(workspace(ctx));try{const source=inspectWorkspaceInboxSource(db,need(ctx,"--source-id"),need(ctx,"--company"));ctx.emitResult(source?{ok:true,source}:{ok:false,errors:["workspace inbox source not found"]});}finally{db.close();} });
+  dispatch.on("workspace-inbox", "ingest", (ctx) => { confirm(ctx); const root=workspace(ctx),db=openWorkspaceControlDb(root);try{const input=json(ctx,"--input");ctx.emitResult({ok:true,source:ingestWorkspaceInboxSource(db,{...input,visibilityAnchorSlug:need(ctx,"--company"),idempotencyKey:need(ctx,"--idempotency-key"),bytes:readFileSync(need(ctx,"--file")),visibleCompanySlugs:new Set([need(ctx,"--company")]),actor:actor(ctx) }as any)});}finally{db.close();} });
+  dispatch.on("workspace-inbox", "assign", (ctx) => { confirm(ctx);const db=openWorkspaceControlDb(workspace(ctx));try{const source=inspectWorkspaceInboxSource(db,need(ctx,"--source-id"),need(ctx,"--company"));if(!source)ctx.emitResult({ok:false,errors:["workspace inbox source not found"]});else ctx.emitResult({ok:true,source:approveWorkspaceInboxAssignment(db,{sourceId:need(ctx,"--source-id"),companySlug:need(ctx,"--target-company"),actor:actor(ctx)})});}finally{db.close();} });
+  dispatch.on("workspace-inbox", "complete", (ctx) => { confirm(ctx);const root=workspace(ctx),sourceId=need(ctx,"--source-id"),target=need(ctx,"--target-company"),control=openWorkspaceControlDb(root);let ledger: ReturnType<typeof openDb>|undefined;try{if(!inspectWorkspaceInboxSource(control,sourceId,need(ctx,"--company"))){ctx.emitResult({ok:false,errors:["workspace inbox source not found"]});return;}const companyRoot=resolveWorkspaceSlug(root,target);if(!companyRoot){ctx.fatal("--target-company is not a workspace company");return;}ledger=openDb(companyPaths(companyRoot).db);migrate(ledger);ctx.emitResult({ok:true,source:completeWorkspaceInboxAssignment(control,ledger,companyRoot,{sourceId,companySlug:target,actor:actor(ctx)})});}finally{ledger?.close();control.close();} });
+}

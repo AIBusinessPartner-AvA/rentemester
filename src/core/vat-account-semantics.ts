@@ -11,6 +11,7 @@ export const VAT_LINE_CODES: ReadonlySet<string> = new Set([
   "DK_SALE_25",
   "DK_SALE_EXEMPT",
   "EU_SERVICE_REVERSE_CHARGE",
+  "EU_GOODS_ACQUISITION",
   "NON_EU_SERVICE_REVERSE_CHARGE",
   "REPRESENTATION_SPECIAL",
   "REPRESENTATION_NON_DEDUCTIBLE_VAT",
@@ -33,6 +34,11 @@ export const VAT_LINE_CODES: ReadonlySet<string> = new Set([
  */
 export const DINERO_VAT_CONTROL_ACCOUNTS = {
   "64000": { role: "output_vat", normalBalance: "credit", side: "output" },
+  // Dinero's separate output-VAT control for foreign goods acquisitions.
+  // Rentemester still does not infer the corresponding goods-purchase base,
+  // but the source-posted VAT amount must remain identifiable during import,
+  // reporting, and year-opening VAT consolidation.
+  "64020": { role: "reverse_charge_vat", normalBalance: "credit", side: "output" },
   "64040": { role: "reverse_charge_vat", normalBalance: "credit", side: "output" },
   "64060": { role: "input_vat", normalBalance: "debit", side: "input" },
 } as const satisfies Record<

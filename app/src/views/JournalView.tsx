@@ -17,11 +17,13 @@ import { formatKroner } from "../lib/format";
 // #379 — the EntryRow needs the slug to build the bilag-file URL on the fly.
 import { useAsync } from "../lib/useAsync";
 import type { CompanyJournal, JournalEntry } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ArchivedBanner } from "../components/ArchivedBanner";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
+import { PartyLink } from "../components/PartyLink";
+import { FilterBar, FormField, PageHeaderActions, PageState } from "../components/CockpitPrimitives";
 
-const FILTER_PARAM_KEYS = ["q", "from", "to", "amountMin", "amountMax"] as const;
+const FILTER_PARAM_KEYS = ["q", "from", "to", "amountMin", "amountMax", "journalEntryId", "journalLineId"] as const;
 
 export function JournalView() {
   const { slug = "" } = useParams();
@@ -29,7 +31,11 @@ export function JournalView() {
   // An optional account drill-down: `?account=<accountNo>` filters the journal
   // to the entries that touch that account (set by the statement views).
   const [params, setParams] = useSearchParams();
+  const [page, setPage] = useState(0);
+  const [selectedEntryId, setSelectedEntryId] = useState<number | null>(null);
   const account = params.get("account") ?? undefined;
+  const journalEntryId = Number(params.get("journalEntryId")) || null;
+  const journalLineId = Number(params.get("journalLineId")) || null;
   const clearAccount = () => {
     const next = new URLSearchParams(params);
     next.delete("account");
@@ -64,7 +70,9 @@ export function JournalView() {
     fromDate !== "" ||
     toDate !== "" ||
     amountMin !== "" ||
-    amountMax !== "";
+    amountMax !== "" ||
+    journalEntryId !== null ||
+    journalLineId !== null;
 
   const state = useAsync<CompanyJournal>(
     () => api.journal(slug, year, account),
@@ -78,6 +86,8 @@ export function JournalView() {
     const minN = amountMin === "" ? null : Number(amountMin);
     const maxN = amountMax === "" ? null : Number(amountMax);
     return entries.filter((entry) => {
+      if (journalEntryId !== null && entry.id !== journalEntryId) return false;
+      if (journalLineId !== null && !entry.lines.some((line) => line.journalLineId === journalLineId)) return false;
       if (needle !== "" && !entryMatchesText(entry, needle)) return false;
       if (fromDate !== "" && entry.date < fromDate) return false;
       if (toDate !== "" && entry.date > toDate) return false;
@@ -87,29 +97,33 @@ export function JournalView() {
         return false;
       return true;
     });
-  }, [state.data, hasActiveFilter, q, fromDate, toDate, amountMin, amountMax]);
+  }, [state.data, hasActiveFilter, q, fromDate, toDate, amountMin, amountMax, journalEntryId, journalLineId]);
 
   if (state.loading && !state.data)
-    return <Loading label="Henter posteringer…" />;
+    return <section data-evidence-issue="652"><h2 data-evidence-heading>Posteringer</h2><p data-evidence-status="loading">Henter posteringer</p><PageState kind="loading" title="Henter posteringer" /></section>;
   if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <section data-evidence-issue="652"><h2 data-evidence-heading>Posteringer</h2><p data-evidence-status={/403|forbudt|adgang/i.test(state.error) ? "warning-or-blocked" : "error"}>{/403|forbudt|adgang/i.test(state.error) ? "Postering kræver afklaring" : "Posteringer kunne ikke hentes"}</p><PageState kind="error" title="Posteringer kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState></section>;
 
   const j = state.data!;
   const currency = j.company.currency || "DKK";
   const totalCount = j.entries.length;
   const matchCount = filteredEntries.length;
+  const pageSize = 25;
+  const pageEntries = filteredEntries.slice(page * pageSize, page * pageSize + pageSize);
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="journal" data-evidence-issue="652">
       <div className="page-head">
         <div>
           <h2>{j.company.name}</h2>
+          <h3 data-evidence-heading>Posteringer</h3>
+          <p className="muted" data-evidence-status={filteredEntries.length ? "normal" : "empty"}>{filteredEntries.length ? "Posteringer klar" : "Ingen posteringer i perioden"}</p>
           <p className="muted">
             {j.company.cvr ? `CVR ${j.company.cvr} · ` : ""}
             {j.company.country} · {currency} · Posteringer
           </p>
         </div>
-        <div className="row-actions">
+        <PageHeaderActions>
           {/* #465 — revisor-anmodning: hele kassekladden som CSV. URL'en
               bærer den aktive konto-drilldown med, så ejeren kan eksportere
               "kun denne konto"-udsnittet direkte. */}
@@ -123,7 +137,7 @@ export function JournalView() {
           <Link className="btn secondary" to={`/companies/${slug}/manage`}>
             Administrér
           </Link>
-        </div>
+        </PageHeaderActions>
       </div>
 
       <CompanyNav
@@ -153,62 +167,25 @@ export function JournalView() {
         </div>
       )}
 
-      <div className="journal-filter-bar card" role="search">
-        <label className="journal-filter-field journal-filter-field--search">
-          <span className="muted">Søg</span>
-          <input
-            type="search"
-            value={q}
-            placeholder="Søg på tekst, bilagsnummer eller konto…"
-            onChange={(e) => setFilter("q", e.target.value)}
-          />
-        </label>
-        <label className="journal-filter-field">
-          <span className="muted">Fra</span>
-          <input
-            type="date"
-            value={fromDate}
-            onChange={(e) => setFilter("from", e.target.value)}
-          />
-        </label>
-        <label className="journal-filter-field">
-          <span className="muted">Til</span>
-          <input
-            type="date"
-            value={toDate}
-            onChange={(e) => setFilter("to", e.target.value)}
-          />
-        </label>
-        <label className="journal-filter-field">
-          <span className="muted">Beløb min</span>
+      <FilterBar activeFilters={[
+        q && `Søgning: ${q}`, fromDate && `Fra: ${fromDate}`, toDate && `Til: ${toDate}`,
+        amountMin && `Beløb fra: ${amountMin}`, amountMax && `Beløb til: ${amountMax}`,
+      ].filter(Boolean) as string[]} onReset={clearAllFilters} resetLabel="Ryd filtre" advanced={<><FormField label="Beløb min">
           <input
             type="number"
-            inputMode="decimal"
-            value={amountMin}
-            placeholder="0"
-            onChange={(e) => setFilter("amountMin", e.target.value)}
+            inputMode="decimal" value={amountMin} placeholder="0" onChange={(e) => setFilter("amountMin", e.target.value)}
           />
-        </label>
-        <label className="journal-filter-field">
-          <span className="muted">Beløb maks</span>
+        </FormField><FormField label="Beløb maks">
           <input
             type="number"
-            inputMode="decimal"
-            value={amountMax}
-            placeholder="∞"
-            onChange={(e) => setFilter("amountMax", e.target.value)}
+            inputMode="decimal" value={amountMax} placeholder="∞" onChange={(e) => setFilter("amountMax", e.target.value)}
           />
-        </label>
-        {hasActiveFilter && (
-          <button
-            type="button"
-            className="btn secondary"
-            onClick={clearAllFilters}
-          >
-            Ryd filtre
-          </button>
-        )}
-      </div>
+        </FormField></>}>
+        <FormField label="Søg"><input type="search" value={q} placeholder="Søg på tekst, bilagsnummer eller konto…" onChange={(e) => setFilter("q", e.target.value)} /></FormField>
+        <FormField label="Fra"><input type="date" value={fromDate} onChange={(e) => setFilter("from", e.target.value)} /></FormField>
+        <FormField label="Til"><input type="date" value={toDate} onChange={(e) => setFilter("to", e.target.value)} /></FormField>
+      </FilterBar>
+      <details data-evidence-progressive><summary>Forklar posten</summary><p>Åbn en postering for at se kontering og dokumenteret grundlag.</p></details>
 
       <p className="statement-asof muted">
         {j.periodStart} – {j.periodEnd} ·{" "}
@@ -217,28 +194,29 @@ export function JournalView() {
           : `${totalCount} posteringer`}
       </p>
       {filteredEntries.length === 0 ? (
-        <div className="card statement-card">
-          <p className="empty-inline" style={{ padding: "var(--space-md)" }}>
-            {hasActiveFilter
+        <PageState kind="empty" title={hasActiveFilter ? "Ingen posteringer" : "Ingen posteringer i året"}>
+          {hasActiveFilter
               ? "Ingen posteringer matcher filtrene."
               : j.accountFilter
                 ? "Ingen posteringer på kontoen i året."
                 : "Ingen posteringer i året."}
-          </p>
-        </div>
+        </PageState>
       ) : (
-        <ul className="entry-list">
-          {filteredEntries.map((entry) => (
+        <ul className="entry-list" aria-label="Posteringer" data-evidence-data>
+          {pageEntries.map((entry) => (
             <EntryRow
               key={entry.id}
               entry={entry}
               currency={currency}
               slug={slug}
               archived={j.archived}
+              open={selectedEntryId === entry.id}
+              onSelect={() => setSelectedEntryId((current) => current === entry.id ? null : entry.id)}
             />
           ))}
         </ul>
       )}
+      {filteredEntries.length > pageSize && <nav className="row-actions" aria-label="Sider"><button type="button" className="btn secondary" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>Forrige</button><span className="muted">Side {page + 1} af {Math.ceil(filteredEntries.length / pageSize)}</span><button type="button" className="btn secondary" disabled={(page + 1) * pageSize >= filteredEntries.length} onClick={() => setPage((p) => p + 1)}>Næste</button></nav>}
     </section>
   );
 }
@@ -259,6 +237,8 @@ function EntryRow({
   currency,
   slug,
   archived,
+  open,
+  onSelect,
 }: {
   entry: JournalEntry;
   currency: string;
@@ -269,8 +249,9 @@ function EntryRow({
    * sender ejeren mod en route der ikke kan resolves.
    */
   archived: boolean;
+  open: boolean;
+  onSelect: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   // #379 — en post har et bilag når både linkage og fil-route er meningsfulde.
   // Arkiverede år vises altid som "Intet bilag" (filen er ikke i `documents`).
   const hasDocument = !archived && entry.documentId !== null;
@@ -280,18 +261,22 @@ function EntryRow({
         type="button"
         className="entry-summary"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        data-evidence-core-action
+        onClick={onSelect}
       >
         <span className="entry-caret" aria-hidden="true">
           {open ? "▾" : "▸"}
         </span>
         <span className="entry-no">{entry.entryNo}</span>
         <span className="entry-date">{entry.date}</span>
-        <span className="entry-text">{entry.text}</span>
+        <span className="entry-text"><PartyLink slug={slug} partyId={entry.partyId}>{entry.text}</PartyLink></span>
+        <span className="muted">{entry.documentNo ? "Bilag" : "Bilag mangler"}</span>
+        <span className="muted">Bogført</span>
         <span className="entry-total num">
           {formatKroner(entry.total, currency)}
         </span>
       </button>
+      {open && <p data-evidence-task-outcome>Forklaring åbnet</p>}
       {open && (
         <div className="entry-lines table-scroll">
           <table className="data statement-table">
@@ -301,6 +286,7 @@ function EntryRow({
                 <th scope="col">Navn</th>
                 <th className="num" scope="col">Debet</th>
                 <th className="num" scope="col">Kredit</th>
+                <th scope="col">Dimensioner</th>
               </tr>
             </thead>
             <tbody>
@@ -319,11 +305,19 @@ function EntryRow({
                   <td className="num">
                     {line.credit ? formatKroner(line.credit, currency) : "—"}
                   </td>
+                  <td>
+                    {line.journalLineId === null ? (
+                      <span className="muted">Ingen dimensionshistorik</span>
+                    ) : (
+                      <DimensionAssignments slug={slug} journalLineId={line.journalLineId} />
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div className="entry-bilag">
+          <div className="entry-bilag" data-evidence-progressive>
+            <ExplanationPanel slug={slug} entryId={entry.id} />
             {hasDocument ? (
               <a
                 className="entry-bilag-link"
@@ -344,4 +338,109 @@ function EntryRow({
       )}
     </li>
   );
+}
+
+function ExplanationPanel({ slug, entryId }: { slug: string; entryId: number }) {
+  const state = useAsync<any>(() => api.journalExplanation(slug, entryId), [slug, entryId]);
+  if (state.loading && !state.data) return <span className="muted">Henter forklaring…</span>;
+  if (state.error) return <span className="muted">Forklaringen kunne ikke hentes.</span>;
+  const e = state.data;
+  return <details className="dimension-assignment"><summary>Forklar posten</summary><p>Konkrete kilder vises kun, når de er eksplicit knyttet til posteringen.</p>
+    <p><strong>Faglig vurdering:</strong> {e.professionalAssessment.text}</p>
+    <p><strong>Lovgrundlag:</strong> {e.legalSource.text}</p>
+    {e.appliedRule && <p><strong>Anvendt Rentemester-regel:</strong> {e.appliedRule.ruleId} v{e.appliedRule.version} (gælder fra {e.appliedRule.effectiveFrom}).</p>}
+    {e.correction.sentence && <p>{e.correction.sentence}</p>}
+    <details><summary>Evidens</summary><code>{e.evidence.entryHash}</code></details>
+  </details>;
+}
+
+type Allocation = { dimensionId: string; memberId: string; amountMinor: number; currency: string };
+type AssignmentEvent = {
+  id: number; allocations_json: string; source: string; source_ref: string | null; plan_hash: string;
+  event_type: "assigned" | "superseded"; supersedes_assignment_id: number | null;
+  actor: string; principal: string; created_at: string;
+};
+
+function parseAllocations(value: string): Allocation[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is Allocation => Boolean(item) && typeof item === "object" &&
+      typeof (item as Allocation).dimensionId === "string" && typeof (item as Allocation).memberId === "string" &&
+      Number.isSafeInteger((item as Allocation).amountMinor) && typeof (item as Allocation).currency === "string");
+  } catch { return []; }
+}
+
+/** Current means an assigned event that no later supersession explicitly retires. */
+function currentAssignment(events: AssignmentEvent[]): AssignmentEvent | null {
+  const retired = new Set(events.map((event) => event.supersedes_assignment_id).filter((id): id is number => id !== null));
+  return events.find((event) => event.event_type === "assigned" && !retired.has(event.id)) ?? null;
+}
+
+function DimensionAssignments({ slug, journalLineId }: { slug: string; journalLineId: number }) {
+  const state = useAsync<AssignmentEvent[]>(() => api.dimensionAssignments(slug, journalLineId) as Promise<AssignmentEvent[]>, [slug, journalLineId]);
+  if (state.loading && !state.data) return <span className="muted">Henter dimensioner…</span>;
+  if (state.error) return <span className="muted">Dimensionshistorik kunne ikke hentes</span>;
+  const events = state.data ?? [];
+  const current = currentAssignment(events);
+  if (!current) return <span className="muted">Ingen godkendt dimension</span>;
+  const allocations = parseAllocations(current.allocations_json);
+  return <details className="dimension-assignment">
+    <summary>{allocations.map((item) => `${item.dimensionId}: ${item.memberId}`).join(", ") || "Godkendt dimension"}</summary>
+    <p className="muted">
+      Kilde: {current.source} · plan-hash <code>{current.plan_hash}</code><br />
+      {current.source_ref && <>Kildereference: {current.source_ref}<br /></>}
+      Godkendt af {current.actor} via {current.principal} · {current.created_at}
+    </p>
+    <DimensionReview slug={slug} journalLineId={journalLineId} current={current} onChanged={state.reload} />
+  </details>;
+}
+
+/**
+ * The legal posting is immutable. A correction therefore first retires the
+ * current allocation and only then applies the exact hash-bound replacement.
+ * This compact form intentionally accepts only explicit allocation ids and
+ * amounts — it does not guess a dimension or silently redistribute amounts.
+ */
+function DimensionReview({ slug, journalLineId, current, onChanged }: { slug: string; journalLineId: number; current: AssignmentEvent; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [allocations, setAllocations] = useState<Allocation[]>(() => parseAllocations(current.allocations_json));
+  const [plan, setPlan] = useState<{ planHash: string } | null>(null);
+  const [reviewed, setReviewed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmSupersede, setConfirmSupersede] = useState(false);
+
+  function change(index: number, key: keyof Allocation, value: string) {
+    setPlan(null); setReviewed(false);
+    setAllocations((rows) => rows.map((row, i) => i === index
+      ? { ...row, [key]: key === "amountMinor" ? Number(value) : value } : row));
+  }
+  async function makePlan() {
+    setError(null);
+    try {
+      const result = await api.planDimensionAssignment(slug, { journalLineId, allocations, source: "reviewed" });
+      if (!result.ok || !result.plan) throw new Error(result.errors?.join(", ") || "Planen kunne ikke valideres.");
+      setPlan(result.plan);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+  async function replace(reason: string) {
+    if (!reason.trim()) throw new Error("Skriv en begrundelse for korrektionen.");
+    if (!plan || !reviewed) throw new Error("Gennemgå først den præcise plan.");
+    await api.replaceDimensionAssignment(slug, { journalLineId, expectedAssignmentId: current.id, allocations, source: "reviewed", planHash: plan.planHash, reason, idempotencyKey: `cockpit-dimension-replace-${current.id}-${plan.planHash}` });
+    setEditing(false); setPlan(null); setReviewed(false); setConfirmSupersede(false); onChanged();
+  }
+  if (!editing) return <button type="button" className="btn secondary" onClick={() => setEditing(true)}>Gennemgå og ret</button>;
+  return <div className="dimension-review card">
+    <p><strong>Ret dimensionsklassifikation</strong></p>
+    <p className="muted">Posteringen ændres aldrig. Den nuværende tildeling supersederes og den reviewede plan anvendes atomisk med begrundelse.</p>
+    {allocations.map((allocation, index) => <div className="row-actions" key={`${allocation.dimensionId}-${index}`}>
+      <label>Dimension<input aria-label={`Dimension ${index + 1}`} value={allocation.dimensionId} onChange={(event) => change(index, "dimensionId", event.target.value)} /></label>
+      <label>Medlem<input aria-label={`Medlem ${index + 1}`} value={allocation.memberId} onChange={(event) => change(index, "memberId", event.target.value)} /></label>
+      <label>Øre<input aria-label={`Øre ${index + 1}`} type="number" value={allocation.amountMinor} onChange={(event) => change(index, "amountMinor", event.target.value)} /></label>
+    </div>)}
+    <div className="row-actions"><button type="button" className="btn secondary" onClick={() => void makePlan()}>Validér revideret plan</button><button type="button" className="btn secondary" onClick={() => setEditing(false)}>Annullér</button></div>
+    {plan && <div className="card"><p>Plan-hash: <code>{plan.planHash}</code></p><label><input type="checkbox" checked={reviewed} onChange={(event) => setReviewed(event.target.checked)} /> Jeg har gennemgået den præcise plan.</label><button type="button" className="btn secondary" disabled={!reviewed} onClick={() => setConfirmSupersede(true)}>Erstat nuværende tildeling atomisk</button></div>}
+    {error && <p className="muted" role="alert">{error}</p>}
+    {confirmSupersede && <ConfirmDialog title="Erstat dimensionsklassifikation" body={<p>Den nuværende klassifikation bevares i revisionssporet. Supersession og den præcise, hash-bundne erstatning gemmes atomisk, så linjen aldrig står uden en aktuel tildeling.</p>} confirmLabel="Erstat tildeling" confirmKind="danger" noteLabel="Begrundelse" onConfirm={replace} onClose={() => setConfirmSupersede(false)} />}
+  </div>;
 }

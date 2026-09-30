@@ -14,23 +14,25 @@
 // Status-linjen under filter-baren viser hvor mange transaktioner der matcher
 // — og hvor mange af dem der er afstemt vs. uafstemte.
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { formatDateDa, formatKroner } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 import type { BankTransactionRow, CompanyBank } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
+import { FilterBar, FormField, MetricCard, PageHeaderActions, PageState, ResponsiveTable, StatusChip } from "../components/CockpitPrimitives";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { BankImportModal } from "../components/BankImportModal";
 import {
   BankReconcileModal,
   type BankReconcileTransaction,
 } from "../components/BankReconcileModal";
+import { BankCorrectionModal } from "../components/BankCorrectionModal";
+import { PartyLink } from "../components/PartyLink";
 
 // #451 — the URL keys we own; listed once so "Ryd filtre" can clear them all
 // without touching other params (e.g. `?year=`).
-const FILTER_PARAM_KEYS = ["q", "from", "to", "status"] as const;
+const FILTER_PARAM_KEYS = ["q", "from", "to", "status", "transactionId"] as const;
 
 type StatusFilter = "all" | "matched" | "unmatched";
 type SortKey = "date" | "amount";
@@ -58,6 +60,7 @@ export function BankView() {
   // while no settle-modal is open.
   const [reconciling, setReconciling] =
     useState<BankReconcileTransaction | null>(null);
+  const [correcting, setCorrecting] = useState<{ id: number; text: string; journalEntryNo?: string | null } | null>(null);
 
   // --- #451 filter-bar params (client-side; reflected in URL) ---------------
   const q = params.get("q") ?? "";
@@ -65,6 +68,7 @@ export function BankView() {
   const toDate = params.get("to") ?? "";
   const statusRaw = params.get("status") ?? "all";
   const status: StatusFilter = isStatusFilter(statusRaw) ? statusRaw : "all";
+  const transactionId = Number(params.get("transactionId")) || null;
 
   // #451 — sorter for the date/amount columns. Default is the import order
   // (chronological as inserted); only after the owner clicks a column-header
@@ -93,7 +97,8 @@ export function BankView() {
     q !== "" ||
     fromDate !== "" ||
     toDate !== "" ||
-    status !== "all";
+    status !== "all" ||
+    transactionId !== null;
 
   function toggleSort(key: SortKey) {
     setSort((prev) => {
@@ -120,6 +125,7 @@ export function BankView() {
     if (!hasActiveFilter) return allTransactions;
     const needle = q.trim().toLowerCase();
     return allTransactions.filter((tx) => {
+      if (transactionId !== null && tx.id !== transactionId) return false;
       if (needle !== "" && !txMatchesText(tx, needle)) return false;
       if (fromDate !== "" && tx.date < fromDate) return false;
       if (toDate !== "" && tx.date > toDate) return false;
@@ -129,7 +135,7 @@ export function BankView() {
         return false;
       return true;
     });
-  }, [allTransactions, hasActiveFilter, q, fromDate, toDate, status]);
+  }, [allTransactions, hasActiveFilter, q, fromDate, toDate, status, transactionId]);
 
   const sortedTransactions = useMemo(() => {
     if (!sort) return filteredTransactions;
@@ -146,30 +152,32 @@ export function BankView() {
     return out;
   }, [filteredTransactions, sort]);
 
-  if (state.loading && !state.data) return <Loading label="Henter bank…" />;
-  if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+  if (state.loading && !state.data) return <section data-evidence-issue="655"><p data-evidence-heading>Bank</p><p data-evidence-status="loading">Henter bankposter</p><BankPageShell><PageState kind="loading" title="Henter bankposter" /></BankPageShell></section>;
+  if (state.error) return <section data-evidence-issue="655"><p data-evidence-heading>Bank</p><p data-evidence-status={/403|forbudt|adgang/i.test(state.error) ? "warning-or-blocked" : "error"}>{/403|forbudt|adgang/i.test(state.error) ? "Bank kræver afstemning" : "Bankposter kunne ikke hentes"}</p><BankPageShell><PageState kind="error" title="Bankposter kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState></BankPageShell></section>;
 
   const b = state.data!;
   const currency = b.company.currency || "DKK";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="bank" data-evidence-issue="655">
       <div className="page-head">
         <div>
+          <h1 data-evidence-heading>Bank</h1>
+          <p className="muted" data-evidence-status={b.transactions.length ? "normal" : "empty"}>{b.transactions.length ? "Bank klar til gennemgang" : "Ingen bankposter i perioden"}</p>
           <h2>{b.company.name}</h2>
           <p className="muted">
             {b.company.cvr ? `CVR ${b.company.cvr} · ` : ""}
             {b.company.country} · {currency} · Bank
           </p>
         </div>
-        <div className="row-actions">
+        <PageHeaderActions>
           {/* The bank-import write action — hidden for an archived (read-only)
               year, where no live ledger is available to import into. */}
           {!b.archived && (
             <button
               type="button"
               className="btn"
+              data-evidence-core-action
               onClick={() => setImporting(true)}
             >
               Importér kontoudtog
@@ -178,7 +186,7 @@ export function BankView() {
           <Link className="btn secondary" to={`/companies/${slug}/manage`}>
             Administrér
           </Link>
-        </div>
+        </PageHeaderActions>
       </div>
 
       <CompanyNav
@@ -204,6 +212,7 @@ export function BankView() {
           onClose={() => setReconciling(null)}
         />
       )}
+      {correcting && <BankCorrectionModal slug={slug} transaction={correcting} onApplied={state.reload} onClose={() => setCorrecting(null)} />}
 
       {b.archived ? (
         <ArchivedBankView
@@ -226,14 +235,7 @@ export function BankView() {
           <BankDifferenceBanner bank={b} currency={currency} />
 
           <div className="status-grid bank-summary">
-            <div className="card status-card">
-              <h3>Faktisk saldo</h3>
-              <div className="status-figure">
-                {b.actualBalance === null
-                  ? "—"
-                  : formatKroner(b.actualBalance, currency)}
-              </div>
-              <p className="muted status-note">
+            <MetricCard label="Faktisk saldo" value={b.actualBalance === null ? "—" : formatKroner(b.actualBalance, currency)}>
                 {/* #305: distinguish "no statement imported" from "a
                     statement was imported but its CSV had no balance column".
                     Saying "intet kontoudtog importeret" for the second case
@@ -242,15 +244,11 @@ export function BankView() {
                   ? "Seneste saldo fra kontoudtoget"
                   : b.bankStatementStatus === "no-balance-column"
                     ? "Banksaldo ukendt — kontoudtoget havde ingen saldo-kolonne"
+                    : b.bankStatementStatus === "ambiguous"
+                      ? "Banksaldo ukendt — kontoudtogets rækkefølge eller saldo-kæde kan ikke bevises"
                     : "Intet kontoudtog importeret"}
-              </p>
-            </div>
-            <div className="card status-card">
-              <h3>Bogført saldo</h3>
-              <div className="status-figure">
-                {formatKroner(b.bookedBalance, currency)}
-              </div>
-              <p className="muted status-note">
+            </MetricCard>
+            <MetricCard label="Bogført saldo" value={formatKroner(b.bookedBalance, currency)}>
                 {b.accounts.length > 0
                   ? b.accounts
                       .map((a) =>
@@ -258,18 +256,11 @@ export function BankView() {
                       )
                       .join(", ")
                   : "Bank- og kassekonti"}
-              </p>
-            </div>
-            <div className="card status-card">
-              <h3>Afstemning</h3>
-              <div className="status-figure">
-                {b.matchedCount} / {b.transactions.length}
-              </div>
-              <p className="muted status-note">
+            </MetricCard>
+            <MetricCard label="Afstemning" value={`${b.matchedCount} / ${b.transactions.length}`}>
                 {b.matchedCount} afstemt ·{" "}
                 {b.unmatchedCount} uafstemte transaktioner
-              </p>
-            </div>
+            </MetricCard>
           </div>
 
           <BankFilterBar
@@ -288,8 +279,8 @@ export function BankView() {
             hasActiveFilter={hasActiveFilter}
           />
 
-          <div className="card statement-card table-scroll">
-            <table className="data statement-table">
+          {sortedTransactions.length === 0 && <PageState kind="empty" title={hasActiveFilter ? "Ingen transaktioner matcher filtrene" : "Ingen bankposter i perioden"}>{hasActiveFilter ? "Nulstil filtrene for at se alle bankposter." : "Importér et kontoudtog, når du er klar."}</PageState>}
+          <div data-evidence-data><ResponsiveTable className="statement-table">
               <thead>
                 <tr>
                   <th scope="col" aria-sort={ariaSort("date")}>
@@ -318,38 +309,24 @@ export function BankView() {
                 </tr>
               </thead>
               <tbody>
-                {sortedTransactions.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="empty-inline">
-                      {hasActiveFilter
-                        ? "Ingen transaktioner matcher filtrene."
-                        : "Ingen banktransaktioner i året."}
-                    </td>
-                  </tr>
-                ) : (
-                  sortedTransactions.map((tx) => (
+                {sortedTransactions.map((tx) => (
                     <tr key={tx.id}>
-                      <td className="entry-date">{tx.date}</td>
-                      <td>{tx.text}</td>
-                      <td className="num">
+                      <td className="entry-date" data-label="Dato">{tx.date}</td>
+                      <td data-label="Tekst"><PartyLink slug={slug} partyId={tx.partyId}>{tx.text}</PartyLink></td>
+                      <td className="num" data-label="Beløb">
                         {formatKroner(tx.amount, currency)}
                       </td>
-                      <td className="num">
+                      <td className="num" data-label="Saldo">
                         {tx.runningBalance === null
                           ? "—"
                           : formatKroner(tx.runningBalance, currency)}
                       </td>
-                      <td>
+                      <td data-label="Afstemning">
                         {tx.reconciliationStatus === "matched" ? (
-                          <span className="flag ok">
-                            Afstemt
-                            {tx.journalEntryNo
-                              ? ` · ${tx.journalEntryNo}`
-                              : ""}
-                          </span>
+                          <div className="row-actions"><StatusChip tone="success">Afstemt{tx.journalEntryNo ? ` · ${tx.journalEntryNo}` : ""}</StatusChip><button type="button" className="btn secondary" onClick={() => setCorrecting({ id: tx.id, text: tx.text, journalEntryNo: tx.journalEntryNo })}>Ret</button></div>
                         ) : (
                           <div className="row-actions">
-                            <span className="flag warning">Uafstemt</span>
+                            <StatusChip tone="warning">Uafstemt</StatusChip>
                             <button
                               type="button"
                               className="btn secondary"
@@ -365,15 +342,14 @@ export function BankView() {
                             >
                               Bogfør
                             </button>
+                            <Link className="btn secondary" to={`/companies/${slug}/koebsoverblik?sourceKind=bank_transaction&sourceId=${tx.id}`}>Åbn købscase</Link>
                           </div>
                         )}
                       </td>
                     </tr>
-                  ))
-                )}
+                  ))}
               </tbody>
-            </table>
-          </div>
+          </ResponsiveTable></div>
         </>
       )}
     </section>
@@ -408,36 +384,32 @@ function BankFilterBar({
   clearAllFilters: () => void;
   showStatusFilter?: boolean;
 }) {
+  const activeFilters = [
+    q && `Søgning: ${q}`,
+    status !== "all" && (status === "matched" ? "Afstemte" : "Uafstemte"),
+    fromDate && `Fra: ${fromDate}`,
+    toDate && `Til: ${toDate}`,
+  ].filter(Boolean) as string[];
   return (
-    <div className="journal-filter-bar card" role="search">
-      <label className="journal-filter-field journal-filter-field--search">
-        <span className="muted">Søg</span>
+    <FilterBar
+      activeFilters={activeFilters}
+      onReset={hasActiveFilter ? clearAllFilters : undefined}
+      advancedEvidence
+      advanced={<div>
+        <FormField label="Fra"><input type="date" value={fromDate} onChange={(e) => setFilter("from", e.target.value)} /></FormField>
+        <FormField label="Til"><input type="date" value={toDate} onChange={(e) => setFilter("to", e.target.value)} /></FormField>
+      </div>}
+    >
+      <FormField label="Søg">
         <input
           type="search"
           value={q}
           placeholder="Søg på tekst eller posteringsnr…"
           onChange={(e) => setFilter("q", e.target.value)}
         />
-      </label>
-      <label className="journal-filter-field">
-        <span className="muted">Fra</span>
-        <input
-          type="date"
-          value={fromDate}
-          onChange={(e) => setFilter("from", e.target.value)}
-        />
-      </label>
-      <label className="journal-filter-field">
-        <span className="muted">Til</span>
-        <input
-          type="date"
-          value={toDate}
-          onChange={(e) => setFilter("to", e.target.value)}
-        />
-      </label>
+      </FormField>
       {showStatusFilter && (
-        <label className="journal-filter-field">
-          <span className="muted">Status</span>
+        <FormField label="Status">
           <select
             value={status}
             onChange={(e) => setFilter("status", e.target.value)}
@@ -446,19 +418,14 @@ function BankFilterBar({
             <option value="matched">Kun afstemte</option>
             <option value="unmatched">Kun uafstemte</option>
           </select>
-        </label>
+        </FormField>
       )}
-      {hasActiveFilter && (
-        <button
-          type="button"
-          className="btn secondary"
-          onClick={clearAllFilters}
-        >
-          Ryd filtre
-        </button>
-      )}
-    </div>
+    </FilterBar>
   );
+}
+
+function BankPageShell({ children }: { children: ReactNode }) {
+  return <section className="statement" data-cockpit-page="bank"><div className="page-head"><div><h1>Bank</h1><p className="muted">Se bankposter, afstemning og næste skridt.</p></div></div>{children}</section>;
 }
 
 // #451 — the "X af Y matcher · Z afstemt · W uafstemte" status line under
@@ -504,11 +471,14 @@ function BankDifferenceBanner({
     // #305: a statement WITH transactions but no balance column is not the
     // same as no statement at all — the wording must reflect which it is.
     const noBalanceColumn = bank.bankStatementStatus === "no-balance-column";
+    const ambiguous = bank.bankStatementStatus === "ambiguous";
     return (
       <div className="card bank-diff-banner neutral">
         <span className="flag">Bank</span>
         <p>
-          {noBalanceColumn ? (
+          {ambiguous ? (
+            <>Kontoudtogets rækkefølge eller løbende saldo kan ikke bevises. Rentemester viser derfor ikke en gættet banksaldo; kontrollér importen og kildeeksporten.</>
+          ) : noBalanceColumn ? (
             <>
               Kontoudtoget for {bank.selectedYear} indeholder ingen
               saldo-kolonne, så den faktiske banksaldo er ukendt — kun den
@@ -650,8 +620,7 @@ function ArchivedBankView({
         hasActiveFilter={hasActiveFilter}
       />
 
-      <div className="card statement-card table-scroll">
-        <table className="data statement-table">
+      <ResponsiveTable className="statement-table">
           <thead>
             <tr>
               <th scope="col" aria-sort={ariaSort("date")}>
@@ -690,10 +659,10 @@ function ArchivedBankView({
             ) : (
               sortedTransactions.map((tx) => (
                 <tr key={tx.id}>
-                  <td className="entry-date">{tx.date}</td>
-                  <td>{tx.text}</td>
-                  <td className="num">{formatKroner(tx.amount, currency)}</td>
-                  <td className="num">
+                  <td className="entry-date" data-label="Dato">{tx.date}</td>
+                  <td data-label="Tekst">{tx.text}</td>
+                  <td className="num" data-label="Beløb">{formatKroner(tx.amount, currency)}</td>
+                  <td className="num" data-label="Saldo">
                     {tx.runningBalance === null
                       ? "—"
                       : formatKroner(tx.runningBalance, currency)}
@@ -702,8 +671,7 @@ function ArchivedBankView({
               ))
             )}
           </tbody>
-        </table>
-      </div>
+      </ResponsiveTable>
     </>
   );
 }

@@ -21,7 +21,8 @@ betragtes som en Digisense-godkendelse.
 1. Vælg næste SemVer efter `docs/versioning.md`.
 2. Opdatér `package.json` og `app/package.json` til samme version.
 3. Flyt punkter fra `[Unreleased]` til en dateret sektion i `CHANGELOG.md`.
-4. Kør `bun run version:check`, alle tests, smoke og builds.
+4. Kør `bun run version:check` og derefter `bun run verify:local`. Gem den
+   afsluttende testopsummering sammen med releasearbejdet.
 5. Merge ændringen til `main`. Opret ikke Git-tag manuelt.
 
 ## 2. Byg release candidate
@@ -34,11 +35,59 @@ Workflowet:
 
 - validerer version/commit og bruger commit-tidspunktet som reproducerbar
   buildtid;
-- kører root-tests, smoke og cockpit-test/build; `www` har sit eget uafhængige
-  workflow og kan hverken blokere eller ændre produktimaget;
+- kører de hurtige kilde-, dependency- og buildkontroller, men gentager ikke
+  de lokalt beståede backend- og cockpittests;
+- bygger cockpittet; `www` har sit eget uafhængige workflow og kan hverken
+  blokere eller ændre produktimaget;
+- bygger to rene, timestamp-normaliserede OCI-exports og kræver identisk
+  manifestdigest og arkiv-SHA-256;
+- kører containeren non-root mod en ny persistent volume, kræver grøn
+  readiness og verificerer en idempotent genstart; den samme smoke kører med
+  read-only root, `--network none`, memory/CPU/PID/tmpfs-grænser og opretter
+  syntetisk virksomhed/PDF gennem HTTP. Den verificerer rigtig pdf.js-tekst og
+  layout, cache-genbrug samt det dokumenterede `no_text_layer`-udfald;
 - bygger ét `linux/amd64` Docker-image og pusher kun kandidat-tagget;
 - attesterer image-proveniens, før evidensartefaktet publiceres;
-- uploader `release-manifest.json`, dets SHA-256 og approval-schemaet.
+- publicerer en BuildKit-genereret SPDX-SBOM som OCI-attestation bundet til
+  kandidatens immutable digest;
+- udtrækker den samme SBOM til `sbom.spdx.json`, uploader den med egen SHA-256
+  og binder checksummen ind i release-manifestet sammen med approval-schemaet;
+  kandidaten afviser desuden en SBOM uden den låste `pdfjs-dist@6.2.108`.
+
+Den fulde testsuite er en lokal releasegate, fordi den stærke udviklingsmaskine
+kører den parallelt med Bun. Kandidatworkflowets ansvar er at bevise, at den
+præcise commit kan bygges reproducerbart til et startbart Linux/AMD64-image og
+at publicere netop dette image med attestering og evidens. Workflowet må derfor
+ikke få `bun test`, `cockpit:test` eller den fulde kilde-smoke tilbage som en
+skjult dobbeltkørsel.
+
+### Cockpit acceptance evidence
+
+Kandidatworkflowet starter også det publicerede image med en helt ny, syntetisk
+workspace og afvikler `scripts/release/cockpit-evidence-scenarios.json` i system-
+Chrome. Filen indeholder ni eksplicitte issue-profiler; runneren udvider dem
+deterministisk til 63 scenarier. Runneren accepterer kun `ghcr.io/...@sha256:...`,
+aldrig et tag, og containeren får en tom tmpfs-workspace på et kortlivet Docker
+`--internal`-netværk med kun loopback-publiceret adgang; den læser derfor ikke
+drifts- eller virksomhedsdata og har ingen ekstern egress. Scenarierne er den
+fælles evidenskontrakt for #649–#657 og dækker desktop, 390 px, 200 %-ækvivalent
+reflow (720×450 CSS px ved device scale 2 og 1440×900 PNG), loading, empty,
+warning/blokeret, fejl og tastatur. Request-interception er begrænset til den
+eksakte feature-endpoint, som den pågældende profil ejer.
+
+Artefaktet `release-candidate-evidence` indeholder PNG'erne og
+`cockpit-evidence.json`. Manifestet binder commit, immutable image-digest,
+route, viewport, zoom, tastaturresultater, interception og SHA-256 for hver
+screenshot sammen. Kontrollér det lokalt med:
+
+```sh
+bun run cockpit:evidence:verify cockpit-evidence/cockpit-evidence.json
+```
+
+Verifikationen fejler med en konkret fejl ved mutable image-reference, manglende
+screenshot, forkert hash eller et manglende obligatorisk scenario. Kandidaten
+stopper også, hvis et åbent `regression`-issue samtidig har label
+`severity:critical` eller `severity:high`.
 
 Manifestet binder version, commit, OCI-digest, schema-checksum og regelsæt-digest
 sammen med GitHub run-id og run-attempt. Digisense skal hente
@@ -68,12 +117,12 @@ udføre de schema-migrationer, som kandidaten indeholder. Før afprøvning mod e
 kopi af eksisterende data skal den aktuelle release derfor have produceret en
 signeret backup, som også er restore-testet.
 
-Compose-eksemplet bruger nye Docker-volumes og gør cockpittet tilgængeligt uden
-login på hostens loopback (`127.0.0.1`). Det må ikke eksponeres på et LAN eller
-internettet. Imaget selv starter fail-closed med token-auth; en
-netværksdeployment kræver en autentificerende reverse proxy eller en fremtidig
-cockpit-loginløsning. Indlæsning af eksisterende data i kandidatens volume skal
-være en bevidst operation efter backupkontrollen ovenfor.
+Compose-eksemplet bruger nye Docker-volumes og kan køre den eksplicitte lokale
+profil uden login på hostens loopback (`127.0.0.1`). Den profil må ikke
+eksponeres på LAN eller internet. En hosted deployment bruger Better Auth,
+individuelle brugere, MFA og virksomhedsspecifik RBAC og kræver samtidig den
+dokumenterede TLS/reverse-proxy-kontrakt. Indlæsning af eksisterende data i
+kandidatens volume skal være en bevidst operation efter backupkontrollen ovenfor.
 
 ## 3. Indhent Digisense-godkendelse
 
@@ -107,6 +156,10 @@ Workflowet afviser et eksisterende Git-tag/GitHub release eller et versioneret
 image med en anden digest. Release-workflows bruger commit-pinnede actions; en
 opgradering af en action er derfor en eksplicit, reviewbar kodeændring.
 
+Promotion bygger ikke igen. Den sætter kun et læsbart versionstag på samme
+digest, så den digest-bundne SPDX-SBOM fra kandidaten bevarer præcis sit
+oprindelige scope.
+
 Git- og OCI-tags er navne, som en privilegeret administrator teknisk kan ændre
 eller slette. Releaseprocessens preflight og publisher-politik forbyder det, men
 driftsmæssig fastlåsning skal altid ske med `repository@sha256:<digest>`.
@@ -123,3 +176,8 @@ understøtter ledgerens schema-version. Ved schemaændringer skal operatøren f�
 følge migrations-/backupplanen i `docs/versioning.md`; start aldrig blot et
 ældre image mod nyere data. Tag en signeret, verificerbar backup før enhver
 fremtidig schema-opgradering.
+# Cockpit candidate evidence
+
+Candidate evidence is digest-bound and deliberately fail-closed. The release workflow authenticates `gh` with `GH_TOKEN`, queries every open `epic:648` issue (pagination limit 1000), and records the exact JSON plus SHA-256 inside the Cockpit manifest. Any related `severity:high` or `severity:critical` issue blocks the candidate.
+
+For every #649–#657 feature, the scenario contract requires normal desktop, 390px, and real 200% browser-zoom/reflow evidence plus loading, empty, blocked, and error states. Feature-owned selectors are intentionally not relaxed while the corresponding UI is unfinished. Each rendered scenario records exact route interception, page-local DOM/status/control/data assertions, natural keyboard task traces, console state and PNG dimensions. The verifier rejects fake, reused, swapped, unsafe, or unreferenced screenshots, and binds the Cockpit manifest/query checksums into `release-manifest.json`.

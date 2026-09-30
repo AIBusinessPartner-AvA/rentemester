@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   packages: write
   id-token: write
   attestations: write
@@ -23,13 +24,14 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BUN_VERSION: 1.3.14
+  BUN_VERSION: 1.4.0
+  BUN_BASE_IMAGE_DIGEST: sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6
   REGISTRY_IMAGE: ghcr.io/mikkelkrogsholm/rentemester
 
 jobs:
   candidate:
     if: github.ref == 'refs/heads/main'
-    name: test and publish run-unique candidate
+    name: build and publish run-unique candidate
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -79,21 +81,35 @@ jobs:
           echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
           echo "candidate_tag=$candidate_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Install root dependencies
+      - name: Install workspace dependencies
         run: bun install --frozen-lockfile
 
-      - name: Install cockpit dependencies
-        working-directory: app
-        run: bun install --frozen-lockfile
+      - name: Typecheck runtime and release scripts
+        run: bun run typecheck:runtime
 
-      - name: Test product runtime
-        run: bun test
+      - name: Verify agent discovery coverage
+        run: bun run agent-discovery:coverage
 
-      - name: Run product smoke test
-        run: bun run smoke
+      - name: Lint TypeScript and React sources
+        run: bun run lint
 
-      - name: Test and build cockpit
-        run: bun run --cwd app test && bun run --cwd app build
+      - name: Refuse vulnerable dependencies
+        run: bun audit --audit-level=low --json > supply-chain-audit.json
+
+      - name: Verify production dependency licenses
+        run: bun run supply-chain:licenses
+
+      - name: Create lockfile-bound supply-chain evidence
+        id: supply_chain
+        env:
+          SUPPLY_CHAIN_AUDIT_REPORT_PATH: supply-chain-audit.json
+        run: |
+          bun run supply-chain:evidence > supply-chain-evidence.json
+          sha256sum supply-chain-evidence.json > supply-chain-evidence.json.sha256
+          echo "sha256=sha256:$(cut -d " " -f 1 supply-chain-evidence.json.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Build cockpit
+        run: bun run cockpit:build
 
       - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -104,6 +120,28 @@ jobs:
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Verify reproducible OCI export
+        env:
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_GIT_COMMIT: ${{ steps.identity.outputs.commit }}
+          RELEASE_BUILT_AT: ${{ steps.identity.outputs.built_at }}
+          SOURCE_DATE_EPOCH: ${{ steps.identity.outputs.source_date_epoch }}
+          RENTEMESTER_BUN_VERSION: ${{ env.BUN_VERSION }}
+          RENTEMESTER_BASE_IMAGE_DIGEST: ${{ env.BUN_BASE_IMAGE_DIGEST }}
+        run: bun run container:reproducibility
+
+      - name: Verify container readiness and persisted restart
+        env:
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+          RELEASE_GIT_COMMIT: ${{ steps.identity.outputs.commit }}
+          RELEASE_BUILT_AT: ${{ steps.identity.outputs.built_at }}
+          SOURCE_DATE_EPOCH: ${{ steps.identity.outputs.source_date_epoch }}
+          RENTEMESTER_BUN_VERSION: ${{ env.BUN_VERSION }}
+          RENTEMESTER_BASE_IMAGE_DIGEST: ${{ env.BUN_BASE_IMAGE_DIGEST }}
+        run: bun run container:test
 
       - name: Refuse to overwrite a candidate tag
         env:
@@ -125,13 +163,17 @@ jobs:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          push: true
           tags: ${{ env.REGISTRY_IMAGE }}:${{ steps.identity.outputs.candidate_tag }}
+          outputs: type=registry,rewrite-timestamp=true
           build-args: |
             RENTEMESTER_VERSION=${{ steps.identity.outputs.version }}
             RENTEMESTER_GIT_COMMIT=${{ steps.identity.outputs.commit }}
             RENTEMESTER_BUILT_AT=${{ steps.identity.outputs.built_at }}
+            RENTEMESTER_BUN_VERSION=${{ env.BUN_VERSION }}
+            RENTEMESTER_BASE_IMAGE_DIGEST=${{ env.BUN_BASE_IMAGE_DIGEST }}
             SOURCE_DATE_EPOCH=${{ steps.identity.outputs.source_date_epoch }}
+          # BuildKit publishes an SPDX SBOM attestation bound to this OCI digest.
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -140,28 +182,91 @@ jobs:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           EXPECTED_VERSION: ${{ steps.identity.outputs.version }}
           EXPECTED_COMMIT: ${{ steps.identity.outputs.commit }}
+          EXPECTED_BUN_VERSION: ${{ env.BUN_VERSION }}
+          EXPECTED_BASE_IMAGE_DIGEST: ${{ env.BUN_BASE_IMAGE_DIGEST }}
         run: |
           set -euo pipefail
           image="$REGISTRY_IMAGE@$IMAGE_DIGEST"
           docker pull "$image"
           docker image inspect "$image" --format '{{json .Config.Env}}' \
             | jq -e 'index("RENTEMESTER_APP_AUTH=required") != null'
+          docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.base.digest"}}' \
+            | grep -Fx "$EXPECTED_BASE_IMAGE_DIGEST"
+          docker image inspect "$image" --format '{{index .Config.Labels "org.rentemester.runtime.bun.version"}}' \
+            | grep -Fx "$EXPECTED_BUN_VERSION"
           docker run --rm --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-            --tmpfs /workspace:rw,nosuid,size=64m \
-            --tmpfs /import:rw,nosuid,size=64m \
+            --tmpfs /workspace:rw,nosuid,size=64m,uid=1000,gid=1000 \
+            --tmpfs /import:rw,nosuid,size=64m,uid=1000,gid=1000 \
             -e RENTEMESTER_APP_AUTH=off \
             -e EXPECTED_VERSION \
             -e EXPECTED_COMMIT \
+            -e EXPECTED_BUN_VERSION \
+            -e EXPECTED_BASE_IMAGE_DIGEST \
             --entrypoint sh \
             "$image" \
             -c 'set -eu
                 test "$(id -u)" = 1000
+                test "$(bun --version)" = "$EXPECTED_BUN_VERSION"
                 bun run src/cli.ts --version | grep -F "rentemester $EXPECTED_VERSION commit $EXPECTED_COMMIT"
-                bun run src/cli.ts serve --workspace /workspace --host 127.0.0.1 --port 4319 >/tmp/server.log 2>&1 &
+                bun run src/cli.ts documents ingest --example >/tmp/documents-example.json
+                bun -e '\''const metadata=await Bun.file("/tmp/documents-example.json").json(); if(metadata.source!=="email"||metadata.currency!=="DKK"||typeof metadata.amountIncVat!=="number") throw new Error("documents ingest example invalid")'\''
+                bun run src/cli.ts serve --workspace /workspace --host 0.0.0.0 --port 4319 >/tmp/server.log 2>&1 &
                 server_pid=$!
                 trap "kill $server_pid 2>/dev/null || true" EXIT
-                bun -e '\''let health; for(let i=0;i<100;i++){try{const response=await fetch("http://127.0.0.1:4319/api/health"); if(response.ok){health=await response.json(); break}}catch{} await Bun.sleep(100)} if(!health) throw new Error("server did not become healthy"); if(health.build.version!==process.env.EXPECTED_VERSION||health.build.gitCommit!==process.env.EXPECTED_COMMIT) throw new Error("wrong build identity"); const html=await fetch("http://127.0.0.1:4319/").then(r=>{if(!r.ok) throw new Error(`cockpit index ${r.status}`); return r.text()}); const asset=/src="([^"]+\.js)"/.exec(html)?.[1]; if(!asset) throw new Error("cockpit asset missing"); const js=await fetch(`http://127.0.0.1:4319${asset}`).then(r=>r.text()); if(!js.includes(process.env.EXPECTED_VERSION)) throw new Error("cockpit version missing")'\'''
+                bun -e '\''const base="http://127.0.0.1:4319/"; let health; for(let i=0;i<100;i++){try{const response=await fetch(new URL("api/health",base)); if(response.ok){health=await response.json(); break}}catch{} await Bun.sleep(100)} if(!health) throw new Error("server did not become healthy"); if(health.build.version!==process.env.EXPECTED_VERSION||health.build.gitCommit!==process.env.EXPECTED_COMMIT||health.build.bunVersion!==process.env.EXPECTED_BUN_VERSION||health.build.baseImageDigest!==process.env.EXPECTED_BASE_IMAGE_DIGEST) throw new Error("wrong build identity"); const html=await fetch(base).then(r=>{if(!r.ok) throw new Error(`cockpit index ${r.status}`); return r.text()}); const asset=/src="([^"]+\.js)"/.exec(html)?.[1]; if(!asset) throw new Error("cockpit asset missing"); const js=await fetch(new URL(asset,base)).then(r=>{if(!r.ok) throw new Error(`cockpit asset ${r.status}`); return r.text()}); if(!js.includes(process.env.EXPECTED_VERSION)) throw new Error("cockpit version missing")'\'''
+
+      - name: Generate digest-bound Cockpit acceptance evidence
+        env:
+          COCKPIT_EVIDENCE_IMAGE: ${{ env.REGISTRY_IMAGE }}@${{ steps.image.outputs.digest }}
+          COCKPIT_EVIDENCE_COMMIT: ${{ steps.identity.outputs.commit }}
+          COCKPIT_EVIDENCE_OUT: cockpit-evidence
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth status
+          # --limit 1000 makes gh paginate all open issues; label relation is explicit.
+          gh issue list --repo "$GITHUB_REPOSITORY" --state open --label epic:648 --limit 1000 --json number,title,labels > cockpit-epic-648-open-issues.json
+          export COCKPIT_EVIDENCE_REGRESSION_QUERY="$PWD/cockpit-epic-648-open-issues.json"
+          bun run scripts/release/run-cockpit-evidence.ts
+          sha256sum "cockpit-evidence/cockpit-epic-648-open-issues.json" > "cockpit-evidence/cockpit-epic-648-open-issues.json.sha256"
+
+      - name: Extract digest-bound SPDX SBOM evidence
+        id: sbom
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY_IMAGE@$IMAGE_DIGEST"
+          docker buildx imagetools inspect "$image" --format '{{ json .SBOM }}' > sbom.spdx.json
+          bun -e 'const value=await Bun.file("sbom.spdx.json").json(); if(!value || typeof value!=="object" || Array.isArray(value)) throw new Error("published image has no object SBOM"); const sbom=value.SPDX??value; if(!sbom || typeof sbom!=="object" || Array.isArray(sbom)) throw new Error("published image has no SPDX document"); await Bun.write("sbom.spdx.json", `${JSON.stringify(sbom)}\n`)'
+          bun -e 'const sbom=await Bun.file("sbom.spdx.json").json(); const packages=Array.isArray(sbom.packages)?sbom.packages:[]; if(!packages.some(p=>p?.name==="pdfjs-dist"&&String(p?.versionInfo??"")==="6.2.108")) throw new Error("SBOM must contain pdfjs-dist@6.2.108")'
+          sha256sum sbom.spdx.json > sbom.spdx.json.sha256
+          echo "sha256=sha256:$(cut -d " " -f 1 sbom.spdx.json.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify packaged agent-discovery coverage identity
+        id: agent_discovery
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          EXPECTED_VERSION: ${{ steps.identity.outputs.version }}
+          EXPECTED_COMMIT: ${{ steps.identity.outputs.commit }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY_IMAGE@$IMAGE_DIGEST"
+          docker pull "$image"
+          docker run --rm --read-only \
+            -e RENTEMESTER_AGENT_DISCOVERY_IMAGE_DIGEST="$IMAGE_DIGEST" \
+            --entrypoint bun "$image" \
+            run src/agent-discovery-coverage-cli.ts > agent-discovery-coverage-report.json
+          bun -e '
+            const report=await Bun.file("agent-discovery-coverage-report.json").json();
+            if(report.ok!==true) throw new Error("packaged discovery gate is not green");
+            if(report.imageDigest!==process.env.IMAGE_DIGEST) throw new Error("coverage evidence is not bound to the image digest");
+            if(report.catalogue?.build?.version!==process.env.EXPECTED_VERSION) throw new Error("coverage evidence has the wrong version");
+            if(report.catalogue?.build?.gitCommit!==process.env.EXPECTED_COMMIT) throw new Error("coverage evidence has the wrong commit");
+          '
+          sha256sum agent-discovery-coverage-report.json > agent-discovery-coverage-report.json.sha256
+          echo "sha256=sha256:$(cut -d " " -f 1 agent-discovery-coverage-report.json.sha256)" >> "$GITHUB_OUTPUT"
 
       - name: Create digest-bound release manifest
         env:
@@ -174,7 +279,17 @@ jobs:
           RELEASE_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
           RENTEMESTER_GIT_COMMIT: ${{ steps.identity.outputs.commit }}
           RENTEMESTER_BUILT_AT: ${{ steps.identity.outputs.built_at }}
+          RENTEMESTER_BUN_VERSION: ${{ env.BUN_VERSION }}
+          RENTEMESTER_BASE_IMAGE_DIGEST: ${{ env.BUN_BASE_IMAGE_DIGEST }}
+          RELEASE_SBOM_SHA256: ${{ steps.sbom.outputs.sha256 }}
+          RELEASE_SUPPLY_CHAIN_SHA256: ${{ steps.supply_chain.outputs.sha256 }}
+          RELEASE_AGENT_DISCOVERY_SHA256: ${{ steps.agent_discovery.outputs.sha256 }}
         run: |
+          set -euo pipefail
+          test -f "cockpit-evidence/cockpit-evidence.json"
+          test -f "cockpit-evidence/cockpit-epic-648-open-issues.json"
+          export RELEASE_COCKPIT_EVIDENCE_SHA256="sha256:$(sha256sum "cockpit-evidence/cockpit-evidence.json" | cut -d " " -f 1)"
+          export RELEASE_COCKPIT_REGRESSION_QUERY_SHA256="sha256:$(sha256sum "cockpit-evidence/cockpit-epic-648-open-issues.json" | cut -d " " -f 1)"
           bun run scripts/release/create-manifest.ts > release-manifest.json
           sha256sum release-manifest.json > release-manifest.json.sha256
 
@@ -194,6 +309,16 @@ jobs:
           path: |
             release-manifest.json
             release-manifest.json.sha256
+            sbom.spdx.json
+            sbom.spdx.json.sha256
+            supply-chain-evidence.json
+            supply-chain-evidence.json.sha256
+            agent-discovery-coverage-report.json
+            agent-discovery-coverage-report.json.sha256
+            cockpit-evidence/cockpit-evidence.json
+            cockpit-evidence/*.png
+            cockpit-evidence/cockpit-epic-648-open-issues.json
+            cockpit-evidence/cockpit-epic-648-open-issues.json.sha256
             docs/release/digisense-approval.schema.json
           if-no-files-found: error
           retention-days: 90
@@ -213,6 +338,8 @@ jobs:
             echo "- Review status: **not reviewed by Digisense**"
             echo "- Candidate: \`$REGISTRY_IMAGE:$CANDIDATE_TAG\`"
             echo "- Immutable digest: \`$REGISTRY_IMAGE@$DIGEST\`"
+            echo "- SPDX SBOM: BuildKit OCI attestation bound to the immutable digest"
+            echo "- Supply chain: clean audit and approved licenses bound to bun.lock"
             echo
             echo "This candidate can be pulled and deployed before review. Pin the digest, not the tag:"
             echo
@@ -223,5 +350,5 @@ jobs:
             echo
             echo "Deploying it does not make it Digisense-approved. Approval later promotes these exact bytes without rebuilding."
             echo
-            echo "Download the release-candidate artifact and send the manifest digest plus image digest to Digisense."
+            echo "Download the release-candidate artifact and send the manifest digest, image digest, checked SPDX SBOM and supply-chain evidence to Digisense."
           } >> "$GITHUB_STEP_SUMMARY"

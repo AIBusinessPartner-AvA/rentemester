@@ -1,5 +1,9 @@
-import { writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { lstatSync, writeFileSync } from "node:fs";
 import { migrate } from "../core/db";
+import { insertAuditLog } from "../core/actor";
+import { inspectLedger, inspectOpenLedger, inspectSchemaViews, openLedgerReadOnly, repairCanonicalSchemaViews, type LedgerInspection } from "../core/ledger-inspection";
+import { companyPaths } from "../core/paths";
 import {
   createSystemBackup,
   exportBackupPublicKey,
@@ -18,7 +22,7 @@ import {
   removeBackupDestination,
   verifyRemoteBackupPlacement,
 } from "../core/backup-governance";
-import type { RemoteBackupProviderAdapter } from "../core/backup-remote-provider";
+import { defaultRemoteBackupProviderResolver, type RemoteBackupProviderAdapter } from "../core/backup-remote-provider";
 import { renderBackupGuide } from "../core/backup-guide";
 import { getCompanySettings } from "../core/company";
 import { exportAuthorityPackage } from "../core/authority-export";
@@ -26,6 +30,7 @@ import { exportSaftPackage } from "../core/saft-export";
 import { openCommandDb } from "../cli-dispatch";
 import type { CommandContext, CommandDispatch } from "../cli-dispatch";
 import { emitHumanReport } from "../cli-format";
+import { checkActorAllowlist } from "../cli-actor";
 
 function requireBool(ctx: CommandContext, flag: string): boolean {
   const value = ctx.arg(flag);
@@ -49,6 +54,30 @@ function resolveActorId(ctx: CommandContext): string | undefined {
     ctx.inferredMutationActor() ??
     undefined
   );
+}
+
+function inspectionError(
+  inspection: Exclude<LedgerInspection, { status: "current" }>,
+): string {
+  if (inspection.status === "pending") {
+    return `schema_outdated: current=${inspection.currentVersion} required=${inspection.requiredVersion}`;
+  }
+  return inspection.error;
+}
+
+/**
+ * `openDb` deliberately rejects a mismatched migration history before a
+ * writable handle exists. `system migrate --apply yes` needs to inspect that
+ * same state under its write lock so it can report a structured no-write
+ * rejection instead.
+ */
+function openExistingMigrationDb(path: string): Database {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) throw new Error("ledger must not be a symbolic link");
+  if (!stat.isFile()) throw new Error("ledger must be a regular file");
+  const db = new Database(path);
+  db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;");
+  return db;
 }
 
 // A placement record names who placed the backup (a human pressing the
@@ -97,6 +126,148 @@ function runExportPackage(
 }
 
 export function register(dispatch: CommandDispatch, remoteProviderAdapter?: RemoteBackupProviderAdapter): void {
+  dispatch.on("system", "migrate", (ctx) => {
+    const apply = ctx.arg("--apply");
+    if (apply !== undefined && apply !== "yes") ctx.fatal("--apply must be exactly yes");
+    if (apply === undefined) {
+      const p = companyPaths(ctx.companyRoot());
+      const before = inspectLedger(p.db);
+      if (before.status === "pending") {
+        ctx.emitResult({
+          ok: true,
+          errors: [],
+          action: "migration_required",
+          wouldMigrate: true,
+          schema_outdated: true,
+          schema: before,
+        });
+      } else if (before.status === "current") {
+        ctx.emitResult({
+          ok: true,
+          errors: [],
+          action: "none",
+          wouldMigrate: false,
+          schema_outdated: false,
+          schema: before,
+        });
+      } else {
+        ctx.emitResult({ ok: false, errors: [inspectionError(before)], schema: before });
+      }
+      return;
+    }
+    const actor = ctx.cliActor ?? ctx.inferredMutationActor();
+    if (!actor) ctx.fatal("actor required for mutations");
+    const dbPath = companyPaths(ctx.companyRoot()).db;
+    let db: Database;
+    try {
+      db = openExistingMigrationDb(dbPath);
+    } catch (error) {
+      const schema = inspectLedger(dbPath);
+      const message = schema.status === "current"
+        ? (error instanceof Error ? error.message : String(error))
+        : inspectionError(schema);
+      ctx.emitResult({ ok: false, errors: [message], schema });
+      return;
+    }
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const locked = inspectOpenLedger(db);
+      if (locked.status !== "pending") {
+        if (locked.status === "current") {
+          db.exec("COMMIT");
+          ctx.emitResult({ ok: true, migrated: false, schema: locked });
+        } else {
+          db.exec("ROLLBACK");
+          ctx.emitResult({ ok: false, errors: [inspectionError(locked)], schema: locked });
+        }
+        return;
+      }
+      const from = locked.currentVersion;
+      try {
+        migrate(db);
+        const after = inspectOpenLedger(db);
+        if (after.status !== "current") {
+          throw new Error(`schema migration did not reach current state: ${inspectionError(after)}`);
+        }
+        insertAuditLog(db, {
+          eventType: "schema_migrated",
+          entityType: "schema",
+          entityId: String(from),
+          message: `Schema migrated from ${from} to ${after.currentVersion}`,
+          createdBy: actor,
+          createdByProgram: ctx.cliActorVia ?? "rentemester-cli",
+        });
+        db.exec("COMMIT");
+        ctx.emitResult({ ok: true, migrated: true, from, to: after.currentVersion, schema: after });
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  dispatch.on("system", "repair-schema-views", (ctx) => {
+    const apply = ctx.arg("--apply");
+    if (apply !== undefined && apply !== "yes") ctx.fatal("--apply must be exactly yes");
+    const reason = ctx.trimToNull(ctx.arg("--reason"));
+    if (apply === "yes" && (!reason || reason.length > 1000)) ctx.fatal("--reason is required and must contain 1 through 1000 characters");
+    const dbPath = companyPaths(ctx.companyRoot()).db;
+    if (apply === undefined) {
+      const schema = inspectLedger(dbPath);
+      if (schema.status !== "current" && schema.status !== "corrupt") {
+        ctx.emitResult({ ok: false, errors: [inspectionError(schema)], schema });
+        return;
+      }
+      let db: Database | undefined;
+      try {
+        db = openLedgerReadOnly(dbPath);
+        const views = inspectSchemaViews(db);
+        if (!views.ok) ctx.emitResult({ ok: true, errors: [], action: "repair_schema_views", wouldRepair: true, views });
+        else ctx.emitResult({ ok: true, errors: [], action: "repair_schema_views", wouldRepair: false, schema, views });
+      } catch (error) {
+        ctx.emitResult({ ok: false, errors: [error instanceof Error ? error.message : String(error)] });
+      } finally { db?.close(); }
+      return;
+    }
+    const actor = resolveActorId(ctx) ?? ctx.fatal("actor required for mutations");
+    const actorDecision = checkActorAllowlist(ctx.companyRoot(), actor);
+    if (!actorDecision.allowed) ctx.fatal(actorDecision.reason);
+    const db = openExistingMigrationDb(dbPath);
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const locked = inspectOpenLedger(db);
+      const views = inspectSchemaViews(db);
+      if (locked.status !== "current" && (locked.status !== "corrupt" || !locked.error.startsWith("SCHEMA_VIEW_DRIFT:"))) {
+        db.exec("ROLLBACK");
+        ctx.emitResult({ ok: false, errors: [inspectionError(locked)], schema: locked, views });
+        return;
+      }
+      if (views.ok) {
+        db.exec("COMMIT");
+        ctx.emitResult({ ok: true, repaired: false, action: "none", views });
+        return;
+      }
+      const before = views;
+      const after = repairCanonicalSchemaViews(db);
+      if (!after.ok) throw new Error(`canonical schema view repair failed: ${after.errors.join("; ")}`);
+      insertAuditLog(db, {
+        eventType: "schema_views_repaired",
+        entityType: "schema_views",
+        entityId: before.affectedNames.join(","),
+        message: JSON.stringify({ reason: reason!, affectedNames: before.affectedNames, beforeCatalogueDigest: before.catalogueDigest, beforeActualDigest: before.actualDigest, afterCatalogueDigest: after.catalogueDigest, afterActualDigest: after.actualDigest }),
+        createdBy: actor,
+        createdByProgram: ctx.cliActorVia ?? "rentemester-cli",
+      });
+      db.exec("COMMIT");
+      ctx.emitResult({ ok: true, repaired: true, affectedNames: before.affectedNames, before, after });
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* transaction already closed */ }
+      throw error;
+    } finally { db.close(); }
+  });
+
   dispatch.on("system", "backup", (ctx) => {
     const db = openCommandDb(ctx);
     migrate(db);
@@ -234,19 +405,14 @@ export function register(dispatch: CommandDispatch, remoteProviderAdapter?: Remo
   dispatch.on("system", "backup-verify-remote-placement", async (ctx) => {
     const destination = ctx.arg("--destination");
     const backupId = ctx.arg("--backup-id");
-    const sha256 = ctx.arg("--archive-sha256");
-    const provider = ctx.arg("--remote-provider");
     const objectId = ctx.arg("--remote-object-id");
-    const objectName = ctx.arg("--remote-object-name");
-    const parentId = ctx.arg("--remote-parent-id");
-    if (!destination || !backupId || !sha256 || !provider || !objectId || !objectName || !parentId) {
-      console.error("Missing required destination, backup, archive, or remote object identity flags");
+    if (!destination || !backupId || !objectId) {
+      console.error("Missing required --destination, --backup-id, or --remote-object-id");
       process.exit(2);
     }
-    const size = ctx.parseOptionalNumber("--archive-size");
     const metadataAge = ctx.parseOptionalNumber("--max-metadata-age-ms");
-    if (!size.ok || !metadataAge.ok || size.value === undefined) {
-      console.error(!size.ok ? size.error : !metadataAge.ok ? metadataAge.error : "Missing required --archive-size <bytes>");
+    if (!metadataAge.ok) {
+      console.error(metadataAge.error);
       process.exit(2);
     }
     const { actor, actorKind } = placementActor(ctx);
@@ -255,22 +421,13 @@ export function register(dispatch: CommandDispatch, remoteProviderAdapter?: Remo
     const result = await verifyRemoteBackupPlacement(db, ctx.companyRoot(), {
       destinationId: destination,
       backupId,
-      archiveSha256: sha256,
-      archiveSizeBytes: size.value,
-      expectedRemoteObject: {
-        provider,
-        objectId,
-        name: objectName,
-        parentId,
-        sizeBytes: size.value,
-        checksumSha256: sha256,
-      },
+      remoteObjectId: objectId,
       actor,
       actorKind,
       at: ctx.arg("--at"),
       note: ctx.arg("--note"),
       maxMetadataAgeMs: metadataAge.value,
-    }, remoteProviderAdapter);
+    }, remoteProviderAdapter ?? defaultRemoteBackupProviderResolver().resolve(ctx.companyRoot(), "google-drive"));
     ctx.emitResult(result as Record<string, unknown>);
     db.close();
   });

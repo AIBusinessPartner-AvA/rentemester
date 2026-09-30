@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "bun:test";
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { VatView } from "./VatView";
@@ -8,6 +8,8 @@ import { vat, vatNotRegistered, mockFetch } from "../test/fixtures";
 function route(over = {}) {
   return {
     "GET /api/companies/acme-aps/vat": { vat: vat(over) },
+    "GET /api/companies/acme-aps/periods/close-readiness": { packet: { hash: "a".repeat(64), blockers: 0, warnings: 0, items: [] } },
+    "POST /api/companies/acme-aps/periods/close-review": { review: { id: 1, packet: { hash: "a".repeat(64), blockers: 0, warnings: 0, items: [] } } },
   };
 }
 
@@ -19,6 +21,28 @@ function renderView() {
 }
 
 describe("VatView — Moms", () => {
+  test("keeps the close-readiness summary as the natural keyboard core action", async () => {
+    mockFetch(route());
+    renderView();
+
+    const summary = await screen.findByText("Gennemgå momsparathed");
+    const details = summary.closest("details")!;
+    expect(summary.tagName).toBe("SUMMARY");
+    expect(summary).toHaveAttribute("data-evidence-core-action");
+    expect(details).toHaveAttribute("data-evidence-progressive");
+    expect(details).not.toHaveAttribute("data-evidence-core-action");
+    expect(details).not.toHaveAttribute("open");
+
+    const user = userEvent.setup();
+    for (let tabs = 0; tabs < 20 && document.activeElement !== summary; tabs++)
+      await user.tab();
+    expect(document.activeElement).toBe(summary);
+
+    await user.click(summary);
+    expect((details as HTMLDetailsElement).open).toBe(true);
+    expect(screen.getByText("Se lukkegrundlag")).toBeVisible();
+  });
+
   test("shows the output, input and payable VAT figures", async () => {
     mockFetch(route());
     renderView();
@@ -26,7 +50,7 @@ describe("VatView — Moms", () => {
       await screen.findByRole("heading", { name: "Acme ApS" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Salgsmoms (udgående moms)"),
+      screen.getByText("Udgående moms før tab (kontrol)"),
     ).toBeInTheDocument();
     expect(
       screen.getByText("Købsmoms (indgående moms)"),
@@ -56,10 +80,10 @@ describe("VatView — Moms", () => {
     // The foreign-trade rubrics the static figures lacked are now present.
     expect(screen.getByText("Salgsmoms")).toBeInTheDocument();
     expect(
-      screen.getByText(/Rubrik A — varer og ydelser købt i udlandet/),
+      screen.getByText(/Rubrik A — varer købt i EU/),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/Rubrik B — varer og ydelser solgt til udlandet/),
+      screen.getByText(/Rubrik B — varer \/ EU-salg uden moms/),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/Rubrik C — øvrige momsfrie salg/),
@@ -69,10 +93,10 @@ describe("VatView — Moms", () => {
         /Moms af ydelseskøb i udlandet med omvendt betalingspligt/,
       ),
     ).toBeInTheDocument();
-    // The momstilsvar row carries the filing figure.
-    const tilsvar = screen.getByText("Momstilsvar").closest("tr")!;
+    // The statutory total row carries the filing figure.
+    const tilsvar = screen.getByText("Moms i alt").closest("tr")!;
     expect(
-      within(tilsvar as HTMLElement).getByText(/3\.621,00/),
+      within(tilsvar as HTMLElement).getByText(/3\.371,00/),
     ).toBeInTheDocument();
   });
 
@@ -107,8 +131,8 @@ describe("VatView — Moms", () => {
 
   // #271: a bad-debt write-off books a debit on the output-VAT account. The
   // VAT card must surface that relief on its own clearly-labelled line —
-  // never let it drag the headline salgsmoms negative.
-  test("a bad-debt adjustment is its own line, salgsmoms stays positive", async () => {
+  // never let it drag the output-VAT control headline negative.
+  test("a bad-debt adjustment is its own line, output-VAT control stays positive", async () => {
     mockFetch(
       route({
         outputVat: 250,
@@ -118,14 +142,14 @@ describe("VatView — Moms", () => {
       }),
     );
     renderView();
-    // Salgsmoms keeps the genuine, positive VAT on sales.
+    // The gross output-VAT control remains positive before the relief.
     const salgsmomsRow = (
-      await screen.findByText("Salgsmoms (udgående moms)")
+      await screen.findByText("Udgående moms før tab (kontrol)")
     ).closest("tr")!;
     expect(
       within(salgsmomsRow as HTMLElement).getByText(/250,00/),
     ).toBeInTheDocument();
-    // It is NOT shown as a confusing negative salgsmoms.
+    // It is NOT shown as a confusing negative output-VAT control amount.
     expect(
       within(salgsmomsRow as HTMLElement).queryByText(/-250,00/),
     ).not.toBeInTheDocument();
@@ -141,7 +165,7 @@ describe("VatView — Moms", () => {
   test("no adjustment line is shown when there is no bad-debt write-off", async () => {
     mockFetch(route({ outputVatAdjustment: 0 }));
     renderView();
-    await screen.findByText("Salgsmoms (udgående moms)");
+    await screen.findByText("Udgående moms før tab (kontrol)");
     expect(
       screen.queryByText(/Regulering for tab på debitorer/),
     ).not.toBeInTheDocument();
@@ -272,8 +296,8 @@ describe("VatView — Moms", () => {
     expect(card.textContent ?? "").not.toMatch(/vat momsangivelse/i);
     expect(card.textContent ?? "").not.toMatch(/i terminalen/i);
     // The replacement text reassures the owner without jargon.
-    expect(card.textContent ?? "").toMatch(/skat\.dk/i);
-    expect(card.textContent ?? "").toMatch(/TastSelv Erhverv/i);
+    expect(card.textContent ?? "").toMatch(/TastSelv-formens rækkefølge/i);
+    expect(card.textContent ?? "").toMatch(/hele kroner/i);
   });
 
   test("rubrics explanation does not leak CLI jargon (open period)", async () => {
@@ -394,9 +418,8 @@ describe("VatView — Moms", () => {
       value: { writeText },
     });
     renderView();
-    // The Salgsmoms row's Kopier-button copies the raw integer (52317 kr in
-    // the fixture closed-period vat() — momstilsvar is 3621, salgsmoms 5621
-    // — we read the actual fixture's salgsmoms below).
+    // The filing Salgsmoms row's Kopier-button copies the raw TastSelv amount;
+    // use the fixture's actual canonical projection below.
     const salgsmomsRow = (
       await screen.findByText(/^Salgsmoms$/)
     ).closest("tr")!;
@@ -456,7 +479,7 @@ describe("VatView — Moms", () => {
     // Semicolon-separated label;beløb pairs, one per line — no thousand
     // separators, no "kr." suffix in the numeric column.
     expect(pasted).toMatch(/Salgsmoms;/);
-    expect(pasted).toMatch(/Momstilsvar;/);
+    expect(pasted).toMatch(/Moms i alt;/);
     expect(pasted).toMatch(/Rubrik A/);
     // No tusindtalsseparator-punktum and no "kr." anywhere in the CSV.
     expect(pasted).not.toMatch(/\./);

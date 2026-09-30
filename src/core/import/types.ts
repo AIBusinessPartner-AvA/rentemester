@@ -103,6 +103,20 @@ export type ImportHistoricalEntry = {
 };
 
 /**
+ * An aggregate debtor/creditor control balance carried by the source without
+ * a structured item schedule. It is evidence only: the framework must never
+ * turn it into a native invoice, payable, customer, vendor, or journal.
+ */
+export type ImportOpenItemControlBalance = {
+  accountNo: string;
+  kind: "receivable" | "payable";
+  /** Unsigned balance in kroner. */
+  amount: number;
+  /** Export-relative source reference, e.g. `2026/SaldoBalance.csv`. */
+  sourceReference: string;
+};
+
+/**
  * The normalised intermediate representation. This is the single hand-off
  * point between a per-system parser and the framework: parsers produce it,
  * the framework consumes it.
@@ -120,6 +134,10 @@ export type ImportSource = {
   openingBalances: ImportOpeningBalanceLine[];
   /** Optional historical entries — captured but not posted by `runImport`. */
   historicalEntries?: ImportHistoricalEntry[];
+  /** Aggregate open-item controls when the source has no item-level schedule. */
+  openItemControlBalances?: ImportOpenItemControlBalance[];
+  /** Explicit, versioned item-level receivable schedule. Never inferred from postings. */
+  importedReceivableSchedule?: import("../imported-receivables").ImportedReceivableSchedule;
   /** Optional company master data (name, CVR, ...) from the export. */
   companyMasterData?: ImportCompanyMasterData;
   /**
@@ -165,6 +183,8 @@ export type ImportArtifact = {
 export type MultiArtifactSource = {
   rootDir: string;
   files: Record<string, ImportArtifact>;
+  /** Immutable, canonical evidence for the exact resolved input. */
+  sourceEvidence: SourceEvidence;
   /**
    * Present for a ZIP source after its complete archive listing and extraction
    * have been verified. The three counts must agree before parsing can begin.
@@ -180,6 +200,36 @@ export type ArchiveIntegrityEvidence = {
   importedEntryCount: number;
   archiveListingSha256: string;
   extractedManifestSha256: string;
+};
+
+/** One canonical file record in a resolved import source. */
+export type SourceEvidenceEntry = {
+  path: string;
+  size: number;
+  sha256: string;
+};
+
+/**
+ * Immutable evidence for a resolved import source. ZIP raw bytes are recorded
+ * only for ZIP inputs; directory and file inputs deliberately expose only
+ * their canonical file inventory.
+ */
+export type SourceEvidence = {
+  sourceKind: "zip" | "directory" | "file";
+  canonicalInventorySha256: string;
+  entries: SourceEvidenceEntry[];
+  importedEntryCount: number;
+  totalUncompressedBytes: number;
+  /** Present only for a ZIP's private immutable snapshot. */
+  rawSha256?: string;
+  /** Present only for a ZIP's private immutable snapshot. */
+  rawSize?: number;
+  /** Present only for ZIP file entries after strict path normalization. */
+  canonicalListingSha256?: string;
+  /** Present only for ZIP file entries after strict path normalization. */
+  listingEntryCount?: number;
+  /** Present only for ZIP sources. */
+  extractedEntryCount?: number;
 };
 
 /**
@@ -319,6 +369,12 @@ export type ImportResult = {
     unmatchedCount: number;
     duplicateCount: number;
     unbookedCount: number;
+  };
+  /** Aggregate balances preserved without claiming item-level allocation. */
+  migrationOpenItems?: {
+    batchCount: number;
+    receivableAmount: number;
+    payableAmount: number;
   };
   /** ZIP archive evidence, when the source was a verified ZIP export. */
   archiveIntegrity?: ArchiveIntegrityEvidence;

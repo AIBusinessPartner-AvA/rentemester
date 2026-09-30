@@ -17,6 +17,8 @@ export type BuildIdentity = {
   version: string;
   gitCommit: string | null;
   builtAt: string | null;
+  bunVersion: string | null;
+  baseImageDigest: string | null;
 };
 
 export type HealthResponse = {
@@ -30,6 +32,7 @@ export type HealthResponse = {
   };
   workspace: string;
   authRequired: boolean;
+  deploymentProfile?: "local" | "local-container" | "hosted";
 };
 
 /**
@@ -65,6 +68,15 @@ export type StatementCompany = {
   currency: string;
   fiscalYearStartMonth: number | string;
   fiscalYearLabelStrategy: string;
+};
+
+export type DataCoverage = {
+  kind: "current" | "historical" | "scenario" | "incomplete" | "final";
+  label: "Aktuel bogføring" | "Historisk kilde" | "Scenarie" | "Ufuldstændigt grundlag" | "Endelig/låst";
+  asOfDate: string | null;
+  comparison: "available" | "not_comparable";
+  provenance: "native" | "imported" | "archived" | "scenario";
+  details: string[];
 };
 
 /** The three VAT settlement cadences a Danish company can be registered for. */

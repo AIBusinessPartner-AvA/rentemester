@@ -5,6 +5,8 @@
 import type { FiscalYearEntry, StatementCompany } from "./common";
 
 export type JournalLine = {
+  /** Immutable ledger id used only to resolve its append-only dimension history. */
+  journalLineId: number | null;
   accountNo: string;
   accountName: string;
   debit: number;
@@ -28,6 +30,7 @@ export type JournalEntry = {
   documentId: number | null;
   /** The linked document's `document_no` for display next to the link. */
   documentNo: string | null;
+  partyId?: string | null;
 };
 
 export type CompanyJournal = {

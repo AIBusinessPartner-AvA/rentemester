@@ -1,12 +1,15 @@
 // Tests: src/mcp/server.ts, src/mcp/tools (MCP server end-to-end)
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { ensureCompanyDirs } from "../../src/core/paths";
+import { companyPaths, ensureCompanyDirs } from "../../src/core/paths";
 import { openDb, migrate } from "../../src/core/db";
 import { seedAccounts } from "../../src/core/ledger";
 import { ensureEd25519Keypair } from "../../src/core/system-backups";
+import { createCompany } from "../../src/core/company";
+import { companyRootForSlug, initWorkspace } from "../../src/core/workspace";
 
 /**
  * Integration-test for MCP-server-scaffolden (#77).
@@ -39,11 +42,12 @@ class StdioMcpClient {
   private buffer = "";
   private nextId = 1;
 
-  constructor() {
+  constructor(env: Record<string, string | undefined> = process.env) {
     this.proc = Bun.spawn(["bun", SERVER_PATH], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
+      env: { ...env, RENTEMESTER_MCP_PROFILE: env.RENTEMESTER_MCP_PROFILE ?? "full" },
     });
     this.stdoutReader = this.proc.stdout.getReader();
   }
@@ -194,6 +198,31 @@ describe("MCP server scaffold", () => {
     expect(structured?.errors?.some((message: string) => message.includes("confirm: true required"))).toBe(true);
   });
 
+  test("efaktura_send rejects a caller-supplied accessPoint before handling", async () => {
+    const response = await client.send("tools/call", {
+      name: "efaktura_send",
+      arguments: {
+        company: companyRoot,
+        documentId: 1,
+        accessPoint: "caller-controlled",
+        confirm: true,
+      },
+    });
+    expect(response.error).toBeUndefined();
+    expect(response.result?.structuredContent?.ok).toBe(false);
+    expect(response.result?.structuredContent?.errors.join(" ")).toContain("accessPoint is not allowed");
+  });
+
+  test("efaktura_status is a confirmed write and rejects before network access", async () => {
+    const response = await client.send("tools/call", {
+      name: "efaktura_status",
+      arguments: { company: companyRoot, documentId: 1, confirm: false },
+    });
+    expect(response.error).toBeUndefined();
+    expect(response.result?.structuredContent?.ok).toBe(false);
+    expect(response.result?.structuredContent?.errors.join(" ")).toContain("confirm: true");
+  });
+
   test("the opt-in backup lock blocks a bookkeeping write tool over MCP but exempts system_backup", async () => {
     const lockedRoot = mkdtempSync(join(tmpdir(), "mcp-lock-company-"));
     try {
@@ -220,6 +249,30 @@ describe("MCP server scaffold", () => {
         arguments: { company: lockedRoot, enforced: true, graceDays: 0, confirm: true },
       });
       expect(lockResp.result?.structuredContent?.ok).toBe(true);
+
+      // Confirm is the first company-write gate after MCP service
+      // authorization. A missing confirm must not probe the backup lock or
+      // open the company database, otherwise a caller gets BACKUP_LOCKED
+      // instead of the documented CONFIRM_REQUIRED envelope.
+      const unconfirmed = await client.send("tools/call", {
+        name: "journal_post",
+        arguments: {
+          company: lockedRoot,
+          payload: {
+            transactionDate: "2026-05-18",
+            text: "Must stop at confirm",
+            lines: [
+              { accountNo: "2000", debitAmount: 100 },
+              { accountNo: "1000", creditAmount: 100 },
+            ],
+          },
+          confirm: false,
+        },
+      });
+      const unconfirmedStructured = unconfirmed.result?.structuredContent;
+      expect(unconfirmedStructured?.ok).toBe(false);
+      expect(unconfirmedStructured?.code).toBe("CONFIRM_REQUIRED");
+      expect(unconfirmedStructured?.code).not.toBe("BACKUP_LOCKED");
 
       // A bookkeeping write tool is refused — the lock holds on the agent surface.
       const blocked = await client.send("tools/call", {
@@ -386,6 +439,38 @@ describe("MCP tools full surface (#78)", () => {
     });
   });
 
+  test("#571 accepts a mixed simplified purchase invoice through the MCP metadata contract", async () => {
+    const filePath = join(companyRoot, "simplified-mixed-571.txt");
+    writeFileSync(filePath, "Synthetic simplified invoice with mixed VAT lines\n");
+    const ingest = await client.send("tools/call", {
+      name: "documents_ingest",
+      arguments: {
+        company: companyRoot,
+        filePath,
+        metadata: {
+          source: "mcp-test",
+          documentType: "purchase_sale",
+          issueDate: "2026-08-21",
+          invoiceNo: "SYN-MCP-571",
+          deliveryDescription: "Synthetic mixed purchase",
+          amountIncVat: 225,
+          currency: "DKK",
+          sender: { name: "Synthetic Supplier ApS", address: "Supplier Street 1", vatOrCvr: "DK11223344" },
+          recipient: { name: "Printed Individual", address: "Personal Street 2" },
+          vatAmount: 25,
+          purchaseVatLines: [
+            { classification: "dk_purchase_25", netAmount: 100, vatAmount: 25 },
+            { classification: "exempt", netAmount: 100, vatAmount: 0 },
+          ],
+          danishSimplifiedPurchaseInvoice: true,
+        },
+        confirm: true,
+      },
+    });
+    expect(ingest.error).toBeUndefined();
+    expect(ingest.result?.structuredContent).toMatchObject({ ok: true });
+  });
+
   test("bank_list on a fresh company returns empty result set", async () => {
     const response = await client.send("tools/call", {
       name: "bank_list",
@@ -444,6 +529,71 @@ describe("MCP tools full surface (#78)", () => {
     const structured = response.result?.structuredContent;
     expect(structured?.ok).toBe(true);
     expect(structured?.data?.ok).toBe(true);
+  });
+
+  test("system_healthcheck reports data.ok=false when required paths are missing", async () => {
+    const response = await client.send("tools/call", {
+      name: "system_healthcheck",
+      arguments: { company: join(companyRoot, "missing-company-root") },
+    });
+    const structured = response.result?.structuredContent;
+    expect(structured?.ok).toBe(false);
+    expect(structured?.data?.ok).toBe(false);
+    expect(structured?.data?.missing).toContain("company_root");
+  });
+
+  test("system_healthcheck has read-only slug/path parity for a pending ledger", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "mcp-health-workspace-"));
+    let isolatedClient: StdioMcpClient | undefined;
+    try {
+      initWorkspace(workspace);
+      const created = createCompany(workspace, {
+        name: "MCP Pending Example",
+        onboardingActor: "user:tester",
+      });
+      const company = companyRootForSlug(workspace, created.slug);
+      const ledger = companyPaths(company).db;
+      const db = openDb(ledger);
+      db.run("DELETE FROM schema_migrations WHERE id > 10");
+      db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+      db.close();
+      const identity = () => ({
+        entries: readdirSync(dirname(ledger)).sort(),
+        sha256: createHash("sha256").update(readFileSync(ledger)).digest("hex"),
+      });
+      const before = identity();
+
+      isolatedClient = new StdioMcpClient({ ...process.env, RENTEMESTER_WORKSPACE: workspace });
+      await isolatedClient.send("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "rentemester-health-test", version: "0.0.1" },
+      });
+      await isolatedClient.notify("notifications/initialized");
+
+      const bySlug = await isolatedClient.send("tools/call", {
+        name: "system_healthcheck",
+        arguments: { company: created.slug },
+      });
+      const byPath = await isolatedClient.send("tools/call", {
+        name: "system_healthcheck",
+        arguments: { company },
+      });
+      for (const response of [bySlug, byPath]) {
+        expect(response.result?.structuredContent).toMatchObject({
+          ok: false,
+          data: {
+            schema_outdated: true,
+            schema: { status: "pending", currentVersion: 10 },
+          },
+        });
+      }
+      expect(bySlug.result?.structuredContent).toEqual(byPath.result?.structuredContent);
+      expect(identity()).toEqual(before);
+    } finally {
+      await isolatedClient?.close();
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
   test("retention_status returns ok envelope", async () => {

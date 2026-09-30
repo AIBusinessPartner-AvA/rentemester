@@ -51,11 +51,11 @@ rollbackstrategi.
 
 ## Versions- og image-tags
 
-- Kandidat: `candidate-v0.1.0-<commit>-<workflow-run>-<attempt>`.
-- Godkendt image: `ghcr.io/mikkelkrogsholm/rentemester:v0.1.0`.
+- Kandidat: `candidate-v0.2.0-<commit>-<workflow-run>-<attempt>`.
+- Godkendt image: `ghcr.io/mikkelkrogsholm/rentemester:v0.2.0`.
 - Uforanderlig driftsreference:
   `ghcr.io/mikkelkrogsholm/rentemester@sha256:<digest>`.
-- Git/GitHub release-tag: `v0.1.0`.
+- Git/GitHub release-tag: `v0.2.0`.
 
 Kandidatworkflowet giver hvert run sit eget tag og afviser genbrug af det i
 workflowet. GHCR håndhæver ikke tag-immutabilitet over for alle fremtidige
@@ -76,9 +76,17 @@ rentemester --version
 curl http://127.0.0.1:4319/api/health
 ```
 
-MCP-klienter bruger `meta_about`. Health/MCP viser produktversion, commit,
+MCP-klienter starter i compact-profilen med `system_server_about`; det
+bagudkompatible full-profilnavn `meta_about` bevares. Health/MCP viser
+produktversion, commit,
 buildtid, schema-version/baseline-checksum og `rules.digest`. Lokale source-runs
 har med vilje `null` for commit og buildtid; officielle images har begge dele.
+
+Schema-kompatibilitet kontrolleres uden mutation af `system healthcheck`,
+`system_healthcheck` og `/api/ready`. `/api/health` er alene liveness og
+forbliver derfor 200, selv når readiness afviser en ventende eller korrupt
+registreret ledger. Kun den actor-gatede CLI-kommando `system migrate --apply
+yes` må opgradere schemaet; MCP har med vilje ingen migrations-tool.
 
 Backups, myndighedspakker og SAF-T-pakker har `manifestVersion: 2` og samme
 `provenance`-blok. Ældre backupmanifests uden feltet læses fortsat som v1.

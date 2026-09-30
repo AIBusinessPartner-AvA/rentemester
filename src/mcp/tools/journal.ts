@@ -14,16 +14,17 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
-  postJournalEntry,
-  reverseJournalEntry,
+  postJournalEntryInCurrentTransaction,
+  reverseJournalEntryInCurrentTransaction,
   dryRunJournalEntry,
   type JournalEntryInput,
 } from "../../core/ledger";
 import { withActor } from "../actor";
 import { envelopeShape, errorEnvelope, successEnvelope, wrapCoreResult } from "../envelope";
-import { withCompanyDb, withCompanyDbConfirmed, resolveJournalEntryId, confirmField } from "../tool-runtime";
+import { withCompanyDb, withCompanyDbConfirmed, resolveJournalEntryId, confirmField, idempotencyKeyField } from "../tool-runtime";
 import { applyPagination, paginationFields, paginationDescriptionSuffix } from "../pagination";
 import { isValidIsoDate } from "../../core/dates";
+import { explainJournalEntry } from "../../core/journal-explanation";
 
 const lineSchema = z.object({
   accountNo: z
@@ -109,6 +110,13 @@ const payloadSchema = z.object({
 });
 
 export function registerJournalTools(server: McpServer): void {
+  server.registerTool("journal_explain", {
+    title: "Explain journal entry",
+    description: "Read-only forklaring af én postering fra eksplicitte journal-, bilags-, bank-, part-, konto- og regelrelationer. Fraværende lovkilde eller faglig vurdering angives eksplicit; interne regler præsenteres ikke som lov.",
+    inputSchema: { company: z.string().min(1), entryId: z.number().int().positive() }, outputSchema: envelopeShape,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, withCompanyDb<{ company: string; entryId: number }>(server, ({ db, args }) => wrapCoreResult(explainJournalEntry(db, args.entryId))));
+
   server.registerTool(
     "journal_post",
     {
@@ -126,6 +134,7 @@ export function registerJournalTools(server: McpServer): void {
         company: z.string().min(1, "company path is required"),
         payload: payloadSchema,
         confirm: confirmField,
+        idempotencyKey: idempotencyKeyField,
       },
       outputSchema: envelopeShape,
       annotations: {
@@ -143,10 +152,11 @@ export function registerJournalTools(server: McpServer): void {
       company: string;
       payload: z.infer<typeof payloadSchema>;
       confirm?: boolean;
+      idempotencyKey?: string;
     }>(server, "journal_post", ({ db, actor, args }) => {
       const entry: JournalEntryInput = withActor(args.payload as JournalEntryInput, actor);
-      return wrapCoreResult(postJournalEntry(db, entry));
-    }),
+      return wrapCoreResult(postJournalEntryInCurrentTransaction(db, entry));
+    }, { keyIdempotent: "journal_post" }),
   );
 
   server.registerTool(
@@ -241,6 +251,7 @@ export function registerJournalTools(server: McpServer): void {
           .min(1, "reason is required")
           .describe("Human-readable reason for the reversal, recorded on the counter-entry."),
         confirm: confirmField,
+        idempotencyKey: idempotencyKeyField,
       },
       outputSchema: envelopeShape,
       annotations: {
@@ -260,6 +271,7 @@ export function registerJournalTools(server: McpServer): void {
       date: string;
       reason: string;
       confirm?: boolean;
+      idempotencyKey?: string;
     }>(server, "journal_reverse", ({ db, args, actor }) => {
       const id = resolveJournalEntryId(db, args);
       if (!id) {
@@ -267,7 +279,7 @@ export function registerJournalTools(server: McpServer): void {
           "Could not resolve journal entry: provide entryId, entryNo or matchText (with optional matchDate/matchDocumentId)",
         );
       }
-      const result = reverseJournalEntry(db, {
+      const result = reverseJournalEntryInCurrentTransaction(db, {
         entryId: id,
         transactionDate: args.date,
         reason: args.reason,
@@ -275,7 +287,7 @@ export function registerJournalTools(server: McpServer): void {
         createdByProgram: actor.createdByProgram,
       });
       return wrapCoreResult(result);
-    }),
+    }, { keyIdempotent: "journal_reverse" }),
   );
 
   server.registerTool(

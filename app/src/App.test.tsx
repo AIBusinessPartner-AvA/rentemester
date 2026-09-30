@@ -6,7 +6,7 @@
 // havde nogen klikbar exit-vej. Disse tests låser at hjælp-linket findes og
 // at hjælpe-siden indeholder de centrale ressourcer.
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test } from "bun:test";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { App } from "./App";
@@ -14,16 +14,28 @@ import { mockFetch } from "./test/fixtures";
 
 function renderApp(route = "/help") {
   return render(
-    <MemoryRouter
-      initialEntries={[route]}
-      future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
-    >
+    <MemoryRouter initialEntries={[route]}>
       <App />
     </MemoryRouter>,
   );
 }
 
 describe("App topbar", () => {
+  test("renders the approved daily navigation through the shared registry", async () => {
+    const routes = [
+      ["Status", "/companies/acme-aps"], ["Kræver opmærksomhed", "/companies/acme-aps/opmaerksomhed"],
+      ["Penge og bilag", "/companies/acme-aps/bank"], ["Fakturaer", "/companies/acme-aps/fakturaer"],
+      ["Moms og frister", "/companies/acme-aps/moms"], ["Rapporter", "/companies/acme-aps/resultatopgorelse"],
+      ["Viden", "/companies/acme-aps/parter"], ["Administration", "/companies/acme-aps/manage"],
+    ] as const;
+
+    for (const [area, route] of routes) {
+      const rendered = renderApp(route);
+      expect(await screen.findByRole("link", { name: area })).toBeInTheDocument();
+      rendered.unmount();
+    }
+  });
+
   test("topbar contains a help/support link reachable from any route", async () => {
     mockFetch({
       "GET /api/companies": { workspace: "/ws", count: 0, companies: [] },
@@ -37,17 +49,17 @@ describe("App topbar", () => {
     });
     renderApp("/");
     await screen.findByRole("form", { name: /Opret virksomhed/i });
-    expect(screen.getByText("v0.1.0")).toBeInTheDocument();
+    expect(screen.getByText("v0.2.0")).toBeInTheDocument();
     const helpLink = screen.getByRole("link", { name: /^Hjælp$/i });
     expect(helpLink).toBeInTheDocument();
     expect(helpLink.getAttribute("href")).toBe("/help");
   });
 
-  test("the /help route renders a help page with docs, contact and feedback links", () => {
+  test("the /help route renders a help page with docs, contact and feedback links", async () => {
     renderApp("/help");
     // Headline visible
     expect(
-      screen.getByRole("heading", { name: /Hjælp og support/i }),
+      await screen.findByRole("heading", { name: /Hjælp og support/i }),
     ).toBeInTheDocument();
     // Link til docs / sådan virker det
     expect(

@@ -21,6 +21,11 @@ import {
   type StatementCsvExport,
 } from "../data/statement-exports";
 import { okResponse } from "./_shared";
+import { responseBodyFromBytes } from "../response-body";
+import { openCurrentLedgerReadOnly } from "../../core/ledger-inspection";
+import { companyPaths } from "../../core/paths";
+import { resolveWorkspaceCompany } from "../../core/workspace-company-resolver";
+import { explainJournalEntry } from "../../core/journal-explanation";
 
 export function handleCompanyIncomeStatement(
   config: ServerConfig,
@@ -89,7 +94,7 @@ export function handleCompanyStatementExport(
     } else {
       pdfExport = exportTrialBalancePdf(config.workspaceRoot, slug, year);
     }
-    return new Response(pdfExport.content, {
+    return new Response(responseBodyFromBytes(pdfExport.content), {
       headers: {
         "content-type": "application/pdf",
         "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(pdfExport.filename)}`,
@@ -153,7 +158,7 @@ export function handleCompanyVatExport(
     }
     throw err;
   }
-  return new Response(exported.content, {
+  return new Response(responseBodyFromBytes(exported.content), {
     headers: {
       "content-type": "application/pdf",
       "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(exported.filename)}`,
@@ -196,4 +201,16 @@ export function handleCompanyJournal(
   const account = url.searchParams.get("account");
   const data = buildCompanyJournal(config.workspaceRoot, slug, year, account);
   return okResponse({ journal: data });
+}
+
+/** Read-only drilldown; the router has already applied company access checks. */
+export function handleCompanyJournalExplanation(config: ServerConfig, slug: string, entryId: number): Response {
+  const resolved = resolveWorkspaceCompany(config.workspaceRoot, slug, { selection: "registered", archived: "allow", ledger: "required" });
+  if (!resolved.ok) throw ApiError.notFound("virksomhed ikke fundet");
+  const db = openCurrentLedgerReadOnly(companyPaths(resolved.company.companyRoot).db);
+  try {
+    const result = explainJournalEntry(db, entryId);
+    if (!result.ok) throw ApiError.notFound(result.errors[0] ?? "postering ikke fundet");
+    return okResponse(result);
+  } finally { db.close(); }
 }

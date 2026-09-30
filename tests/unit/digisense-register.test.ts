@@ -31,6 +31,7 @@ function freshLedger(label: string) {
   const root = mkdtempSync(join(tmpdir(), `rentemester-digisense-register-${label}-`));
   const db = openDb(ensureCompanyDirs(root).db);
   migrate(db);
+  db.run("INSERT INTO companies (id, cvr, name) VALUES (1, ?, ?)", [CVR, "Min Virksomhed ApS"]);
   return { root, db };
 }
 
@@ -70,6 +71,15 @@ function fakeRegisterClient(): { client: DigisenseClient; calls: RecordedCall[] 
 const CVR = "DK12345678";
 
 describe("registerDigisenseCompany — happy path", () => {
+  test("rejects a foreign caller identity before making a network call", async () => {
+    const { root, db } = freshLedger("identity-mismatch");
+    const { client, calls } = fakeRegisterClient();
+    try {
+      const result = await registerDigisenseCompany(db, root, client, { companyType: { type: "DK:CVR", id: "DK87654321" }, companyName: "Min Virksomhed ApS" });
+      expect(result.ok).toBe(false);
+      expect(calls).toHaveLength(0);
+    } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+  });
   test("registers the company, saves the companyKey, and registers inbound+outbound", async () => {
     const { root, db } = freshLedger("happy");
     const { client, calls } = fakeRegisterClient();
@@ -115,6 +125,29 @@ describe("registerDigisenseCompany — happy path", () => {
     }
   });
 
+  test("uses the Peppol document profile when registering on Peppol", async () => {
+    const { root, db } = freshLedger("peppol-profile");
+    const { client, calls } = fakeRegisterClient();
+    try {
+      const result = await registerDigisenseCompany(db, root, client, {
+        companyType: { type: "DK:CVR", id: CVR },
+        companyName: "Min Virksomhed ApS",
+        network: "peppol",
+      });
+      expect(result.ok).toBe(true);
+      const participantCalls = calls.filter((call) => call.kind === "register-participant");
+      expect(participantCalls).toHaveLength(2);
+      for (const call of participantCalls) {
+        if (call.kind !== "register-participant") continue;
+        expect(call.network).toBe("peppol");
+        expect(call.body.documentProfiles).toBe("default-peppol");
+      }
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("writes an audit_log row for the registration", async () => {
     const { root, db } = freshLedger("audit");
     const { client } = fakeRegisterClient();
@@ -138,7 +171,7 @@ describe("registerDigisenseCompany — happy path", () => {
 describe("registerDigisenseCompany — idempotent re-run", () => {
   test("re-registering the same CVR does not duplicate state and does not hard-fail", async () => {
     const { root, db } = freshLedger("idempotent");
-    const { client } = fakeRegisterClient();
+    const { client, calls } = fakeRegisterClient();
     try {
       const first = await registerDigisenseCompany(db, root, client, {
         companyType: { type: "DK:CVR", id: CVR },
@@ -151,6 +184,7 @@ describe("registerDigisenseCompany — idempotent re-run", () => {
 
       expect(first.ok).toBe(true);
       expect(second.ok).toBe(true);
+      expect(calls.filter((call) => call.kind === "register-company")).toHaveLength(1);
 
       // No duplicate company row; exactly one (inbound+outbound) participant pair.
       expect(listDigisenseCompanies(db)).toHaveLength(1);
@@ -178,7 +212,7 @@ describe("registerDigisenseCompany — error handling", () => {
     try {
       const result = await registerDigisenseCompany(db, root, client, {
         companyType: { type: "DK:CVR", id: CVR },
-        companyName: "Acme ApS",
+        companyName: "Min Virksomhed ApS",
       });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.errors.join(" ")).toContain("boom");
@@ -202,7 +236,7 @@ describe("registerDigisenseCompany — error handling", () => {
     try {
       const result = await registerDigisenseCompany(db, root, client, {
         companyType: { type: "DK:CVR", id: CVR },
-        companyName: "Acme ApS",
+        companyName: "Min Virksomhed ApS",
       });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.errors.join(" ")).toContain("network down");

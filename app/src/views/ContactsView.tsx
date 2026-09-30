@@ -27,6 +27,7 @@ import { ErrorState, Loading } from "../components/Feedback";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { ImportModal } from "../components/ImportModal";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { PartyLink } from "../components/PartyLink";
 import {
   ContactFormModal,
   type ContactKind,
@@ -107,7 +108,7 @@ export function ContactsView() {
   }
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="contacts" data-evidence-issue="655">
       <div className="page-head">
         <div>
           <h2>{c.company.name}</h2>
@@ -250,6 +251,7 @@ export function ContactsView() {
             <h3>Kunder</h3>
             <CustomerTable
               customers={c.customers}
+              slug={slug}
               onEdit={openEditCustomer}
               onDelete={openDeleteCustomer}
             />
@@ -259,6 +261,7 @@ export function ContactsView() {
             <h3>Leverandører</h3>
             <VendorTable
               vendors={c.vendors}
+              slug={slug}
               onEdit={openEditVendor}
               onDelete={openDeleteVendor}
             />
@@ -271,16 +274,18 @@ export function ContactsView() {
 
 function CustomerTable({
   customers,
+  slug,
   onEdit,
   onDelete,
 }: {
   customers: ContactCustomerRow[];
+  slug: string;
   onEdit: (row: ContactCustomerRow) => void;
   onDelete: (row: ContactCustomerRow) => void;
 }) {
   return (
     <div className="card statement-card table-scroll">
-      <table className="data statement-table">
+      <table className="data statement-table responsive-table" aria-label="Kunder">
         <thead>
           <tr>
             <th>Navn</th>
@@ -302,7 +307,7 @@ function CustomerTable({
           ) : (
             customers.map((row) => (
               <tr key={row.id}>
-                <td>{row.name}</td>
+                <td><PartyLink slug={slug} partyId={row.partyId}>{row.name}</PartyLink></td>
                 <td className="account-no">{row.vatOrCvr ?? "—"}</td>
                 <td>{row.email ?? "—"}</td>
                 <td>{row.defaultCurrency}</td>
@@ -360,16 +365,18 @@ function CustomerTable({
 
 function VendorTable({
   vendors,
+  slug,
   onEdit,
   onDelete,
 }: {
   vendors: ContactVendorRow[];
+  slug: string;
   onEdit: (row: ContactVendorRow) => void;
   onDelete: (row: ContactVendorRow) => void;
 }) {
   return (
     <div className="card statement-card table-scroll">
-      <table className="data statement-table">
+      <table className="data statement-table responsive-table" aria-label="Leverandører">
         <thead>
           <tr>
             <th>Navn</th>
@@ -389,7 +396,7 @@ function VendorTable({
           ) : (
             vendors.map((row) => (
               <tr key={row.id}>
-                <td>{row.name}</td>
+                <td><PartyLink slug={slug} partyId={row.partyId}>{row.name}</PartyLink></td>
                 <td className="account-no">{row.vatOrCvr ?? "—"}</td>
                 <td className="account-no">
                   {row.defaultExpenseAccount ?? "—"}

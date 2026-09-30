@@ -21,6 +21,50 @@ company_profile_get), and the round-2 polish batches D/E/F. See
 
 ## Product gaps (would block real-world adoption)
 
+### Complete historical analytics and AI-CFO surface
+
+**Surfaced by:** real-world multi-company Dinero migration (2026-08-22).
+**Current state:** a Dinero migration replays the cut-over year's postings into
+the live ledger and stores earlier fiscal years in append-only import archive
+tables. Historical years can be inspected individually, but the agent and
+cockpit do not yet have one normalized, documented query surface spanning live
+and archived years, vouchers, accounts, counterparties and source documents.
+That limits reliable trend, supplier, margin, cash-flow and anomaly analysis.
+**Workaround:** query each archived year and the live ledger separately, then
+reconcile and analyze exported datasets outside the ledger.
+**Estimated scope:** ~3-5 weeks after the Dinero migration path is fully
+verified; normalize historical analytical dimensions without rewriting source
+evidence, expose read-only multi-year MCP/CLI queries, and add deterministic
+reconciliation/eval fixtures before AI-generated explanations.
+**Next action:** use real migrations only as local, non-committed acceptance
+corpora. Define a read-only `historical_analysis` contract that returns
+source-linked postings across years and proves totals against each year's
+source balance before adding CFO suggestions. Repository tests use synthetic
+companies and values.
+
+### Legal group structure, intercompany reconciliation and consolidation
+
+**Surfaced by:** real-world holding-company workspace migration (2026-08-22).
+**Current state:** the workspace now has an effective-dated ownership graph,
+membership-filtered group overview, reviewed intercompany mappings, exact
+same-currency reconciliation, source-bound append-only balance eliminations,
+reviewed reporting-chart profiles and read-only consolidated balance/income
+statements. Every legal ledger remains separate. The first report slice is
+deliberately limited to 100% ownership, one currency and balance eliminations;
+it fails closed for stale evidence, incomplete mappings or partial visibility.
+**Workaround:** use the built-in profile-bound report for supported groups.
+Keep FX, non-controlling interests, income/expense eliminations, consolidated
+tax and statutory group reporting external.
+**Estimated scope:** ~4-8 weeks in slices: ownership graph and disclosures;
+an independent group overview with company status and consolidation-readiness;
+intercompany account/counterparty mapping and mismatch report; then an
+append-only elimination workflow and read-only consolidated statements with
+explicit evidence. Consolidated tax or statutory reporting remains a separate
+reviewed scope.
+**Next action:** only after explicit accounting-policy review, add FX,
+non-controlling interests and transaction-level income/expense eliminations.
+Portfolio, group structure and consolidated figures remain separate contracts.
+
 ### Payroll / A-skat / AM-bidrag / ATP / eIndkomst
 
 **Surfaced by:** virksomhedsejer-review (both rounds, top priority).

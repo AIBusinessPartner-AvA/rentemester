@@ -21,7 +21,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { postJournalEntry, type JournalPostResult } from "./ledger";
+import { postJournalEntry, postJournalEntryInCurrentTransaction, type JournalPostResult } from "./ledger";
 import { insertAuditLog } from "./actor";
 import { getCompanySettings } from "./company";
 import { isValidIsoDate as looksLikeIsoDate, diffDays, todayIsoDate } from "./dates";
@@ -29,6 +29,8 @@ import { absDkk, compareDkk, percentOfDkk, roundDkk, subtractDkk, sumDkk } from 
 import { resolveAccountRole } from "./account-roles";
 import { parsePurchaseVatLinesPayload } from "./documents";
 import { deductibleDanishPurchaseSupplierErrors } from "./supplier-identity";
+import { validSimplifiedPurchaseCompanyContext } from "./document-company-context";
+import { validIncompleteStandardPurchaseVatEvidenceReview } from "./document-purchase-vat-evidence-review";
 
 const RULE_ID = "DK-PAYABLE-001";
 const PAYMENT_RULE_ID = "DK-PAYABLE-PAYMENT-001";
@@ -72,6 +74,9 @@ export type PayPayableInput = {
   note?: string;
   createdBy?: string;
   createdByProgram?: string;
+  /** Internal correction workflow only: the direct source being atomically superseded. */
+  allowSupersededDirectBankJournalEntryId?: number;
+  skipBankSourceLink?: boolean;
 };
 
 export type PayPayableResult = {
@@ -160,6 +165,22 @@ export type PayablesListResult = {
   errors: string[];
 };
 
+/** Canonical, transport-neutral operation identity for #583 retries. */
+export function payablePayOperationPayload(input: {
+  payableId: number; bankTransactionId: number; amount?: number;
+  date?: string; paymentDate?: string; paymentAccount?: string;
+  paymentAccountNo?: string; note?: string;
+}): Record<string, unknown> {
+  return {
+    payableId: input.payableId,
+    bankTransactionId: input.bankTransactionId,
+    amount: input.amount ?? null,
+    date: input.date ?? input.paymentDate ?? null,
+    paymentAccount: input.paymentAccount ?? input.paymentAccountNo ?? null,
+    note: input.note ?? null,
+  };
+}
+
 type PayableRow = {
   id: number;
   document_id: number;
@@ -198,7 +219,7 @@ function getPayableRow(db: Database, payableId: number): PayableRow | null {
  * Leverandørgæld). Idempotent on `documentId`: a second registration of the
  * same purchase document is rejected.
  */
-export function registerPayable(db: Database, input: RegisterPayableInput): RegisterPayableResult {
+export function registerPayable(db: Database, input: RegisterPayableInput, inCurrentTransaction = false): RegisterPayableResult {
   const errors: string[] = [];
   if (!Number.isInteger(input.documentId) || input.documentId <= 0) errors.push("documentId must be a positive integer");
   if (!looksLikeIsoDate(input.billDate)) errors.push("billDate must be YYYY-MM-DD");
@@ -222,24 +243,35 @@ export function registerPayable(db: Database, input: RegisterPayableInput): Regi
   if (!account.active) return { ok: false, appliedRules: [RULE_ID], errors: [`account ${expenseAccountNo} is inactive`] };
 
   const document = db.query(
-    `SELECT id, document_type, invoice_no, amount_inc_vat, vat_amount, currency, sender_name, payload_json,
-            sender_vat_cvr, supplier_country_code, supplier_identifier_kind, supplier_identity_status
+    `SELECT id, document_type, invoice_no, invoice_date, amount_inc_vat, vat_amount, currency, sender_name, payload_json,
+            sender_vat_cvr, recipient_vat_cvr, supplier_country_code, supplier_identifier_kind, supplier_identity_status
      FROM documents WHERE id = ?`,
   ).get(input.documentId) as {
     id: number;
     document_type: string;
     invoice_no: string | null;
+    invoice_date: string | null;
     amount_inc_vat: number | null;
     vat_amount: number | null;
     currency: string;
     sender_name: string | null;
     payload_json: string | null;
     sender_vat_cvr: string | null;
+    recipient_vat_cvr: string | null;
     supplier_country_code: string | null;
     supplier_identifier_kind: string | null;
     supplier_identity_status: string | null;
   } | null;
   if (!document) return { ok: false, appliedRules: [RULE_ID], errors: [`document ${input.documentId} does not exist`] };
+  // The evidence-bearing document date is the accounting and VAT date. A
+  // caller may repeat it for an explicit review, but may never move a bill to
+  // another period by supplying a different date.
+  if (document.document_type === "purchase_sale" && (!document.invoice_date || !looksLikeIsoDate(document.invoice_date))) {
+    return { ok: false, appliedRules: [RULE_ID], errors: [`document ${input.documentId} has no valid immutable invoice_date`] };
+  }
+  if (document.invoice_date && input.billDate !== document.invoice_date) {
+    return { ok: false, appliedRules: [RULE_ID], errors: [`billDate ${input.billDate} must match document invoice_date ${document.invoice_date}`] };
+  }
   if (document.document_type !== "purchase_sale" && document.document_type !== "cash_register_receipt") {
     return { ok: false, appliedRules: [RULE_ID], errors: [`document ${input.documentId} is not a purchase document`] };
   }
@@ -286,6 +318,15 @@ export function registerPayable(db: Database, input: RegisterPayableInput): Regi
       supplierIdentityStatus: document.supplier_identity_status,
     });
     if (supplierErrors.length > 0) return { ok: false, appliedRules: [RULE_ID], errors: supplierErrors };
+    try {
+      const payload = document.payload_json ? JSON.parse(document.payload_json) as Record<string, unknown> : {};
+      const invoiceStatesCompany = typeof document.recipient_vat_cvr === "string" && document.recipient_vat_cvr.trim().length > 0;
+      const contextIsValid = payload.danishSimplifiedPurchaseInvoice === true && validSimplifiedPurchaseCompanyContext(db, input.documentId);
+      const reviewedIncomplete = payload.incompleteStandardPurchaseInvoice === true && validIncompleteStandardPurchaseVatEvidenceReview(db, input.documentId);
+      if (document.document_type === "purchase_sale" && !invoiceStatesCompany && !contextIsValid && !reviewedIncomplete) {
+        return { ok: false, appliedRules: [RULE_ID], errors: ["standard purchase VAT requires invoice-stated recipient identity or a valid hash-bound simplified-invoice company context"] };
+      }
+    } catch { return { ok: false, appliedRules: [RULE_ID], errors: ["document payload_json is not valid JSON"] }; }
   }
   if (vatTreatment === "exempt" && vatAmount !== 0) {
     return { ok: false, appliedRules: [RULE_ID], errors: ["exempt payable registration requires document vat_amount = 0"] };
@@ -344,8 +385,8 @@ export function registerPayable(db: Database, input: RegisterPayableInput): Regi
       ];
 
   try {
-    return db.transaction(() => {
-      const journal = postJournalEntry(db, {
+    const apply = () => {
+      const journal = (inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry)(db, {
         transactionDate: input.billDate,
         text,
         documentId: input.documentId,
@@ -402,8 +443,13 @@ export function registerPayable(db: Database, input: RegisterPayableInput): Regi
         appliedRules: [RULE_ID, ...journal.appliedRules],
         errors: [],
       } satisfies RegisterPayableResult;
-    }, { immediate: true })();
+    };
+    return inCurrentTransaction ? apply() : db.transaction(apply).immediate();
   } catch (error) {
+    // The #583 receipt executor owns the outer transaction. It must see a
+    // post-write failure as an exception so it can roll back journal,
+    // payable/payment, receipt and audit together.
+    if (inCurrentTransaction) throw error;
     const parsed = parseTransactionError(error);
     return {
       ok: false,
@@ -413,11 +459,15 @@ export function registerPayable(db: Database, input: RegisterPayableInput): Regi
   }
 }
 
+export function registerPayableInCurrentTransaction(db: Database, input: RegisterPayableInput): RegisterPayableResult {
+  return registerPayable(db, input, true);
+}
+
 /** Open balance (gross minus applied payments) for a single payable. */
-function openBalanceOf(db: Database, payable: PayableRow): number {
+function openBalanceOf(db: Database, payable: PayableRow, asOfDate?: string): number {
   const payments = db.query(
-    `SELECT amount FROM payable_payments WHERE payable_id = ?`,
-  ).all(payable.id) as Array<{ amount: number }>;
+    `SELECT amount FROM payable_payments WHERE payable_id = ?${asOfDate ? " AND payment_date <= ?" : ""}`,
+  ).all(...(asOfDate ? [payable.id, asOfDate] : [payable.id])) as Array<{ amount: number }>;
   const paid = sumDkk(payments.map((p) => Number(p.amount)));
   return subtractDkk(roundDkk(Number(payable.gross_amount)), paid);
 }
@@ -428,11 +478,15 @@ export function getPayableStatus(db: Database, payableId: number, asOfDate?: str
   }
   const payable = getPayableRow(db, payableId);
   if (!payable) return { ok: false, errors: [`payable ${payableId} does not exist`] };
+  if (asOfDate !== undefined && !looksLikeIsoDate(asOfDate)) return { ok: false, errors: ["asOfDate must be YYYY-MM-DD when present"] };
+  if (asOfDate !== undefined && payable.bill_date > asOfDate) {
+    return { ok: false, errors: [`payable ${payableId} is not effective as of ${asOfDate}`] };
+  }
 
   const payments = db.query(
     `SELECT id, payment_date, amount, bank_transaction_id, journal_entry_id, note
-     FROM payable_payments WHERE payable_id = ? ORDER BY id ASC`,
-  ).all(payableId) as Array<{ id: number; payment_date: string; amount: number; bank_transaction_id: number | null; journal_entry_id: number; note: string | null }>;
+     FROM payable_payments WHERE payable_id = ?${asOfDate ? " AND payment_date <= ?" : ""} ORDER BY id ASC`,
+  ).all(...(asOfDate ? [payableId, asOfDate] : [payableId])) as Array<{ id: number; payment_date: string; amount: number; bank_transaction_id: number | null; journal_entry_id: number; note: string | null }>;
 
   const grossAmount = roundDkk(Number(payable.gross_amount));
   const paidAmount = sumDkk(payments.map((p) => Number(p.amount)));
@@ -478,7 +532,7 @@ export function getPayableStatus(db: Database, payableId: number, asOfDate?: str
  * transaction must be an outgoing payment (negative amount), in DKK, and not
  * already linked to a payable payment or any journal entry.
  */
-export function payPayableFromBank(db: Database, input: PayPayableInput): PayPayableResult {
+export function payPayableFromBank(db: Database, input: PayPayableInput, inCurrentTransaction = false): PayPayableResult {
   const errors: string[] = [];
   if (!Number.isInteger(input.payableId) || input.payableId <= 0) errors.push("payableId must be a positive integer");
   if (!Number.isInteger(input.bankTransactionId) || input.bankTransactionId <= 0) errors.push("bankTransactionId must be a positive integer");
@@ -498,8 +552,8 @@ export function payPayableFromBank(db: Database, input: PayPayableInput): PayPay
     return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [`bank transaction ${input.bankTransactionId} is not in DKK — foreign-currency payable settlement is out of scope for this slice`] };
   }
 
-  const existingJournal = db.query(`SELECT id FROM journal_entries WHERE source_bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
-  if (existingJournal) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [`bank transaction ${bank.id} is already linked to journal entry ${existingJournal.id}`] };
+  const existingJournal = db.query(`SELECT journal_entry_id AS id FROM bank_journal_reconciliations WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
+  if (existingJournal && existingJournal.id !== input.allowSupersededDirectBankJournalEntryId) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [`bank transaction ${bank.id} is already linked to journal entry ${existingJournal.id}`] };
   const existingPayment = db.query(`SELECT id FROM payable_payments WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
   if (existingPayment) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [`bank transaction ${bank.id} is already applied to payable payment ${existingPayment.id}`] };
 
@@ -516,19 +570,23 @@ export function payPayableFromBank(db: Database, input: PayPayableInput): PayPay
   }
 
   const paymentDate = input.paymentDate ?? bank.transaction_date;
+  if (paymentDate !== bank.transaction_date) {
+    return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [`paymentDate ${paymentDate} must match bank transaction date ${bank.transaction_date}`] };
+  }
   const payment = input.paymentAccountNo?.trim() ? { ok: true as const, accountNo: input.paymentAccountNo.trim() } : resolveAccountRole(db, "bank");
   const creditor = resolveAccountRole(db, "creditors");
-  if (!payment.ok || !creditor.ok) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [!payment.ok ? payment.error : creditor.error] };
+  if (!payment.ok) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [payment.error] };
+  if (!creditor.ok) return { ok: false, appliedRules: [PAYMENT_RULE_ID], errors: [creditor.error] };
   const text = payable.supplier_name
     ? `Betaling af kreditorpost til ${payable.supplier_name} (banktransaktion ${bank.id})`
     : `Betaling af kreditorpost (banktransaktion ${bank.id})`;
 
   try {
-    return db.transaction(() => {
-      const journal = postJournalEntry(db, {
+    const apply = () => {
+      const journal = (inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry)(db, {
         transactionDate: paymentDate,
         text,
-        sourceBankTransactionId: input.bankTransactionId,
+        sourceBankTransactionId: input.skipBankSourceLink ? undefined : input.bankTransactionId,
         createdBy: input.createdBy,
         createdByProgram: input.createdByProgram,
         lines: [
@@ -566,8 +624,13 @@ export function payPayableFromBank(db: Database, input: PayPayableInput): PayPay
         appliedRules: [PAYMENT_RULE_ID, ...journal.appliedRules],
         errors: [],
       } satisfies PayPayableResult;
-    }, { immediate: true })();
+    };
+    return inCurrentTransaction ? apply() : db.transaction(apply).immediate();
   } catch (error) {
+    // See registerPayable: do not turn an after-journal failure into an
+    // `{ ok:false }` result after writes have occurred in an outer receipt
+    // transaction.
+    if (inCurrentTransaction) throw error;
     const parsed = parseTransactionError(error);
     return {
       ok: false,
@@ -575,6 +638,11 @@ export function payPayableFromBank(db: Database, input: PayPayableInput): PayPay
       errors: parsed?.errors ?? [String(error)],
     };
   }
+}
+
+/** See registerPayableInCurrentTransaction. */
+export function payPayableFromBankInCurrentTransaction(db: Database, input: PayPayableInput): PayPayableResult {
+  return payPayableFromBank(db, input, true);
 }
 
 /**
@@ -611,13 +679,14 @@ export function buildPayablesList(db: Database, filters: PayablesListFilters = {
 
   const rows: PayablesListRow[] = [];
   for (const payable of payables) {
+    if (payable.bill_date > asOfDate) continue;
     if (filters.from && payable.bill_date < filters.from) continue;
     if (filters.to && payable.bill_date > filters.to) continue;
     if (filters.vendorId !== undefined && payable.vendor_id !== filters.vendorId) continue;
     if (supplierNeedle && !(payable.supplier_name ?? "").toLocaleLowerCase().includes(supplierNeedle)) continue;
 
     const grossAmount = roundDkk(Number(payable.gross_amount));
-    const openBalance = openBalanceOf(db, payable);
+    const openBalance = openBalanceOf(db, payable, asOfDate);
     const itemStatus: PayableStatus = openBalance > 0 ? "open" : "paid";
     const overdueDays = openBalance > 0 ? Math.max(0, diffDays(payable.due_date, asOfDate)) : 0;
     const isOverdue = overdueDays > 0;

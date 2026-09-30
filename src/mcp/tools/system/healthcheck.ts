@@ -10,7 +10,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { existsSync } from "node:fs";
 import { companyPaths } from "../../../core/paths";
-import { envelopeShape, errorEnvelope, successEnvelope } from "../../envelope";
+import { inspectLedger } from "../../../core/ledger-inspection";
+import { envelopeShape, errorEnvelope, errorEnvelopeWithData, successEnvelope } from "../../envelope";
+import { redactPaths, resolveCompanyArg, strictMcpReadOnlyHandler } from "../../tool-runtime";
 
 export function registerSystemHealthcheckTools(server: McpServer): void {
   server.registerTool(
@@ -31,7 +33,7 @@ export function registerSystemHealthcheckTools(server: McpServer): void {
       outputSchema: envelopeShape,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ company }: { company: string }) => {
+    strictMcpReadOnlyHandler(async ({ company }: { company: string }) => {
       if (typeof company !== "string" || company.length === 0) {
         const env = errorEnvelope("company path is required");
         return {
@@ -40,7 +42,12 @@ export function registerSystemHealthcheckTools(server: McpServer): void {
           structuredContent: env,
         };
       }
-      const p = companyPaths(company);
+      const resolution = resolveCompanyArg(company);
+      if (!resolution.ok) {
+        const env = errorEnvelope(redactPaths(resolution.error));
+        return { content: [{ type: "text" as const, text: JSON.stringify(env) }], isError: true, structuredContent: env };
+      }
+      const p = companyPaths(resolution.companyRoot);
       const checks: Array<{ name: string; ok: boolean }> = [
         { name: "company_root", ok: existsSync(p.root) },
         { name: "data_dir", ok: existsSync(p.data) },
@@ -49,15 +56,22 @@ export function registerSystemHealthcheckTools(server: McpServer): void {
         { name: "config", ok: existsSync(p.config) },
       ];
       const missing = checks.filter((c) => !c.ok).map((c) => c.name);
+      const inspection = checks.find((check) => check.name === "ledger")?.ok
+        ? inspectLedger(p.db)
+        : undefined;
+      if (inspection && inspection.status !== "current") missing.push("schema");
       const env =
         missing.length === 0
-          ? successEnvelope({ ok: true, missing: [], checks })
-          : { ...errorEnvelope(missing.map((m) => `missing: ${m}`)), data: { ok: false, missing, checks } };
+          ? successEnvelope({ ok: true, missing: [], checks, schema_outdated: false, schema: inspection })
+          : errorEnvelopeWithData(
+              missing.map((m) => m === "schema" ? `schema_${inspection?.status}: current=${inspection?.currentVersion} required=${inspection?.requiredVersion}` : `missing: ${m}`),
+              { ok: false, missing, checks, schema_outdated: inspection?.status === "pending", schema: inspection },
+            );
       return {
         content: [{ type: "text" as const, text: JSON.stringify(env) }],
         isError: !env.ok,
         structuredContent: env,
       };
-    },
+    }),
   );
 }

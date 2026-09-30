@@ -1,9 +1,22 @@
 # MCP Tool Surface — Rentemester
 
-Den autoritative liste over de tools Rentemester-MCP-serveren eksponerer til
-agenter (Claude, Cursor, Claude Code, Codex osv.). Dokumentet startede som
-bygge-tegning for MCP-epicen (#89, scaffold #77, implementation #78) og
+The authoritative internal operation registry contains every exact operation.
+The default transport projection exposes exactly eight compact tools to agents
+(Claude, Cursor, Claude Code, Codex osv.):
+
+`system_server_about`, `agent_capability_search`, `agent_workflow_describe`,
+`agent_operation_search`, `agent_operation_describe`, `agent_operation_read`,
+`agent_operation_write`, `agent_operation_destroy`.
+
+Set `RENTEMESTER_MCP_PROFILE=full` before startup to expose the complete
+backward-compatible legacy surface directly. The document started as
+bygge-tegning for MCP-epicen (#89, scaffold #77, implementation #78) and
 vedligeholdes nu som facitliste mod den kørende server.
+
+In compact mode every precise operation remains available through the
+registry/gateway route and discovery reports `directlyListed: false`; coverage
+therefore still includes every precise operation while `tools/list` stays
+bounded and stable.
 
 > **Hold dette synkront.** Tool-tallet i dette dokument skal matche en
 > kørende server. Den hurtige måde at få den faktiske liste på er at drive
@@ -14,6 +27,19 @@ Kilder:
 - En kørende `src/mcp/server.ts` (`tools/list`) — facit for hvilke tools der
   faktisk eksponeres og deres `annotations` (read-only/destructive-hints).
 - `src/mcp/registry.ts` — registrerer hele tool-surface'en pr. domæne.
+
+Legacy kontakt → canonical party mapping: `legacy_party_mapping_plan` og
+`legacy_party_mapping_list` er read-only. `legacy_party_mapping_apply` kræver
+bekræftelse, autentificeret company membership, idempotency key og eksakt
+kontakt-/bilag-/planbinding; `legacy_party_mapping_supersede` er den append-only
+korrektionsvej. En reviewed legacy reference alene opretter aldrig en mapping.
+Importerede, uafklarede leverandører bruger først
+`vendor_identity_enrichment_plan` → `vendor_identity_enrichment_apply` og kan
+inspiceres med `vendor_identity_enrichment_list`. Planen læser og SHA-256-
+verificerer det registrerede originalbilag og kræver eksakt navn/adresse samt
+overensstemmende dokumentidentitet. Apply udfylder kun null typefelter,
+kræver `company.master-data`, confirmation, actor, plan-hash og principal-scoped
+idempotency og overskriver aldrig en eksisterende typed identitet.
 - `src/cli-meta.ts` — CLI-kommandoerne. MCP-surface'en er *tæt på* 1:1 med
   CLI'en, men ikke fuldstændig — se "CLI/MCP-mapping" nedenfor.
 - `src/core/*.ts` — TypeScript-typer for inputs og resultater (`InvoicePayload`,
@@ -55,7 +81,11 @@ med det samme i komprimeret form.
    altid for kommandoer der bogfører (sporbarhed mod regelsæt).
 4. **Sikkerhedsklassifikation** på fire niveauer:
    - `read` — ingen state-bivirkninger; agenten må kalde frit og parallelt.
-     Markeret med `annotations.readOnlyHint: true`.
+     Markeret med `annotations.readOnlyHint: true`. Company-scoped reads åbner
+     kun en eksisterende SQLite snapshot i læsetilstand: de initialiserer eller
+     migrerer aldrig ledgeren og skriver aldrig WAL/SHM, audit, profil eller
+     workspace-manifest. Manglende, uinitialiserede og schema-pending ledgers
+     returnerer en afgrænset fejl-envelope uden filsystemændringer.
    - `write-reversible` — opretter state der kan tilbageføres via
      `journal_reverse`, `invoice_credit_note`, `exception_resolve` eller ved
      en korrigerende post. Kræver `confirm: true`.
@@ -67,15 +97,14 @@ med det samme i komprimeret form.
 5. **Actor-attribution er obligatorisk.** Hvert MCP-call tilskrives som
    `agent:<client-info>` (jf. #63). `auditActor` skrives ind i
    `audit_log.actor` og udgør traceable kæde fra agent-call til bogføring.
-6. **Ingen generel idempotency-key på writes.** Der findes *ikke* en
-   `idempotencyKey`-mekanisme med en retry-cache på writes. En agent kan
-   derfor ikke regne med at en gentaget `journal_post` (eller anden write)
-   automatisk de-dupes — en retry efter en uafklaret netværksfejl kan
-   dobbelt-bogføre. Flere intake-/generér-tools er derimod idempotente *af
-   natur* (`annotations.idempotentHint`) — de de-duper på indhold/periode,
-   ikke på en klient-leveret nøgle; se de enkelte tool-rækker nedenfor.
-   En generel write-idempotency-cache er en mulig fremtidig udvidelse, ikke
-   et nuværende løfte.
+6. **Idempotency-key på fem højrisiko-writes.** `journal_post`,
+   `journal_reverse`, `expense_book`, `payable_register` og `payable_pay`
+   accepterer en klientgenereret nøgle på højst 128 tegn. Den kræver
+   autentificeret bruger/servicekonto og scope’er på stabil principal,
+   workspace, virksomhed og operation — aldrig actor eller credential. Nøglen
+   hashes, udfaldet og audit commit’er atomisk. Efter 30 dage kan udfaldet
+   slettes, men tombstonen bevares og afviser med
+   `IDEMPOTENCY_OUTCOME_EXPIRED`; nøglen kan ikke genbruges.
 7. **Eksplicit `company`-parameter overalt.** Aldrig implicit "current
    company"; agent skal altid pege på virksomheden. `company` accepterer
    **enten** en absolut filsystem-sti til virksomhedsmappen (`..`-guardet),
@@ -91,7 +120,7 @@ med det samme i komprimeret form.
 | Niveau | Krav | Eksempler |
 |---|---|---|
 | `read` | Ingen | `audit_verify`, `bank_list`, `invoice_status`, `vat_report`, `portfolio_overview` |
-| `write-reversible` | `confirm: true` | `customer_create`, `vendor_create`, `bank_import`, `documents_ingest`, `exception_resolve`, `mileage_log` |
+| `write-reversible` | `confirm: true` | `customer_create`, `vendor_create`, `bank_import`, `documents_ingest`, `documents_set_company_context`, `exception_resolve`, `mileage_log` |
 | `write-irreversible` | `confirm: true` | `accounts_add`, `journal_post`, `invoice_issue`, `invoice_post`, `expense_book`, `vat_post_*`, `asset_register`, `system_backup` |
 | `destructive` | `confirm: true` + `confirmText` | `system_restore_backup` |
 
@@ -101,7 +130,7 @@ selv ændres ikke.
 
 ## Resultat-shapes (`outputSchema`)
 
-**Alle 113 tools deklarerer et `outputSchema`** (#202). Det er det samme
+**Alle 249 tools deklarerer et `outputSchema`** (#202). Det er det samme
 delte schema for hver tool — konvolutten — så en agent kan læse
 resultat-kontrakten fra `tools/list` *uden* at kalde tool'et først.
 Schemaet er defineret én gang i `src/mcp/envelope.ts` (`envelopeShape`).
@@ -120,7 +149,7 @@ Konvolutten (`structuredContent` på et `tools/call`-svar):
 den konkrete feltliste i `data` varierer pr. tool, og MCP-SDK'en validerer
 kun `structuredContent` mod schemaet for *succes*-svar (`isError:false`) —
 fejl-envelopes springes over. De per-tool `data`-felter er ikke hånd-typet
-113 gange; de er dokumenteret nedenfor og i tool-brief'ene.
+120 gange; de er dokumenteret nedenfor og i tool-brief'ene.
 
 ### Cross-cutting preconditions (envelope-`code`)
 
@@ -175,6 +204,7 @@ sende uændret for at hente næste side. Et svar med `hasMore: true` er
 | `journal_dry_run` | `{ entryId, entryNo, previousHash, entryHash, accountEffects: [{ accountNo, accountName, balanceBefore, balanceAfter, delta }] }` — ikke-bindende forhåndsvisning af `journal_post`: felterne beskriver hvad posteringen *ville* få. `accountEffects` lister saldo før/efter pr. berørt konto (debet-minus-kredit-netto, i kroner). Ved en ugyldig payload er konvolutten `ok=false` med `errors[]`, og `data` mangler. |
 | `bank_list` | `{ rows: [...], total, count, limit, offset, hasMore, nextOffset? }` (pagineret) |
 | `invoice_list` | `{ invoices: [...], count }` |
+| `invoice_imported_receivables` | `{ asOfDate, boundary, count, totalOpen, rows: [{ externalInvoiceId, invoiceDate, grossAmount, paidAmount, openBalance, controlAccountNo, sourceDocumentHash, scheduleHash }] }` — source-evidenced pre-cut-over debtors only. They are intentionally separate from `invoice_list`; never add the two without an explicit reconciliation. |
 | `exceptions_list` | `{ exceptions: [...], count }` |
 | `period_list` | `{ periods: [{ id, periodStart, periodEnd, kind, status, reference, createdAt }], count }` — `kind` er `"vat_period" \| "fiscal_year" \| "custom"`; ældre rækker kan læses som `"vat_quarter"`, der kun er et legacy-alias. `status` er `"open" \| "closed" \| "reported"`; `reference` kan være `null`. |
 | `audit_verify` | `{ entries: <number> }` — kun antallet af verificerede posteringer. Integritets-verdikten læses fra **konvolutten**: `ok=true` (+ tom `errors[]`) ⇒ kæden er intakt; `ok=false` ⇒ `errors[]` lister bruddene. Der er hverken `ok` eller `errors` *inde i* `data`. |
@@ -204,8 +234,12 @@ sende uændret for at hente næste side. Et svar med `hasMore: true` er
 | `system_restore_backup` | `{ backupId, restoredAt, targetCompanyRoot, restoredDbPath, restoredFiles: { documentsOriginals, invoicesIssued, config } }` — `backupId`/`restoredAt` er ISO-tidsstempler; `restoredFiles`-felterne er antal genskabte filer pr. kategori. `appliedRules` (på konvoluttens topniveau) er `["DK-BOOKKEEPING-RESTORE-001"]`. |
 | `efaktura_konfigurer` | `{ configPath, environment }` — `configPath` er stien til den skrevne secret-fil (config/digisense.json); `environment` er `"production" \| "test"`. license-key returneres ALDRIG. |
 | `efaktura_registrer` | `{ companyKey, directionsRegistered, network, participantType, participantId }` — `companyKey` er Digisense' nøgle for virksomheden; `directionsRegistered` er de registrerede retninger (fx `["inbound","outbound"]`); `network` er `"nemhandel" \| "peppol"`; `participantType` er `"DK:CVR" \| "GLN"`. |
+| `efaktura_onboarding_status` | Secret-redacted local readiness: profile identity, configured environment, inbound/outbound readiness and blockers. |
+| `efaktura_onboard` | `{ companyKey, status }` — validates auth and idempotently registers the profile CVR inbound + outbound. |
 | `efaktura_modtag` | `{ pagesFetched, documentsListed, documentsIngested, documentsSkipped, documentsQuarantined, documents[], errors[] }` — tællere over pollen; `documentsQuarantined` er TERMINALT uingesterbare bilag (validering/dublet) der er sat i karantæne så de ikke down­loades igen. `documents[]` er `ReceivedDocumentOutcome`: `{ internalId, status, documentNo?, errors? }`, hvor `status` er `"ingested" \| "skipped-duplicate" \| "quarantined" \| "error"`. **Partiel succes:** konvoluttens `ok` er kun `false` ved en BATCH-fejl (list-received-documents fejlede); en enkelt dårlig faktura giver `ok:true` med tællerne intakte og fejlen i `documents[]`/`errors[]`. |
-| `efaktura_send` | `{ invoiceNumber, submissionReference, idempotencyKey, status, transmissionId, ... }` — samme `SubmitPublicEInvoicePeppolResult`-shape som `peppol_submit_public_invoice`. `status` er `"acknowledged"` ved levering. En queued-men-endnu-ikke-leveret timeout giver `ok:false` + `status:"prepared"` + `transmissionId` (det kø-satte documentId); et efterfølgende send AFVISES (double-send-guard) — poll leverings-status på documentId i stedet for at retry'e transmit. |
+| `efaktura_modtag_workspace` | `{ companies: [{ slug, status, reason?, documentsIngested? }] }` — confirm-gated poll af aktive manifest-virksomheder. Ingen caller credentials/companyKey; arkiverede og ukonfigurerede springes over, fejl fortsætter pr. virksomhed, og resultater er redigerede. |
+| `efaktura_send` | `{ invoiceNumber, submissionReference, idempotencyKey, status, transmissionId, ... }` — samme `SubmitPublicEInvoicePeppolResult`-shape som `peppol_submit_public_invoice`. `status` er `"acknowledged"` ved levering. En queued-men-endnu-ikke-leveret accept giver `ok:true` + `status:"prepared"` + `transmissionId`; klienten skal kun polle status og aldrig redelivere. En terminal afvisning efter accept giver `status:"failed"`; et tvetydigt delivery-POST uden pålideligt remote-id giver `status:"uncertain"`. Begge blokerer redelivery, og CLI'en afslutter med exit 1. |
+| `efaktura_status` | `{ invoiceNumber, submissionReference, idempotencyKey, status, transmissionId, ... }` — observerer kun `document-status` for en allerede køsat afsendelse og gemmer append-only statusevidens; kalder aldrig `document-delivery`. En terminal afvisning returneres eksplicit som `status:"failed"`; CLI'en afslutter med exit 1. |
 
 > **Discovery-kontrakten:** Konvolut-formen er maskin-kendt via `outputSchema`
 > i `tools/list`. Den præcise `data`-feltliste står her og i kildens
@@ -219,21 +253,35 @@ Tallene gælder en kørende `src/mcp/server.ts` (verificeret via `tools/list`).
 Tabellerne nedenfor er den autoritative liste pr. tool — bliver prosa-tal og
 tabel uenige, er det tabellerne (og i sidste ende `tools/list`) der gælder.
 
-- **Read-tools**: 49
-- **Write-reversible**: 13
-- **Write-irreversible**: 49
+- **Read-tools**: 91
+- **Ordinary write-tools**: 122
 - **Destructive**: 1 (`system_restore_backup`)
-- **Total**: **113**
+- **Total**: **249** (read and write tool counts are verified from the live registry in CI)
 
 ## Read-tools
 
-49 tools (tæl tabellen — den er facit). Ingen state-bivirkninger; må kaldes
+### PDF parsing evidence
+
+`documents_parse_status` and `documents_parsed_text` are read-only. The latter
+is capped at ten pages and returns decoded text plus a `layoutHash` per page,
+never layout coordinates, stored paths, child stderr, or worker details. The
+registered source file is re-snapshotted before either response. A failed
+evidence check returns `{ ok:false, code:"PDF_EVIDENCE_TAMPERED",
+errors:["PDF_EVIDENCE_TAMPERED"] }` without paths or diagnostics.
+paired writes are `documents_parse` and `documents_parse_pending`; both require
+`confirm:true`, the normal actor allow-list, and return bounded summaries only.
+Parsing is evidence, not bookkeeping authority.
+
+50 tools i den kuraterede tabel nedenfor. Ingen state-bivirkninger; må kaldes
 frit og parallelt.
 
 | Tool | CLI-ækvivalent | Input | Brief |
 |---|---|---|---|
 | `accounts_list` | `accounts list` | `{ company }` | Lister kontoplanen. |
+| `expense_vat_preflight` | `expense vat-preflight` | `{ company, documentId }` | Ren dry-run: afledt region, krævet validering, cache-friskhed, sikker evidens/exception og om apply ville kalde provider. |
 | `accounts_roles_status` | `accounts roles-status` | `{ company }` | Viser bekræftede kontoroller, importforslag, tvetydigheder og den read-only posting-resolution. |
+
+Document-party resolution uses exactly one visible state per document: `resolved`, `internal_no_external_party`, or `unresolved`. `documents_internal_no_external_party` is limited to internal vouchers and records a confirmed, actor-audited, hash-bound append-only decision; it never mutates document bytes, VAT, or journals.
 | `accrual_register_report` | `accrual register-report` | `{ company }` | Register af periodeafgrænsningsposter med bogførte perioder, periodiseret beløb og resterende balanceeksponering. |
 | `asset_register_report` | `asset register-report` | `{ company }` | Aktivregister med akkumulerede afskrivninger og bogført værdi. |
 | `audit_log_list` | `gdpr audit-log` (delvis) | `{ company, fromDate?, toDate?, eventTypeLike?, actorLike?, limit?, offset? }` | Filtreret, pagineret read af audit_log — den menneskelæsbare revisionsspor over hvad agenten/cockpittet/CLI'en har gjort. Append-only på server-siden. |
@@ -244,12 +292,19 @@ frit og parallelt.
 | `company_profile_get` | `company profile` | `{ company }` | Henter virksomhedens gemte profil-stamdata (navn, CVR, valuta, land, adresse, regnskabsår-start, betalingsfrist, momsperiode). Hver fakturering, momsrapport og årsrapport bygger på disse felter. |
 | `meta_about` | (ingen — kun MCP) | `{}` | Server-identifikation: serverName, serverVersion, antallet af registrerede tools, rules-bundle-versionen og repo-relative stier til kontrakt-dokumenter. Bruges af agenten lige efter `initialize` for at verificere identitet/version. |
 | `budget_forecast` | `budget forecast` | `{ company, startDate, months }` | Likviditetsprognose: fremskriver banksaldoen måned for måned ud fra primosaldo, åbne fakturaer der forfalder, planlagte gentagne fakturaer og budgetterede omkostninger. Rent deterministisk. |
+| `liquidity_forecast_13_week` | — | `{ company, startDate, weeks? }` | Read-only 13-week forecast with source buckets. `closingCash` is canonical-base cash; `scenarioClosingCash` adds dated reviewed assumptions. Undated account budgets remain informational, VAT is canonical only when filing-safe/closed-or-reported and settlement state stays explicit. Foreign currency is excluded unless a dated FX source is supplied. |
+| `supplier_commitment_plan` | `supplier-commitment plan` | `{ company, commitment }` | Strict read-only proposal from source references; a recurring bank pattern is never a contract. |
+| `supplier_commitment_apply` | `supplier-commitment apply` | `{ company, commitment, payloadHash, confirm, idempotencyKey? }` | Appends reviewed planning evidence only; never creates a payable, journal, payment or supplier message. |
+| `supplier_commitment_list` | `supplier-commitment list` | `{ company }` | Lists active immutable commitment revisions and their hashes. |
+| `supplier_commitment_change` | `supplier-commitment change` | `{ company, commitmentId, action, reason, confirm }` | Appends pause/end/supersession history without deleting earlier occurrences. |
+| `supplier_commitment_match` | `supplier-commitment match` | `{ company, commitmentId, occurrenceDate, evidence, confirm }` | Confirmed append-only evidence link to a canonical document, payable, or bank transaction. It never posts or settles anything; FX comparisons are explicitly unsupported. |
+| `supplier_commitment_matches` | `supplier-commitment matches` | `{ company, commitmentId? }` | Reads recorded evidence links and their deterministic amount/date/currency/party/documentation variance. |
+| `supplier_commitment_alerts` | `supplier-commitment alerts` | `{ company, asOf }` | Reads renewal and notice alerts in the next 30 days. |
 | `budget_list` | `budget list` | `{ company, period?, accountNo? }` | Lister de gældende (seneste-revision) budgetlinjer. |
 | `budget_vs_actual` | `budget vs-actual` | `{ company, from, to }` | Sammenligner budget mod faktisk bogføring pr. konto pr. måned. |
 | `customer_list` | `customer list` | `{ company, archived?, limit?, offset? }` | Lister kendte kunder. Pagineret. |
-| `customer_validate_vat` | `customer validate-vat` | `{ company, cvr }` | Validerer EU-VAT via VIES og opdaterer en lokal validerings-cache. Klassificeret `read` (se note nedenfor): den skriver kun en gennemsigtig opslags-cache, ingen bogførings-/stamdata-state, og kræver ikke `confirm`. |
-| `cvr_lookup` | `customer cvr-lookup` | `{ company, cvr }` | Slår en dansk virksomhed op i CVR-registret. Kræver `CVR_USERNAME`/`CVR_PASSWORD`. |
 | `documents_list` | `documents list` | `{ company, limit?, offset? }` | Lister gemte bilag. Pagineret. |
+| `efaktura_onboarding_status` | `efaktura onboarding-status` | `{ company }` | Lokal, secret-redacted DigiSense-readiness for ledgerens profil; foretager ingen netværkskald og returnerer aldrig API-nøgle eller signature secret. |
 | `exceptions_list` | `exceptions list` | `{ company, status?, includeArchived? }` | Lister exceptions-køen (open/resolved/all). |
 | `import_archive_list` | `import archive` | `{ company, sourceSystem? }` | Lister pre-cut-over regnskabsår arkiveret fra et flerårigt eksport. |
 | `import_archive_year` | (afledt af `import archive`)¹ | `{ company, fiscalYear, sourceSystem? }` | Henter ét arkiveret regnskabsårs fulde posteringer + saldobalance. |
@@ -258,6 +313,7 @@ frit og parallelt.
 | `invoice_interest_calc` | `invoice interest` | `{ company, documentId? \| invoiceNumber?, asOf, referenceRate }` | Beregner morarente (uden at registrere). `accruedInterestAmount` er den **inkrementelle** rente der kan opkræves nu (perioden siden sidste registrerede krav, eller fra forfald hvis ingen). Ekstra felter: `priorClaimedInterest`, `totalInterestToDate`, `claimableDays`, `interestFromDate`. |
 | `invoice_interest_correction_calc` | `invoice interest-correction` | `{ company, documentId? \| invoiceNumber? }` | Foreslår en korrektion af for meget opkrævet morarente (read-only). Opstår når en betaling/kreditnota er registreret med virkningsdato inde i et allerede bogført rentekravs vindue. Felter: `hasProposal`, `overClaimedAmount`, `postedInterest`, `lawfulInterest`, `alreadyCorrected`, `throughDate`. |
 | `invoice_list` | `invoice list` | `{ company, status?, from?, to?, customerCvr?, customer?, invoiceNumber?, minAmount?, maxAmount?, asOf? }` | Lister udstedte fakturaer med filtre. |
+| `invoice_imported_receivables` | `invoice imported-receivables` | `{ company, asOf }` | Lister kildebeviste importerede tilgodehavender pr. cutoff. Listen er et arkiv-read og indeholder aldrig Rentemester-udstedte fakturaer. HTTP-paritet: `GET /api/companies/:slug/imported-receivables?asOf=YYYY-MM-DD`. |
 | `invoice_overdue` | `invoice overdue` | `{ company, asOf?, minDays? }` | Lister forfaldne, ikke fuldt afregnede fakturaer. |
 | `invoice_status` | `invoice status` | `{ company, documentId? \| invoiceNumber?, asOf? }` | Viser åben saldo og status på en faktura. |
 | `invoice_validate` | `invoice validate` | `{ payload: InvoicePayload }` | Validerer faktura-payload uden at gemme. |
@@ -268,14 +324,22 @@ frit og parallelt.
 | `payable_list` | `payable list` | `{ company, status?, asOf? (legacy alias: asOfDate), supplier?, vendorId?, from?, to?, minDays? }` | Bygger kreditorlisten: åbne leverandørposter med åben saldo og forfaldsintervaller (forfaldne/ikke-forfaldne). |
 | `period_list` | (ingen — kun MCP)² | `{ company }` | Lister regnskabsperioder (open/closed/reported). |
 | `portfolio_overview` | `dashboard` (delvist) | `{ workspace, asOf? }` | Status side om side for hver virksomhed i workspace'et. Intet konsolideres. |
+| `cfo_analytics_query` | `report analytics` | `{ workspace, scope, from, to, companySlug?/companySlugs?/groupProfileId?, filters?, cursor?, limit? }` | Versioneret, læsende analyse med journal-/arkivkilder. Portfolio er tydeligt ikke-konsolideret; gruppe bruger kun godkendt konsolideringsprofil. |
 | `reconcile_bank` | `reconcile bank` | `{ company, from, to, status?, textMatch?, amount?, account? }` | Bygger bank-afstemningsrapport for periode. |
+| `bank_reconciliation_correction_plan` | `bank correction-plan` | `{ company, bankTransactionId, replacementJournalEntryId }` | Read-only, deterministisk plan med den aktuelle afstemningsidentitet og plan-hash. |
+| `bank_reconciliation_correction_apply` | `bank correction-apply` | `{ company, bankTransactionId, replacementJournalEntryId, expectedReconciliationId, planHash, reason, idempotencyKey, confirm }` | Supersederer atomisk kun den reviewede afstemning; journaler og historiske links ændres aldrig. |
+| `direct_bank_purchase_payable_correction_plan` | `bank direct-payable-plan` | `{ company, documentId, bankTransactionId, billDate, dueDate, expenseAccountNo, ... }` | Read-only plan der binder dokument-, konto-, VAT-, periode- og bankevidens til `planHash`. |
+| `direct_bank_purchase_payable_correction_apply` | `bank direct-payable-apply` | `{ ..., planHash, reason, idempotencyKey, confirm }` | Flytter append-only et direkte bankkøb til payable og betaler på den autoritative bankdato; læs status før retry med en ny nøgle. |
 | `recurring_invoice_list` | `recurring-invoice list` | `{ company, includeInactive? }` | Lister gentagende fakturaskabeloner. |
+| `recurring_invoice_run_workspace` | `recurring-invoice run-workspace` | `{ workspace, asOfDate, confirm }` | Eksplicit scheduler-kørsel for aktive manifestvirksomheder. Ingen indbygget cron; arkiverede/uinitialiserede springes over og resultater er secret-frie. |
 | `retention_status` | `retention status` | `{ company, asOf? }` | Viser opbevaringsfrister og udløbet materiale. |
 | `gdpr_audit_log` | `gdpr audit-log` | `{ company, since?, until?, asOf?, signWithEd25519? }` | Eksporterer GDPR-hændelser med deterministisk fingerprint og valgfri signatur; skriver ikke state. |
 | `system_backup_destination_list` | `system backup-destinations` | `{ company }` | Lister konfigurerede backup-destinationer med attestering. |
 | `system_backup_governance` | `system backup-governance` | `{ company, asOf? }` | Samlet backup-status: forfald, lås, destinationer, sikker placering. |
 | `system_backup_status` | `system backup-status` | `{ company, asOf? }` | Tjekker om backup-pligten er opfyldt. |
-| `system_healthcheck` | `system healthcheck` | `{ company }` | Tjekker virksomhedsmappens integritet. |
+| `system_healthcheck` | `system healthcheck` | `{ company }` | Read-only integritetstjek. `company` accepterer både workspace-slug og sikker sti; resultatet indeholder `checks`, `missing` og `schema` (inkl. ventende migrationsidentiteter). Stifejl redigeres før de vises til kaldende agent. |
+
+`system migrate --company <slug|path> [--apply yes]` er bevidst CLI-only og har ingen MCP-pendant. Uden `--apply yes` er den en read-only schema-preflight; `--apply` accepterer kun den eksakte værdi `yes` og kræver en allowlistet actor.
 | `tax_return_prepare` | `report tax` | `{ company, from, to }` | Forbereder selskabets skattepligtige indkomst (oplysningsskema) for et lukket regnskabsår: årets resultat + deterministiske skattemæssige reguleringer + 22% selskabsskat (kun ApS). Ikke-deterministiske poster markeres som needs-review. |
 | `vat_eu_sales_list` | `vat eu-sales-list` | `{ company, from, to }` | EU-salg uden moms-liste (VIES recapitulative statement): værdien af grænseoverskridende B2B-salg uden dansk moms grupperet pr. køber-VAT-nummer. |
 | `vat_oss_report` | `vat oss-report` | `{ company, from, to }` | OSS-rapportskelet (One Stop Shop, første slice): grundlaget for digitale ydelser solgt til EU-forbrugere. Ikke en OSS-indberetning til SKAT. |
@@ -288,29 +352,13 @@ samme arkiv-artefakt som `import archive` skriver.
 
 > **`customer_validate_vat` — read/write-klassifikation.** Tool'et slår et
 > EU-VAT-nummer op mod VIES og *skriver* resultatet til en lokal cache-tabel
-> (`vies_validations`). Det er bevidst klassificeret `read`
-> (`readOnlyHint: true`) og kræver derfor *ikke* `confirm: true`: den eneste
-> side-effekt er en gennemsigtig opslags-cache med TTL — der skrives hverken
-> i finanskæden eller i stamdata, og et gentaget opslag inden for TTL
-> genbruger blot cachen (`idempotentHint: true`).
+> (`vies_validations`). Det er derfor klassificeret `write-reversible`
+> (`readOnlyHint: false`) og kræver `confirm:true`. Den skriver ikke i
+> finanskæden eller stamdata, og et gentaget opslag inden for TTL genbruger
+> blot cachen (`idempotentHint: true`).
 >
-> **Bemærk en bevidst CLI/MCP-divergens i governance-klasse.** Den ramme
-> handling er den samme (et cache-opdaterende VIES-opslag), men de to
-> overflader klassificerer den forskelligt:
->
-> - **MCP-tool'et `customer_validate_vat`** er `read` — det er *ikke*
->   `confirm`-gatet og kræver ingen actor.
-> - **CLI-kommandoen `customer validate-vat`** står derimod i
->   `MUTATING_COMMANDS` (`src/cli-actor.ts`): den er actor-gatet og afvises
->   uden en kendt actor med `actor required for mutations`.
->
-> Det er altså *ikke* korrekt at kalde de to "konsistente" — de sidder i
-> materielt forskellige governance-klasser (read vs. actor-gatet mutation).
-> Divergensen er accepteret: CLI'en behandler enhver cache-skrivende handling
-> som muterende for at få actor-attribution på opslaget, mens MCP-laget
-> vægter at et opslag skal kunne kaldes frit. Vil man harmonisere, skal
-> enten CLI-kommandoen ud af `MUTATING_COMMANDS`, eller MCP-tool'et
-> omklassificeres til en `confirm`-gatet write.
+> MCP og CLI klassificerer begge cache-opdateringen som en bekræftet mutation;
+> der er ingen read-only undtagelse for VIES-cachen.
 
 ## Write-tools
 
@@ -327,7 +375,7 @@ uden at kernen kaldes.
 
 ### write-reversible
 
-13 tools. Opretter state der kan tilbageføres/arkiveres uden at røre den
+17 tools. Opretter state der kan tilbageføres/arkiveres uden at røre den
 append-only finanskæde.
 
 | Tool | CLI-ækvivalent | Input | Brief |
@@ -335,10 +383,15 @@ append-only finanskæde.
 | `accounts_role_confirm` | `accounts role-confirm` | `{ company, role, accountNo, confirm }` | Bekræfter eksplicit ét kompatibelt kontorolle-forslag med actor- og versionsspor; senere confirmation kan ændre mappingen. |
 | `bank_import` | `bank import` | `{ company, csvPath \| csvContent, account?, profile?, confirm }` | Importerer banktransaktioner fra CSV. Se den kanoniske [idempotenskontrakt](bank-import-idempotency.md). |
 | `budget_set` | `budget set` | `{ company, accountNo, period, amount, notes?, confirm }` | Sætter et budget for én konto i én kalendermåned. Append-only revisioner — seneste vinder. |
+| `dimension_assignment_replace` | `dimensions replace` | `{ company, journalLineId, expectedAssignmentId, allocations, planHash, reason, idempotencyKey?, confirm }` | Erstatter atomisk den forventede aktuelle dimensionsklassifikation med den eksakte reviewede plan; journalen ændres aldrig, og der opstår ingen ubeskyttet mellemtilstand. |
 | `company_sync_cvr` | `company sync-cvr` | `{ company, confirm }` | Henter virksomhedens stamdata fra CVR og opdaterer companies-rækken. Regnskabsåret røres ikke. |
+| `customer_validate_vat` | `customer validate-vat` | `{ company, cvr, confirm }` | Validerer EU-VAT via VIES og opdaterer den lokale cache. |
+| `cvr_lookup` | `customer cvr-lookup` | `{ company, cvr, confirm }` | Slår en dansk virksomhed op i CVR-registret og cacher snapshottet. Kræver `CVR_USERNAME`/`CVR_PASSWORD`. |
 | `customer_create` | `customer create` | `{ company, input: CreateCustomerInput, fromCvr?, confirm }` | Opretter append-only kundepost. Kan arkiveres. |
-| `documents_ingest` | `documents ingest` | `{ company, filePath, metadata: DocumentMetadata, vendorId?, force?, confirm }` | Indlæser og hash-lagrer et bilag. |
+| `documents_ingest` | `documents ingest` | `{ company, filePath, metadata: DocumentMetadata, vendorId?, force?, confirm }` | Indlæser og hash-lagrer et bilag. `internal_voucher` kræver bank-id, begrundelse og moms 0. |
+| `documents_set_company_context` | `documents set-company-context` | `{ company, documentId, sourceReference, businessUseReason, confirm }` | Gemmer append-only, hash-bundet virksomheds- og forretningskontekst for et dansk forenklet købsbilag eller et ufuldstændigt standardkøbsbilag; ændrer aldrig modtagerfelter på fakturaen og er ikke en moms-godkendelse. |
 | `efaktura_modtag` | `efaktura modtag` | `{ company, digisenseCompanyKey?, limit?, maxTimestamp?, metadata?, force?, confirm }` | Poller modtagne e-fakturaer hos Digisense (pagination), ingester hvert nyt dokument. Dedup på internalId — rerun-stabil. |
+| `efaktura_modtag_workspace` | `efaktura modtag-workspace` | `{ workspace, confirm }` | Poller aktive manifest-virksomheder med deres lokale bindings; ingen caller credentials/companyKey og redigerede per-company resultater. |
 | `exception_resolve` | `exceptions resolve` | `{ company, id, note?, confirm }` | Markerer exception som løst. |
 | `imap_intake_poll` | `imap-intake poll` | `{ company, imapHost, imapPort?, imapUsername, imapMailbox?, sinceUid?, metadata?, metadataPerMessage?, force?, confirm }` | Poller en IMAP-postkasse og videresender vedhæftninger til bilags-pipelinen. Dedup-stabil. |
 | `mail_intake_ingest` | `mail-intake ingest` | `{ company, source, metadata?, metadataPerMessage?, force?, confirm }` | Indlæser en `.eml`-fil/maildrop-mappe og videresender vedhæftninger. Idempotent. |
@@ -348,7 +401,7 @@ append-only finanskæde.
 
 ### write-irreversible
 
-49 tools (tæl tabellen — den er facit). Bogfører i den append-only hash-kæde eller skriver
+51 tools (tæl tabellen — den er facit). Bogfører i den append-only hash-kæde eller skriver
 revisionsklare/eksterne artefakter; kan kun "rulles tilbage" via en
 modpostering.
 
@@ -359,14 +412,17 @@ modpostering.
 | `gdpr_export` | `gdpr export` | `{ company, cvr?, name?, asOf?, confirm }` | Bygger en retention-annoteret DSAR og skriver et actor-attribueret, append-only `gdpr_export`-audit-event. |
 | `accrual_recognize` | `accrual recognize` | `{ company, accrualId, period, date?, settlementAccountNo?, confirm }` | Indtægts-/omkostningsfører én periode af en periodeafgrænsningspost. |
 | `efaktura_konfigurer` | `efaktura konfigurer` | `{ company, apiLicenseKey, environment?, confirm }` | Gemmer Digisense API license-key i secret-laget (config/digisense.json, 0600). PRECONDITION for efaktura_registrer/efaktura_modtag/efaktura_send. license-key rammer aldrig ledger'en. |
+| `efaktura_onboard` | `efaktura onboard` | `{ company, confirm }` | Validerer auth og registrerer idempotent kun ledgerprofilens eget CVR inbound + outbound. Ekstern registrering gør governance-klassen write-irreversible. |
 | `efaktura_registrer` | `efaktura registrer` | `{ company, cvr, companyName, network?, confirm }` | Registrerer en virksomhed i NemHandel via Digisense: register-company ⇒ gemmer companyKey ⇒ register-participant for BÅDE outbound OG inbound. webhookUrl=null (vi poller selv). Idempotent: re-run med samme CVR duplikerer ikke state. |
-| `efaktura_send` | `invoice transmit-digisense` | `{ company, documentId? \| invoiceNumber?, digisenseCompanyKey?, accessPoint?, confirm }` | Sender en udstedt offentlig e-faktura gennem Digisense: validate-document ⇒ deliver-document ⇒ poll til delivered; bogfører succes som acknowledged PEPPOL-submission. Access-point-identiteten udledes deterministisk af companyKey (Digisense ER access point'et), så gentaget send er idempotent og leverer aldrig dobbelt. |
+| `efaktura_send` | `invoice transmit-digisense` | `{ company, documentId? \| invoiceNumber?, digisenseCompanyKey?, confirm }` | Sender en udstedt offentlig e-faktura gennem Digisense: validate-document ⇒ deliver-document ⇒ poll til delivered; bogfører succes som acknowledged PEPPOL-submission. Kun den konfigurerede Digisense-identitet indgår i idempotens. |
+| `efaktura_status` | `efaktura status` | `{ company, documentId, digisenseCompanyKey?, confirm }` | Genoptager en allerede køsat afsendelse med document-status alene; append-only status-evidens betyder, at en senere send ikke redeliverer. |
 | `accrual_register` | `accrual register` | `{ company, accrualType, description, totalAmount, recognitionPeriods, firstRecognitionDate, resultAccountNo, registrationDate?, periodStepMonths?, balanceAccountNo?, settlementAccountNo?, documentId?, note?, confirm }` | Registrerer en periodeafgrænsningspost og bogfører registreringsposteringen. |
 | `asset_depreciate` | `asset depreciate` | `{ company, assetId, period, date, confirm }` | Bogfører en periodes afskrivning. |
 | `asset_register` | `asset register` | `{ company, name, category, acquisitionDate, cost, usefulLifeMonths, documentId, assetAccount, depreciationAccount, accumulatedAccount, note?, confirm }` | Registrerer et aktiv med lineær afskrivningsplan. |
 | `asset_write_off` | `asset write-off` | `{ company, name, category, acquisitionDate, cost, documentId, expenseAccount, date, thresholdRuleSource, confirmImmediateWriteOff, paymentAccount?, note?, confirm }` | Bogfører straksafskrivning af et mindre aktiv. |
 | `company_add` | `company add` | `{ workspace?, name, slug?, cvr?, fiscalYearStartMonth?, fiscalYearLabelStrategy?, confirm }` | Opretter en ny virksomhed under `<workspace>/<slug>/` og initialiserer ledgeren. Som ethvert write-tool kræver det `confirm: true` — uden flaget returneres `{ ok:false, errors:["confirm: true required for write tool company_add"] }` uden at noget oprettes. Udelades `workspace`, bruges miljøvariablen `RENTEMESTER_WORKSPACE` på MCP-serverens host; er den heller ikke sat, afvises kaldet med `no workspace given: pass 'workspace' or set RENTEMESTER_WORKSPACE`. **Ikke idempotent (`idempotentHint: false`):** et gentaget kald med samme `name`/`slug` *afvises* — det overskriver ALDRIG en eksisterende virksomhed. Findes der allerede en ledger på `<workspace>/<slug>/` fejler kaldet med `a company already exists at <sti>`, og et slug der allerede står i workspace-manifestet afvises ligeledes med en `ok:false`-envelope. For at oprette endnu en virksomhed med samme navn skal et nyt, unikt `slug` angives eksplicit. |
 | `expense_book` | `expense book` | `{ company, documentId, bankTransactionId, expenseAccount, vatTreatment?, paymentAccount?, date?, text?, confirm }` | Bogfører leverandørudgift fra bilag + bankpost. |
+| `expense_vat_preflight_apply` | `expense vat-preflight --apply yes` | `{ company, documentId, confirm }` | Actor-attribueret EU-VAT-preflight; gemmer kun sikker evidens og en resumérbar exception ved blokering. |
 | `invoice_apply_payment` | `invoice apply-payment` | `{ company, payload: InvoicePaymentPayload, confirm }` | Registrerer fakturabetaling fra payload. Forudsætning: `invoice_post`. |
 | `invoice_claim_compensation` | `invoice claim-compensation` | `{ company, documentId? \| invoiceNumber?, asOf, amountDkk?, note?, confirm }` | Registrerer kompensationskrav. Forudsætning: `invoice_post` (fakturaen skal være bogført og forfalden). |
 | `invoice_claim_interest` | `invoice claim-interest` | `{ company, documentId? \| invoiceNumber?, asOf, referenceRate, note?, confirm }` | Registrerer morarentekrav. Forudsætning: `invoice_post` (fakturaen skal være bogført og forfalden). Et nyt krav opkræver kun renten for perioden siden sidste krav (inkrementelt — ingen dobbelt-opkrævning), så rente kan registreres ad flere omgange. |
@@ -379,8 +435,8 @@ modpostering.
 | `invoice_post_reminder` | `invoice post-reminder` | `{ company, documentId? \| invoiceNumber?, reminderId?, date?, confirm }` | Bogfører registreret rykker. Forudsætning: `invoice_remind`. |
 | `invoice_refund_bank` | `invoice refund-bank` | `{ company, payload: RefundPayload, confirm }` | Bogfører refundering til kunde fra banken. Forudsætning: `invoice_post`. |
 | `invoice_remind` | `invoice remind` | `{ company, documentId? \| invoiceNumber?, date, fee?, note?, confirm }` | Registrerer rykker på forfalden faktura. Forudsætning: `invoice_post` (fakturaen skal være bogført og forfalden). |
-| `invoice_render` | `invoice render` | `{ company, documentId? \| invoiceNumber?, confirm }` | Renderer (eller genskaber) deterministisk PDF. Idempotent. Forudsætning: `invoice_issue`. |
-| `invoice_send_email` | `invoice send` | `{ company, documentId? \| invoiceNumber?, kind?, to?, confirm }` | Sender faktura/rykker via SMTP med PDF vedhæftet. Idempotent. SMTP-config læses fra `config/smtp.json` i virksomhedsmappen — påkrævede felter: `host`, `port`, `fromAddress`; valgfri: `fromName`, `username`, `password`, `dryRun`. Mangler filen ⇒ `{ ok:false, errors:["missing SMTP config: ..."] }`. Den indbyggede transport kører **kun** i dry-run: `dryRun:true` registrerer afsendelsen uden netværkskald (`ok:true`); uden `dryRun:true` fejler et rigtigt send med en `ok:false`-envelope. |
+| `invoice_render` | `invoice render` | `{ company, documentId? \| invoiceNumber?, confirm }` | Returnerer og hash-verificerer den immutabelt udstedte PDF. Manipuleret eller manglende evidens genskabes aldrig. Idempotent. Forudsætning: `invoice_issue`. |
+| `invoice_send_email` | `invoice send` | `{ company, documentId? \| invoiceNumber?, kind?, to?, confirm }` | Sender faktura/rykker via SMTP med PDF vedhæftet. SMTP har ingen provider-reconciliation-kontrakt: læs den kanoniske delivery-evidens før et retry; et nyt send må aldrig antages sikkert alene ud fra input. SMTP-config læses fra `config/smtp.json` i virksomhedsmappen — påkrævede felter: `host`, `port`, `fromAddress`; valgfri: `fromName`, `username`, `password`, `dryRun`. Mangler filen ⇒ `{ ok:false, errors:["missing SMTP config: ..."] }`. Den indbyggede transport kører **kun** i dry-run: `dryRun:true` registrerer afsendelsen uden netværkskald (`ok:true`); uden `dryRun:true` fejler et rigtigt send med en `ok:false`-envelope. |
 | `invoice_settle_bank` | `invoice settle-bank` | `{ company, payload: SettlementPayload, confirm }` | Matcher bankbetaling mod faktura. Forudsætning: `invoice_post`. |
 | `invoice_settle_claim_bank` | `invoice settle-claim-bank` | `{ company, payload: ClaimSettlementPayload, confirm }` | Matcher bankbetaling mod fakturakrav. Forudsætning: `invoice_post` + relevant `invoice_post_reminder` / `invoice_post_interest` / `invoice_post_compensation`. |
 | `invoice_write_off_bad_debt` | `invoice write-off-bad-debt` | `{ company, payload: BadDebtPayload, confirm }` | Bogfører tab på debitor. Forudsætning: `invoice_post`. |
@@ -390,7 +446,7 @@ modpostering.
 | `payable_register` | `payable register` | `{ company, documentId, billDate, dueDate, expenseAccount, vatTreatment?, vendorId?, note?, confirm }` | Registrerer et bogført leverandørbilag som en åben kreditorpost (debit udgift + købsmoms, credit 7000 Leverandørgæld). |
 | `peppol_submit_public_invoice` | `invoice submit-public-peppol` | `{ company, documentId? \| invoiceNumber?, accessPoint, acknowledgement?, confirm }` | Bygger en idempotent PEPPOL-submission-envelope og registrerer forsøget. |
 | `period_close` | `period close` | `{ company, from, to, kind?, status?, reference?, confirm }` | Lukker eller markerer regnskabsperiode. |
-| `recurring_invoice_create` | `recurring-invoice create` | `{ company, name, interval, firstIssueDate, invoice: InvoicePayload, paymentTermsDays?, deliveryPeriodMode?, notes?, confirm }` | Opretter en gentagende fakturaskabelon. `invoice` er en typet `InvoicePayload` (samme form som `invoice_issue`) — men dato-/nummerfelter (`invoiceNumber`, `issueDate`, `dueDate`, leveringsdatoer) sættes IKKE her; `recurring_invoice_generate` udleder dem pr. periode. |
+| `recurring_invoice_create` | `recurring-invoice create` | `{ company, name, interval: weekly|monthly|quarterly|yearly, intervalCount?, deliveryChannel?: manual|email|digisense, firstIssueDate, invoice: InvoicePayload, paymentTermsDays?, deliveryPeriodMode?, notes?, confirm }` | Opretter en gentagende fakturaskabelon. `invoice` er en typet `InvoicePayload` (samme form som `invoice_issue`) — men dato-/nummerfelter (`invoiceNumber`, `issueDate`, `dueDate`, leveringsdatoer) sættes IKKE her; `recurring_invoice_generate` udleder dem pr. periode. |
 | `recurring_invoice_generate` | `recurring-invoice generate` | `{ company, templateId, asOfDate, confirm }` | Materialiserer den forfaldne faktura for skabelonen. Idempotent pr. template/periode. |
 | `system_backup` | `system backup` | `{ company, at?, archive?, confirm }` | Opretter revisionsklar backup. `archive:true` pakker straks til ét `.tar`. |
 | `system_backup_archive` | `system backup-archive` | `{ company, backupId?, out?, confirm }` | Pakker en eksisterende backup til ét deterministisk `.tar` (+ `.sha256`). |
@@ -399,10 +455,18 @@ modpostering.
 | `system_backup_destination_remove` | `system backup-remove-destination` | `{ company, id, confirm }` | Fjerner en konfigureret backup-destination. |
 | `system_backup_lock` | `system backup-lock` | `{ company, enforced, graceDays?, at?, confirm }` | Konfigurerer den frivillige bogførings-lås. |
 | `system_backup_place` | `system backup-place` | `{ company, archivePath, destinationId, actorKind?, at?, note?, confirm }` | Kopierer et backup-arkiv til en lokal/synkroniseret destination og verificerer med sha256. |
-| `system_backup_verify_remote_placement` | `system backup-verify-remote-placement` | `{ company, destinationId, backupId, archiveSha256, archiveSizeBytes, remoteProvider, remoteObjectId, remoteObjectName, remoteParentId, maxMetadataAgeMs?, actorKind?, at?, note?, confirm }` | Verificerer remote objektidentitet, placering, størrelse og checksum via provider-adapter før evidensen registreres som verificeret. |
+| `system_backup_verify_remote_placement` | `system backup-verify-remote-placement` | `{ company, destinationId, backupId, remoteObjectId, maxMetadataAgeMs?, actorKind?, at?, note?, confirm }` | Verificerer det kanoniske lokale `<backupId>.tar` mod remote objekt via provider-adapter før evidensen registreres som verificeret. |
 | `system_export_authority` | `system export-authority` | `{ company, from, to, out, requestedAt?, requester?, confirm }` | Eksporterer materiale til myndighedsudlevering. |
 | `vat_post_eu_service_purchase` | `vat post-eu-service-purchase` | `{ company, payload: ReverseChargePurchaseInput, confirm }` | Bogfører EU-servicekøb med reverse charge. |
 | `vat_post_representation_purchase` | `vat post-representation-purchase` | `{ company, payload: RepresentationPurchaseInput, confirm }` | Bogfører repræsentationsudgift med delvis momsfradrag. |
+
+Google Drive-verifikation bruger et kortlivet token fra
+`RENTEMESTER_GOOGLE_DRIVE_ACCESS_TOKEN`; tokenet lagres aldrig i virksomhedens
+mappe, backup, ledger eller auditlog. Udsted tokenet med `drive.file`, når
+Rentemester har oprettet eller fået delt den konkrete backupfil. Hvis et
+eksisterende objekt kræver den bredere `drive.readonly`, er det en særskilt
+produktions-/sikkerhedsgodkendelse. Rotér tokenet i hostmiljøet og genstart
+processen; fejl ved manglende eller tilbagekaldt token stopper fail-closed.
 
 > De seks `system_backup_*`-konfigurations-tools (`*_archive`,
 > `*_confirm_placement`, `*_destination_add`, `*_destination_remove`,
@@ -513,6 +577,18 @@ konkret diff, der vedligeholdes pr. fil.
 
 ### MCP-only — tools uden CLI-pendant
 
+- `src/mcp/tools/agent-discovery.ts` — `agent_capability_search` og
+  `agent_workflow_describe` er read-only runtime-discovery for den versionerede
+  outcome-katalog; de har ingen CLI-pendant.
+- `src/mcp/tools/bookkeeping-workbench.ts` — `bookkeeping_workbench` er den
+  read-only, kanoniske bankarbejdskø. Den viser den eksplicitte
+  dokument-part-resolution og canonical party fra `current_document_party_links`
+  (aldrig `documents.sender_name` som party-identitet), plus konto, moms og
+  dimensioner. Filtre ændrer kun siden; `population.blockers` er altid for hele
+  den kanoniske population. Følg række-drilldowns til bilag, party, bank,
+  reviewet batch, journal og periodeluk, og brug derefter den eksisterende
+  hash-bundne plan → persist → approve → apply-kontrakt for alle writes.
+
 MCP-tools, der ikke findes på CLI'en (`src/mcp/tools/<filename>.ts` ⇒ intet
 modsvar i `src/cli/`). En agent, der CLI-fortrinsstiller, vil aldrig opdage
 disse uden at læse mapping-doc'en:
@@ -566,6 +642,43 @@ regnskabsperiode (`period reopen`) er fx CLI-only — se også underafsnittet
   resten er CLI-only.
 - `src/cli/serve.ts` — `serve` (starter cockpit HTTP-API'en). Det er en
   proces-host og giver ikke mening som MCP-tool.
+- `src/cli/group.ts` — strukturkommandoerne `validate-manifest`,
+  `apply-manifest` og `overview` samt mellemregningskommandoerne
+  `validate-mapping`, `propose-mapping`, `approve-mapping`, `revoke-mapping`
+  og `reconcile`, samt balanceelimineringernes `propose-elimination`,
+  `approve-elimination`, `reject-elimination`, `apply-elimination`,
+  `reverse-elimination` og `eliminations`. Mappings og eliminationer har
+  append-only lifecycle og særskilt reviewer;
+  afstemning er read-only, eksplicit dateret og kun sammenlignelig i samme
+  funktionsvaluta. Der er bevidst ingen MCP-vej, før en særskilt workspace-wide
+  autorisationskontrakt er eksponeret der.
+- `src/cli/workspace-access.ts` — `workspace-access bootstrap-first`:
+  lokal, engangs bootstrap af workspace-ejer og medlemskaber. Den private
+  sikkerhedsbootstrap må ikke udstilles som et generelt MCP-tool.
+- `src/cli/workspace-snapshot.ts` — `workspace snapshot` og
+  `workspace restore`: credential-fri, signeret flytning af et helt workspace
+  med staged restore og eksplicit geninvitation af identiteter. Det er en
+  administrativ backup-/recovery-grænse og udstilles ikke som MCP-tool.
+- `src/cli/workspace-registry.ts` ↔ `src/mcp/tools/workspace-registry.ts` —
+  canonical parties og immutable corporate records med explicit company-scope,
+  actor/confirm på writes og filtrering før pagination.
+- `src/cli/workspace-registry.ts` ↔ `src/mcp/tools/workspace-document-inbox.ts` —
+  immutable workspace-indbakke med eksplicit, adgangskontrolleret routing og
+  ét canonical company-handoff; kilden ligger aldrig i en workspace-hovedbog.
+- `src/cli/group.ts` ↔ `src/mcp/tools/intercompany-dispositions.ts` —
+  source-linked two-sided disposition lifecycle. MCP requires live, narrow
+  membership on both legal-company endpoints; it can plan, propose, approve,
+  link, inspect, settle and reopen evidence, but never posts either ledger.
+- `src/cli/report.ts` ↔ `src/mcp/tools/cfo-analytics.ts` — versioneret,
+  source-linked CFO-analyse over live journal og importarkiver. Portfolio er
+  aldrig en konsolidering; group-scope delegerer kun til en godkendt profil.
+- `src/cli/local.ts` — `local start`: loopback-only launcher for den simple
+  én-virksomhedstilstand; det er en proces-host, ikke et MCP-tool.
+- `src/cli/accounting-draft.ts` — det append-only fire-øjne-flow
+  `create`/`revise`/`submit`/`reject`/`approve-and-post` samt `list`/`show`.
+  Hosted HTTP håndhæver bogholder/reviewer-roller via Better Auth-medlemskab;
+  CLI'en håndhæver actor-allowlist og forskellige actors, men workflowet
+  udstilles ikke over MCP før samme rolle- og virksomhedsgrænse findes dér.
 - `src/cli/bank-account.ts` — `bank-account add`/`bank-account list`
   (registrér/lis/opdatér bankkonti for FX-bogføring). MCP-surface'en eksponerer
   `bank_account_list` og confirm-gatede `bank_account_update`; oprettelse er
@@ -594,14 +707,42 @@ og `tools/list`):
   `system export-accountant` (håndoff-pakke til bogholder/revisor) og
   `system backup-guide` (HTML-guide).
 - `src/cli/vat.ts` (tvilling: `src/mcp/tools/vat.ts`) —
-  `vat momsangivelse` (alias: `vat filing`) er CLI-only; MCP har kun
-  `vat_report`, `vat_eu_sales_list`, `vat_oss_report` og `vat_post_*`.
+  `vat momsangivelse` (alias: `vat filing`) har MCP-pendanten `vat_filing`.
+  Begge bygger den read-only, hele-kroner TastSelv-form og indsender aldrig til Skattestyrelsen.
 - `src/cli/import.ts` (tvilling: `src/mcp/tools/import.ts`) —
   `import run` (fuld migrering), `import systems` og `import contacts` er
   CLI-only; MCP har kun `import_archive_list`/`import_archive_year`.
 - `src/cli/customer.ts` (tvilling: `src/mcp/tools/customer.ts`) —
   `customer cvr-lookup` har MCP-pendanten `cvr_lookup` (se MCP-only ovenfor);
   ingen kommandoer i filen er helt uden pendant, men navnene divergerer.
+
+**Nye domæne-tvillinger** — disse filer har direkte, men ikke nødvendigvis
+ord-for-ord, CLI/MCP-pendanter og er derfor hverken CLI-only eller MCP-only:
+
+- `src/cli/bookkeeping-batch.ts` ↔ `src/mcp/tools/bookkeeping-batch.ts` —
+  planlægning, godkendelse og anvendelse af en hash-bundet batch.
+- `src/cli/supplier-commitments.ts` ↔ `src/mcp/tools/supplier-commitments.ts` —
+  reviewede leverandørforpligtelser og deres deterministiske occurrence-flow.
+- `src/cli/dimensions.ts` ↔ `src/mcp/tools/dimensions.ts` — company-scoped,
+  append-only dimension definitions and members, including activate,
+  deactivate, rename and supersede lifecycle events with queryable historical
+  labels, plus hash-bound journal-line allocations. Assignments never alter
+  journal bytes, VAT or legal totals.
+- `src/cli/posting-rules.ts` ↔ `src/mcp/tools/posting-rules.ts` —
+  forslag, lifecycle og dry-run forklaring af virksomheds-lokale
+  konteringsregler.
+- `src/cli/purchase-vat-preflight.ts` ↔ `src/mcp/tools/expense.ts` —
+  `expense vat-preflight` og `expense_vat_preflight[_apply]`; MCP-værktøjet
+  ligger under expense-domænet, mens CLI-adapteren bevidst er en selvstændig
+  fil for at holde provider-I/O ude af posting-kernen.
+- `src/cli/purchase-case.ts` ↔ `src/mcp/tools/purchase-cases.ts` —
+  kildebundne, foreløbige købscases og eksakt review. Flowet bogfører aldrig
+  eller ændrer momsstatus; den efterfølgende bogføring følger det eksisterende
+  purchase-/payable-flow. Købsoverblikkets bogførte grundlag læses altid fra
+  hovedbogen, også for historiske køb uden case. Aktive accounting drafts i
+  perioden vises som en særskilt foreløbig effekt med deres egen økonomidato;
+  de er synlige med `caseId: null`, hvis ingen case findes, og udløser aldrig
+  automatisk historisk case-backfill.
 
 > **Andre kendte mikro-afvigelser (samme filnavn, divergent klassifikation
 > eller ergonomi):**
@@ -640,9 +781,8 @@ og `tools/list`):
 >   `dashboard`, men er et workspace-tool (`workspace`-parameter, ikke
 >   `company`).
 > - **`customer_validate_vat` (MCP) vs. `customer validate-vat` (CLI)** —
->   MCP-tool'et er `read` (ikke confirm-gatet, ingen actor); CLI-kommandoen er
->   `actor`-gatet via `MUTATING_COMMANDS`. Se "Read-tools"-sektionen for den
->   bevidste divergens i governance-klasse.
+>   begge overflader klassificerer den cache-skrivende handling som en
+>   bekræftet mutation.
 >
 > ### Den oprindelige løse note (for historisk reference)
 >

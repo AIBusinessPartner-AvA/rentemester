@@ -1,0 +1,11 @@
+import { existsSync } from "node:fs";
+import { openLedgerReadOnly } from "../../core/ledger-inspection";
+import { companyPaths } from "../../core/paths";
+import { buildThirteenWeekLiquidityForecast } from "../../core/liquidity-forecast";
+import { buildWorkspaceThirteenWeekLiquidityForecast } from "../../core/intercompany-liquidity";
+import { listSupplierCommitments, listSupplierCommitmentOccurrenceMatches, supplierCommitmentAlerts } from "../../core/supplier-commitments";
+import { findWorkspaceCompany, companyRootForSlug } from "../../core/workspace";
+import { openWorkspaceControlReadOnlyDb, workspaceControlPaths } from "../../core/workspace-control";
+import { isValidIsoDate } from "../../core/dates";
+import { ApiError } from "../errors";
+export function buildCompanyCommitments(workspaceRoot:string,slug:string,startDate:string){if(!findWorkspaceCompany(workspaceRoot,slug))throw ApiError.notFound("virksomhed findes ikke");const path=companyPaths(companyRootForSlug(workspaceRoot,slug)).db;if(!existsSync(path))throw ApiError.notFound("virksomheden har ingen ledger");const db=openLedgerReadOnly(path);try{const rows=listSupplierCommitments(db).map(row=>{let commitment:any={};try{commitment=JSON.parse(row.payload_json);}catch{}return {commitmentId:row.commitment_id,payloadHash:row.payload_hash,createdAt:row.created_at,vendor:commitment.vendorSnapshot??commitment.vendorPartyId,purpose:commitment.businessPurpose??commitment.description,amount:commitment.amount??null,currency:commitment.currency??null,frequency:commitment.frequency??null,nextDate:commitment.nextDate??null,renewalDate:commitment.renewalDate??null,status:commitment.status??"active",evidenceRefs:commitment.evidenceRefs??[],missingDocument:false};});if(!isValidIsoDate(startDate))return {commitments:rows,matches:listSupplierCommitmentOccurrenceMatches(db),alerts:[],forecast:buildThirteenWeekLiquidityForecast(db,{startDate})};const control=existsSync(workspaceControlPaths(workspaceRoot).db)?openWorkspaceControlReadOnlyDb(workspaceRoot):null;try{return {commitments:rows,matches:listSupplierCommitmentOccurrenceMatches(db),alerts:supplierCommitmentAlerts(db,startDate),forecast:buildWorkspaceThirteenWeekLiquidityForecast(control,db,slug,startDate)};}finally{control?.close();}}finally{db.close();}}

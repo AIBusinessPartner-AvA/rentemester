@@ -71,7 +71,7 @@ export const invoiceSpecs: CommandSpec[] = [
       "Udelad --invoice-number for automatisk fortløbende nummerering",
     ],
   },
-  { key: "invoice render", usage: "invoice render --company <path> (--document-id <n> | --invoice-number <no>)", description: "Renderer eller genskaber en deterministisk PDF for en udstedt faktura.", allowedFlags: ["--company", "--document-id", "--invoice-number"] },
+  { key: "invoice render", usage: "invoice render --company <path> (--document-id <n> | --invoice-number <no>)", description: "Returnerer og hash-verificerer den immutabelt udstedte PDF; manglende eller manipuleret evidens genskabes aldrig.", allowedFlags: ["--company", "--document-id", "--invoice-number"] },
   { key: "invoice export-public", usage: "invoice export-public --company <path> (--document-id <n> | --invoice-number <no>) --out <file.xml>", description: "Eksporterer en deterministisk preview-artifact til offentlig EAN/GLN e-faktura uden PEPPOL-transport.", allowedFlags: ["--company", "--document-id", "--invoice-number", "--out"] },
   { key: "invoice export-public-oioubl", usage: "invoice export-public-oioubl --company <path> (--document-id <n> | --invoice-number <no>) --out <file.xml>", description: "Eksporterer et deterministisk OIOUBL-handoff-artifact til offentlig e-faktura uden direkte PEPPOL-submission.", allowedFlags: ["--company", "--document-id", "--invoice-number", "--out"] },
   // PEPPOL submission (#128)
@@ -79,12 +79,13 @@ export const invoiceSpecs: CommandSpec[] = [
   // Digisense e-faktura-transport (#efaktura)
   {
     key: "invoice transmit-digisense",
-    usage: "invoice transmit-digisense --company <path> (--document-id <n> | --invoice-number <no>) [--digisense-company-key <key>]",
+    usage: "invoice transmit-digisense --company <path> (--document-id <n> | --invoice-number <no>) --confirm yes [--digisense-company-key <key>]",
     description:
       "Sender en offentlig e-faktura gennem Digisense' access point: validate-document (schematron) -> deliver-document -> poll til delivered, og bogfører en succes som en acknowledged PEPPOL-submission. License-key hentes fra secret-laget (config/digisense.json) — gem den først med `efaktura konfigurer`. companyKey resolves fra Digisense-state eller --digisense-company-key.",
-    allowedFlags: ["--company", "--document-id", "--invoice-number", "--digisense-company-key"],
+    allowedFlags: ["--company", "--document-id", "--invoice-number", "--digisense-company-key", "--confirm"],
     inputNotes: [
       "INTET --access-point: for Digisense ER access point'et Digisense selv (routing på companyKey + license-key). Access-point-identiteten udledes deterministisk af companyKey, så gentaget transmit af samme faktura er idempotent og aldrig leverer dobbelt.",
+      "--confirm yes: påkrævet bekræftelse; kommandoen kræver også en actor.",
       "Forudsætter en gemt license-key (`efaktura konfigurer --api-license-key ...`) og en registreret virksomhed (`efaktura registrer`).",
     ],
   },
@@ -194,6 +195,12 @@ export const invoiceSpecs: CommandSpec[] = [
     description: "Lister udstedte fakturaer med filtre for status, kunde og dato.",
     allowedFlags: ["--company", "--status", "--from", "--to", "--customer-cvr", "--customer", "--invoice-number", "--min-amount", "--max-amount", "--as-of"],
   },
+  { key: "invoice imported-receivables", usage: "invoice imported-receivables --company <path> --as-of <YYYY-MM-DD>", description: "Lister kildebeviste importerede tilgodehavender. De er ikke Rentemester-udstedte fakturaer.", allowedFlags: ["--company", "--as-of"] },
+  { key: "invoice imported-receivables-backfill-plan", usage: "invoice imported-receivables-backfill-plan --company <path> --input <artifact.json>", description: "Planlægger read-only en hash-bundet legacy Dinero-debitorbackfill uden at genafspille importen.", allowedFlags: ["--company", "--input"] },
+  { key: "invoice imported-receivables-backfill-apply", usage: "invoice imported-receivables-backfill-apply --company <path> --input <artifact.json> --plan-hash <sha256> --idempotency-key <key> --confirm yes", description: "Appender den eksakt reviewede legacy Dinero-debitorplan uden at ændre journaler, dokumenter eller arkivår. Kræver en autentificeret workspace-servicekonto med aktiv company.ledger.post-membership; actor er kun audit-attribution.", allowedFlags: ["--company", "--input", "--plan-hash", "--idempotency-key", "--confirm"] },
+  { key: "invoice imported-receivable-settlement-plan", usage: "invoice imported-receivable-settlement-plan --company <path> --input <settlement.json>", description: "Planlægger read-only en hash-bundet afregning af ét importeret DKK-tilgodehavende mod én bankpost.", allowedFlags: ["--company", "--input"] },
+  { key: "invoice imported-receivable-settlement-apply", usage: "invoice imported-receivable-settlement-apply --company <path> --input <settlement.json> --plan-hash <sha256> --idempotency-key <key> --confirm yes", description: "Bogfører og afstemmer præcis den reviewede importerede debitorafregning append-only. Kræver en autentificeret workspace-servicekonto med aktiv company.ledger.post-membership; actor er kun audit-attribution.", allowedFlags: ["--company", "--input", "--plan-hash", "--idempotency-key", "--confirm"] },
+  { key: "invoice imported-receivable-settlement-status", usage: "invoice imported-receivable-settlement-status --company <path> --bank-transaction-id <n>", description: "Læser den immutable afregning bundet til en bankpost.", allowedFlags: ["--company", "--bank-transaction-id"] },
   { key: "invoice find", usage: "invoice find --company <path> [<query>] [--customer <text>] [--amount <n>] [--invoice-number <no>] [--as-of <YYYY-MM-DD>]", description: "Finder udstedte fakturaer via nummer, kunde eller beløb.", allowedFlags: ["--company", "--customer", "--amount", "--invoice-number", "--as-of"] },
   { key: "invoice overdue", usage: "invoice overdue --company <path> [--as-of <YYYY-MM-DD>] [--min-days <n>]", description: "Lister forfaldne udstedte fakturaer som ikke er fuldt afregnet.", allowedFlags: ["--company", "--as-of", "--min-days"] },
   { key: "invoice interest", usage: "invoice interest --company <path> (--document-id <n> | --invoice-number <no>) --as-of <YYYY-MM-DD> --reference-rate <pct>", description: "Beregner morarente på en faktura.", allowedFlags: ["--company", "--document-id", "--invoice-number", "--as-of", "--reference-rate"] },

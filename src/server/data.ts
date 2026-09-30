@@ -47,6 +47,9 @@ export type {
   CompanyAgentSuggestions,
 } from "./data/agent-suggestions";
 
+export { buildCompanyAttention } from "./data/attention";
+export type { AttentionItem } from "./data/attention";
+
 // --- data/vat.ts -----------------------------------------------------------
 export type { VatPosition, VatRubrikker } from "./data/vat";
 
@@ -103,12 +106,14 @@ export type {
 export {
   buildCompanyBudget,
   buildCompanyBudgetVsActual,
+  buildCompanyBudgetDimensionActuals,
 } from "./data/budget";
 export type {
   CompanyBudgetLine,
   CompanyBudget,
   CompanyBudgetVsActualLine,
   CompanyBudgetVsActual,
+  CompanyBudgetDimensionActuals,
 } from "./data/budget";
 
 // --- data/company-views.ts -------------------------------------------------
@@ -123,6 +128,7 @@ export {
   resolveCompanyDocumentFile,
   resolveCompanyIssuedInvoicePdf,
   buildCompanyInvoices,
+  buildCompanyImportedReceivables,
   buildCompanyContacts,
   buildCompanyObligations,
   buildCompanyCashflow,

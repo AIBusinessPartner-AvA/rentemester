@@ -46,6 +46,7 @@ Hver række er én logisk mutation. **Kræves** betyder afvisning uden samtykke.
 | Send faktura på e-mail | `invoice_send_email` / `POST /invoices/send` / `invoice send` | `confirm: true` | `confirm: true` | Ikke krævet |
 | Send rykker | `invoice_remind` / `POST /invoices/send-reminder` / `invoice remind` | `confirm: true` | `confirm: true` | Ikke krævet |
 | Importer bank-CSV | `bank_import` / `POST /bank/import` / `bank import` | `confirm: true` | `confirm: true` | Ikke krævet |
+| Ret bankafstemning | `bank_reconciliation_correction_apply` / `POST /bank/reconciliation-correction` / `bank correction-apply` | `confirm: true` | `confirm: true` | `--confirm yes` |
 | Ingester bilag | `documents_ingest` / `POST /documents/ingest` / `documents ingest` | `confirm: true` | `confirm: true` | Ikke krævet |
 | Bogfør finanspostering | `journal_post` / *(N/A)* / `journal post` | `confirm: true` | N/A | Ikke krævet |
 | Modpost finanspostering | `journal_reverse` / *(N/A)* / `journal reverse` | `confirm: true` | N/A | Ikke krævet |
@@ -54,6 +55,7 @@ Hver række er én logisk mutation. **Kræves** betyder afvisning uden samtykke.
 | Genåbn periode | *(ingen MCP-tool)* / `POST /periods/reopen` / `period reopen` | N/A | `confirm: true` | Ikke krævet |
 | Ryd undtagelse | `exception_resolve` / `POST /exceptions/:id/resolve` / `exceptions resolve` | `confirm: true` | **Ikke krævet** (kun status flippes) | Ikke krævet |
 | Generér tilbagevendende faktura | `recurring_invoice_generate` / `POST /recurring-invoices/generate` / `recurring-invoice generate` | `confirm: true` | `confirm: true` | Ikke krævet |
+| Kør gentagende fakturaer i workspace | `recurring_invoice_run_workspace` / *(ingen cockpit-timer)* / `recurring-invoice run-workspace` | `confirm: true` | N/A | **`--confirm yes`** |
 | Registrer aktiv | `asset_register` / *(N/A)* / `asset register` | `confirm: true` | N/A | Ikke krævet |
 | Straksafskriv aktiv | `asset_write_off` / *(N/A)* / `asset write-off` | `confirm: true` | N/A | **`--confirm yes`** (matcher det MCP-felt der hedder `confirmImmediateWriteOff`) |
 | Tag backup | `system_backup` / *(N/A)* / `system backup` | `confirm: true` | N/A | Ikke krævet |
@@ -62,8 +64,8 @@ Hver række er én logisk mutation. **Kræves** betyder afvisning uden samtykke.
 | GDPR-slet persondata | *(ingen MCP-slette-tool — bevidst CLI/Cockpit-only)* / `POST /gdpr/erase` / `gdpr forget` (legacy alias: `gdpr erase`) | N/A | `confirm: true` | Ikke `--confirm yes`, men **`--after-retention-expiry`** (eksplicit flag; exit `2` uden) + actor — retention vurderes altid mod dags dato |
 | Slet kontakt fra cockpittet | *(N/A)* / `DELETE /contacts/:id` / *(N/A)* | N/A | `confirm: true` | N/A |
 
-(Tabellen er ikke udtømmende for alle 113 MCP-tools — heraf er 63
-confirm-gatede (62 writes + 1 destructive); den dækker de
+(Tabellen er ikke udtømmende for alle 114 MCP-tools — 49 read, 64 ordinary
+writes og 1 destructive; alle 65 ikke-read tools er confirm-gatede. Den dækker de
 business-operationer der har en konflikt eller en afvigelse mellem stakke.
 For den fulde liste pr. tool, se `annotations` i `docs/mcp-tool-surface.md`.)
 
@@ -107,8 +109,8 @@ Samme business-operation, modsat regel — og det er **med vilje**:
   shell-prompt; en eksplicit `confirm` er det eneste signal en agent kan
   give om at den ikke kalder ved et uheld. Selv om `invoice_issue` kun
   producerer en kladde (intet journal-entry endnu), kræver kontrakten
-  alligevel `confirm` — det er ensartet på tværs af alle 63 confirm-gatede
-  tools (62 writes + det destruktive restore), så agenten ikke skal huske
+  alligevel `confirm` — det er ensartet på tværs af alle 65 confirm-gatede
+  tools (64 writes + det destruktive restore), så agenten ikke skal huske
   undtagelser.
 - **Cockpittets `POST /invoices/issue` kræver det IKKE.** Den multi-linje
   faktura-modal i SPA'en *er* samtykket — at trykke "Udsted faktura"-knappen

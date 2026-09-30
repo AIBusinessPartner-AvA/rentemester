@@ -28,10 +28,12 @@ import type {
   CompanyPayableRow,
   PayableListStatusFilter,
 } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
+import { FilterBar, PageState } from "../components/CockpitPrimitives";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PayableRegisterModal } from "../components/PayableRegisterModal";
+import { DirectBankPayableCorrectionModal } from "../components/DirectBankPayableCorrectionModal";
+import { LegacyPayableBackfillModal } from "../components/LegacyPayableBackfillModal";
 
 const FILTERS: { value: PayableListStatusFilter; label: string }[] = [
   { value: "open", label: "Åbne" },
@@ -58,19 +60,21 @@ export function PayablesView() {
   );
   const [registering, setRegistering] = useState(false);
   const [paying, setPaying] = useState<CompanyPayableRow | null>(null);
+  const [correcting, setCorrecting] = useState(false);
+  const [legacyBackfill,setLegacyBackfill]=useState(false);
 
   if (state.loading && !state.data) {
-    return <Loading label="Henter leverandørfakturaer…" />;
+    return <PageState kind="loading" title="Henter leverandørfakturaer" />;
   }
   if (state.error) {
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <PageState kind="error" title="Leverandørfakturaer kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState>;
   }
 
   const view = state.data!;
   const currency = view.company.currency || "DKK";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="payables" data-evidence-issue="655">
       <div className="page-head">
         <div>
           <h2>{view.company.name}</h2>
@@ -87,6 +91,10 @@ export function PayablesView() {
           >
             Registrér leverandørfaktura
           </button>
+          <button type="button" className="btn secondary" disabled={view.unregisteredDocuments.length===0} onClick={()=>setCorrecting(true)}>
+            Ret direkte bankkøb
+          </button>
+          <button type="button" className="btn secondary" onClick={()=>setLegacyBackfill(true)}>Legacy kreditor-backfill</button>
           <Link className="btn secondary" to={`/companies/${slug}/manage`}>
             Administrér
           </Link>
@@ -110,6 +118,9 @@ export function PayablesView() {
           onClose={() => setRegistering(false)}
         />
       )}
+
+      {correcting && <DirectBankPayableCorrectionModal slug={slug} payables={view} onApplied={state.reload} onClose={()=>setCorrecting(false)} />}
+      {legacyBackfill&&<LegacyPayableBackfillModal slug={slug} onApplied={state.reload} onClose={()=>setLegacyBackfill(false)} />}
 
       {paying && (
         <ConfirmDialog
@@ -188,10 +199,8 @@ export function PayablesView() {
         </div>
       </div>
 
-      <nav
-        className="filter-pills"
-        aria-label="Filtrér leverandørfakturaer på status"
-      >
+      <FilterBar activeFilters={filter !== "open" ? [`Status: ${FILTERS.find((item) => item.value === filter)?.label}`] : []} onReset={() => setFilter("open")}>
+      <nav className="filter-pills" aria-label="Filtrér leverandørfakturaer på status">
         {FILTERS.map((f) => (
           <button
             key={f.value}
@@ -204,6 +213,7 @@ export function PayablesView() {
           </button>
         ))}
       </nav>
+      </FilterBar>
 
       {view.rows.length === 0 ? (
         <div className="card statement-card empty-state">
@@ -220,7 +230,7 @@ export function PayablesView() {
         </div>
       ) : (
         <div className="card statement-card table-scroll">
-          <table className="data statement-table">
+          <table className="data statement-table responsive-table" aria-label="Leverandørfakturaer">
             <thead>
               <tr>
                 <th>Leverandør</th>

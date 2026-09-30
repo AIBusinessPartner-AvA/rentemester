@@ -343,6 +343,52 @@ function receiptBody(over: Record<string, unknown> = {}) {
 }
 
 describe("Cockpit write — document ingest (happy path)", () => {
+  test("#554 ingests an internal voucher bound to imported bank evidence", async () => {
+    const { root: ws, slug } = makeWorkspace("doc-internal-voucher");
+    try {
+      const cfg = config({ workspaceRoot: ws });
+      const bank = await post(cfg, `/api/companies/${slug}/bank/import`, {
+        csvContent: [
+          "transaction_date,booking_date,text,amount,currency,reference",
+          "2026-07-31,2026-07-31,BANKGEBYR,-417,DKK,REF-INTERNAL-417",
+        ].join("\n"),
+        confirm: true,
+      });
+      expect(bank.status).toBe(200);
+
+      const res = await post(cfg, `/api/companies/${slug}/documents/ingest`, {
+        fileName: "internt-bankgebyr.txt",
+        fileBase64: Buffer.from("Bankgebyr 417 DKK; ingen moms", "utf8").toString("base64"),
+        metadata: {
+          source: "internal-preparation",
+          documentType: "internal_voucher",
+          issueDate: "2026-07-31",
+          deliveryDescription: "Bankgebyr",
+          amountIncVat: 417,
+          vatAmount: 0,
+          currency: "DKK",
+          sourceBankTransactionId: 1,
+          accountingRationale: "Bankgebyr ifølge importeret kontoudtog; ingen moms.",
+        },
+        confirm: true,
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      withLedger(ws, slug, (db) => {
+        expect(db.query(
+          `SELECT bank_transaction_id, prepared_by, prepared_by_program
+             FROM internal_voucher_evidence`,
+        ).get()).toEqual({
+          bank_transaction_id: 1,
+          prepared_by: "system:cockpit",
+          prepared_by_program: "rentemester-cockpit",
+        });
+      });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   test("a POST .../documents/ingest stores the bilag and reports ok", async () => {
     const { root: ws, slug } = makeWorkspace("doc-ok");
     try {
@@ -362,6 +408,8 @@ describe("Cockpit write — document ingest (happy path)", () => {
           .query("SELECT COUNT(*) AS n FROM documents")
           .get() as { n: number };
         expect(row.n).toBe(1);
+        expect(db.query("SELECT actor FROM audit_log WHERE event_type = 'document_ingest'").get())
+          .toEqual({ actor: "system:cockpit via rentemester-cockpit" });
       });
     } finally {
       rmSync(ws, { recursive: true, force: true });
@@ -388,6 +436,24 @@ describe("Cockpit write — document ingest (happy path)", () => {
 });
 
 describe("Cockpit write — document ingest (gates + input errors)", () => {
+  test("a required scanner with no provider fails closed at real HTTP ingress", async () => {
+    const { root: ws, slug } = makeWorkspace("doc-scanner-required-absent");
+    try {
+      const res = await post(
+        config({ workspaceRoot: ws, documentScannerPolicy: "required" }),
+        `/api/companies/${slug}/documents/ingest`,
+        receiptBody(),
+      );
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).toContain("scanner is required");
+      withLedger(ws, slug, (db) => {
+        expect(db.query("SELECT count(*) AS n FROM documents").get()).toEqual({ n: 0 });
+      });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   test("without confirm:true the ingest is refused with 400", async () => {
     const { root: ws, slug } = makeWorkspace("doc-noconfirm");
     try {

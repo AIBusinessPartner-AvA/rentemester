@@ -8,12 +8,28 @@
 //     reload, and every in-app link below preserves it automatically.
 //
 //   * `CompanyNav` — the sub-navigation bar plus the fiscal-year selector,
-//     rendered at the top of each company view. The views are arranged in
-//     four labelled groups (Regnskab · Bogføring · Salg · Historik) so the bar
-//     stays scannable and wraps tidily on a phone.
+//     rendered at the top of each company view. The destinations are classified
+//     into six task areas; only the active area's destinations are shown.
 
-import { NavLink, useSearchParams } from "react-router-dom";
+import { NavLink, useLocation, useSearchParams } from "react-router-dom";
+import { createContext, useContext, type ReactNode } from "react";
 import type { FiscalYearEntry } from "../lib/types";
+import { companyRouteForPath } from "../company-route-path";
+import type { CompanyRouteId } from "../company-route-registry";
+
+export type CompanyRouteNavigationProjection = {
+  routes: readonly {
+    id: CompanyRouteId;
+    segment: string;
+    label: string;
+    area: string;
+  }[];
+  areas: readonly {
+    id: string;
+    label: string;
+    destination: string;
+  }[];
+};
 
 /**
  * The selected fiscal year as a URL query param. `year` is `undefined` until
@@ -52,90 +68,82 @@ export function accountPostingsTo(
   return `/companies/${slug}/posteringer?${params.toString()}`;
 }
 
-type NavTab = { to: string; label: string };
+const CompanyNavigationShellContext = createContext<{
+  navigation: CompanyRouteNavigationProjection;
+  rendersNavigation: boolean;
+} | undefined>(undefined);
 
-/**
- * The company views, arranged into four labelled groups. The grouping keeps the
- * bar scannable — and gives narrow viewports a deliberate wrap boundary rather
- * than an arbitrary one.
- */
-const TAB_GROUPS: { name: string; tabs: NavTab[] }[] = [
-  {
-    name: "Regnskab",
-    tabs: [
-      { to: "", label: "Overblik" },
-      { to: "resultatopgorelse", label: "Resultatopgørelse" },
-      { to: "balance", label: "Balance" },
-      { to: "saldobalance", label: "Saldobalance" },
-      { to: "forpligtelser", label: "Forpligtelser" },
-      { to: "likviditet", label: "Likviditet" },
-      // #339: budget plan vs. faktiske bevægelser, side-om-side i en knap.
-      { to: "budget", label: "Budget" },
-    ],
-  },
-  {
-    name: "Bogføring",
-    tabs: [
-      { to: "posteringer", label: "Posteringer" },
-      { to: "bilag", label: "Bilag" },
-      { to: "leverandoerfaktura", label: "Leverandørfaktura" },
-      { to: "bank", label: "Bank" },
-      { to: "anlaeg", label: "Anlæg" },
-      { to: "moms", label: "Moms" },
-      { to: "koersel", label: "Kørsel" },
-      // Agent-forslag → menneskelig godkendelse (#346). Lever i Bogføring-
-      // gruppen fordi en godkendelse her er sidste mile før en konkret
-      // postering — selve den deterministiske postering laves derefter på
-      // den linkede side (Anlæg, Leverandørfaktura, Posteringer, …).
-      { to: "agent-forslag", label: "Agent-forslag" },
-      // #332 — Undtagelses-kø (unmatched bank-rows, blokerede write-flows).
-      { to: "undtagelser", label: "Undtagelser" },
-      // #342 — Periodelås: close/reopen audit-loggede regnskabsperioder.
-      { to: "periodelas", label: "Periodelås" },
-      // #345 — Bankkonti + CSV-mapping-profiler.
-      { to: "bankkonti", label: "Bankkonti" },
-      // #334 — GDPR-indsigt + anonymisering.
-      { to: "gdpr", label: "GDPR" },
-      // #337 — Periodiseringsregister.
-      { to: "periodisering", label: "Periodisering" },
-      // #338 — Årsrapport-builder.
-      { to: "aarsrapport", label: "Årsrapport" },
-      // #348-#352 — Bilagsmail: IMAP-config, mail-alias, inbox.
-      { to: "bilagsmail", label: "Bilagsmail" },
-    ],
-  },
-  {
-    name: "Salg",
-    tabs: [
-      { to: "fakturaer", label: "Fakturaer" },
-      { to: "faktura-skabeloner", label: "Skabeloner" },
-      { to: "kontakter", label: "Kontakter" },
-    ],
-  },
-  {
-    name: "Historik",
-    tabs: [
-      { to: "arkiv", label: "Arkiv" },
-      { to: "fleraar", label: "Flerår" },
-      // #343 — 5-års retention-status pr. data-domæne, så ejeren kan se hvad
-      // der nærmer sig udløb af bogføringspligten.
-      { to: "retention", label: "Retention" },
-      // #333 — Integritet & backup: hash-kæde-status, backup-compliance og
-      // backup-destinationer.
-      { to: "integritet", label: "Integritet" },
-      // #344 — Kontoplan: read-only liste over konti med søg + type-filter.
-      { to: "kontoplan", label: "Kontoplan" },
-    ],
-  },
-];
+/** Supplies the route registry's navigation projection to company views. */
+export function CompanyNavigationShell({
+  children,
+  navigation,
+  rendersNavigation = false,
+}: {
+  children: ReactNode;
+  navigation: CompanyRouteNavigationProjection;
+  /** App renders the shared navigation above its Routes; isolated hosts do not. */
+  rendersNavigation?: boolean;
+}) {
+  return (
+    <CompanyNavigationShellContext.Provider value={{ navigation, rendersNavigation }}>
+      {children}
+    </CompanyNavigationShellContext.Provider>
+  );
+}
 
-/**
- * The per-company sub-navigation. `slug` keys the links; the current `?year=`
- * is threaded through every tab so the chosen year follows the user across
- * views. `years`/`selectedYear`/`onYearChange` drive the fiscal-year selector.
- */
+/** Task navigation shared by every company route, including pages without a year selector. */
+export function CompanyTaskNavigation({
+  visibleRouteIds,
+  navigation: navigationOverride,
+}: {
+  /** Presentation filter only; the server remains the authorization boundary. */
+  visibleRouteIds?: readonly CompanyRouteId[];
+  /** Lets isolated component hosts provide the same projection as the app shell. */
+  navigation?: CompanyRouteNavigationProjection;
+}) {
+  const shellNavigation = useContext(CompanyNavigationShellContext);
+  const navigation = navigationOverride ?? shellNavigation?.navigation;
+  const [params] = useSearchParams();
+  const location = useLocation();
+  // #UI-4: only the fiscal year is a cross-view concern. Threading the WHOLE
+  // query string leaked per-view filters (Bank's q/from/to/status, a posting
+  // account=…) onto every other tab. Whitelist `?year=` and drop the rest —
+  // each view owns its own filter namespace.
+  const year = params.get("year");
+  const suffix = year ? `?year=${encodeURIComponent(year)}` : "";
+  const currentRoute = navigation && companyRouteForPath(location.pathname, navigation.routes);
+  const slug = location.pathname.match(/^\/companies\/([^/]+)/)?.[1];
+  const visibleRoutes = navigation?.routes.filter(
+    (route) => !visibleRouteIds || visibleRouteIds.includes(route.id),
+  ) ?? [];
+  const visibleAreas = navigation?.areas.filter((area) => visibleRoutes.some((route) => route.area === area.id)) ?? [];
+  if (!currentRoute || !slug) return null;
+  const toPath = (segment: string) =>
+    `${segment ? `/companies/${slug}/${segment}` : `/companies/${slug}`}${suffix}`;
+
+  return (
+    <section className="company-task-navigation" aria-label="Virksomhedsnavigation">
+      <nav className="company-areas" aria-label="Daglige opgaver">
+        {visibleAreas.map((area) => {
+          const destination = visibleRoutes.find((route) => route.segment === area.destination) ?? visibleRoutes.find((route) => route.area === area.id);
+          if (!destination) return null;
+          return (
+            <NavLink
+              key={area.id}
+              to={toPath(destination.segment)}
+              className={currentRoute.area === area.id ? "active" : undefined}
+            >
+              {area.label}
+            </NavLink>
+          );
+        })}
+      </nav>
+    </section>
+  );
+}
+
+/** The fiscal-year control retained by year-aware company views. */
 export function CompanyNav({
-  slug,
   years,
   selectedYear,
   onYearChange,
@@ -145,45 +153,21 @@ export function CompanyNav({
   selectedYear: string;
   onYearChange: (year: string) => void;
 }) {
-  const [params] = useSearchParams();
-  // #UI-4: only the fiscal year is a cross-view concern. Threading the WHOLE
-  // query string leaked per-view filters (Bank's q/from/to/status, a posting
-  // account=…) onto every other tab. Whitelist `?year=` and drop the rest —
-  // each view owns its own filter namespace.
-  const year = params.get("year");
-  const suffix = year ? `?year=${encodeURIComponent(year)}` : "";
-
+  const shellNavigation = useContext(CompanyNavigationShellContext);
   return (
-    <nav className="company-nav" aria-label="Virksomhedsvisninger">
-      <div className="company-tabs">
-        {TAB_GROUPS.map((group) => (
-          <div
-            key={group.name}
-            className="company-tab-group"
-            role="group"
-            aria-label={group.name}
-          >
-            {group.tabs.map((tab) => {
-              const path = tab.to
-                ? `/companies/${slug}/${tab.to}`
-                : `/companies/${slug}`;
-              return (
-                <NavLink key={tab.to} to={`${path}${suffix}`} end>
-                  {tab.label}
-                </NavLink>
-              );
-            })}
-          </div>
-        ))}
+    <>
+      {!shellNavigation?.rendersNavigation && <CompanyTaskNavigation />}
+      <div className="company-year-controls">
+        <YearSelector
+          years={years}
+          selected={selectedYear}
+          onChange={onYearChange}
+        />
       </div>
-      <YearSelector
-        years={years}
-        selected={selectedYear}
-        onChange={onYearChange}
-      />
-    </nav>
+    </>
   );
 }
+
 
 /** The fiscal-year dropdown — shared by every company view. */
 export function YearSelector({

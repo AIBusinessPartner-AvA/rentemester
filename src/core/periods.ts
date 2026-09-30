@@ -3,6 +3,7 @@ import { insertAuditLog, resolveActor, type ResolveActorInput } from "./actor";
 import { ensureNullableVatPeriodColumn } from "./companies-schema";
 import { isValidIsoDate as looksLikeIsoDate, addDays, todayIsoDate, MONTH_NAMES_DA } from "./dates";
 import { loadVatAccountSemantics, VAT_LINE_CODES } from "./vat-account-semantics";
+import { computePeriodCloseReadiness, loadPeriodCloseReview, reviewPeriodCloseReadiness, latestPeriodCloseDecision, recordForcedPeriodCloseOpenItems, recordPeriodCloseDecision, type CloseReadinessPacket, type CloseReviewPrincipal } from "./period-close-readiness";
 
 /** `vat_period` is cadence-neutral; `vat_quarter` is read-only legacy compatibility. */
 export type AccountingPeriodKind = "vat_period" | "vat_quarter" | "fiscal_year" | "custom";
@@ -25,7 +26,11 @@ const VAT_PERIOD_TYPES = new Set<VatPeriodType>(["month", "quarter", "half-year"
 
 /** Read only the cadence without importing `company.ts` (which depends here). */
 function registeredVatPeriodType(db: Database): VatPeriodType | null {
-  ensureNullableVatPeriodColumn(db);
+  // Readiness must be a strictly read-only inspection.  Compatibility repair
+  // belongs to `migrate()`, never to a close preflight: a missing legacy
+  // column is interpreted through the documented historic default instead.
+  const columns = db.query("PRAGMA table_info(companies)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "vat_period_type")) return DEFAULT_VAT_PERIOD_TYPE;
   const row = db.query(
     "SELECT vat_period_type AS value FROM companies WHERE id = 1",
   ).get() as { value: string | null } | null;
@@ -364,7 +369,7 @@ export function setCompanyVatPeriodType(
   // `closeAccountingPeriod` / `validateJournalTransactionDate` already use.
   if (type === null && before.t !== null) {
     const vatAccounts = loadVatAccountSemantics(db).amountSideByAccountNo;
-    const vatEntryDates = db
+    const vatEntryDates = (db
       .query(
         `SELECT DISTINCT je.transaction_date AS d, a.account_no AS account_no
            FROM journal_lines jl
@@ -372,11 +377,8 @@ export function setCompanyVatPeriodType(
            JOIN journal_entries je ON je.id = jl.journal_entry_id
           WHERE je.status = 'posted'`,
       )
-      .all()
-      .filter((row) => vatAccounts.has(row.account_no)) as Array<{
-      d: string;
-      account_no: string;
-    }>;
+      .all() as Array<{ d: string; account_no: string }>)
+      .filter((row) => vatAccounts.has(row.account_no));
     if (vatEntryDates.length > 0) {
       const vatPeriods = db
         .query(
@@ -444,6 +446,8 @@ export type CloseAccountingPeriodInput = {
   reference?: string;
   createdBy?: string;
   createdByProgram?: string;
+  /** Stable evidence root used to verify the same reviewed packet at close. */
+  companyRoot?: string;
   /**
    * Per round-2 review: closing a period with open high/medium exceptions
    * silently hides them — the default `exceptions list` filter no longer
@@ -458,6 +462,13 @@ export type CloseAccountingPeriodInput = {
    * A forced bypass is recorded on the period's close audit event.
    */
   force?: boolean;
+  readinessPacketHash?: string;
+  /** Exact durable review snapshot. A calculated packet is never closable. */
+  readinessReviewId?: number;
+  forceReason?: string;
+  /** Trusted surface-derived, stable principal authority; actor never authorizes. */
+  forceAuthorization?: { principal: CloseReviewPrincipal; permissions: readonly string[] };
+  forceConfirmed?: boolean;
 };
 
 export type CloseAccountingPeriodResult = {
@@ -470,6 +481,7 @@ export type CloseAccountingPeriodResult = {
   reference?: string;
   appliedRules: string[];
   errors: string[];
+  readinessPacket?: CloseReadinessPacket;
 };
 
 const PERIOD_RULE_ID = "DK-BOOKKEEPING-PERIOD-LOCK-001";
@@ -571,10 +583,8 @@ function unreconciledBankTransactionsIn(
   return db.query(
     `SELECT bt.id, bt.transaction_date, bt.text, bt.amount, bt.currency
        FROM bank_transactions bt
-       LEFT JOIN journal_entries je
-         ON je.source_bank_transaction_id = bt.id
-        AND je.status = 'posted'
-      WHERE je.id IS NULL
+       LEFT JOIN bank_journal_reconciliations br ON br.bank_transaction_id = bt.id
+      WHERE br.journal_entry_id IS NULL
         AND bt.transaction_date BETWEEN ? AND ?
       ORDER BY bt.transaction_date ASC, bt.id ASC`,
   ).all(periodStart, periodEnd) as Array<{
@@ -644,7 +654,7 @@ export function validateJournalTransactionDate(db: Database, transactionDate: st
   return errors;
 }
 
-export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriodInput): CloseAccountingPeriodResult {
+function closeAccountingPeriodInImmediateTransaction(db: Database, input: CloseAccountingPeriodInput): CloseAccountingPeriodResult {
   const appliedRules = [PERIOD_RULE_ID];
   const errors: string[] = [];
   const periodStart = input.periodStart?.trim();
@@ -663,6 +673,64 @@ export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriod
 
   if (errors.length > 0) return { ok: false, appliedRules, errors };
   const kind = canonicalPeriodKind(requestedKind);
+  // Reporting is a distinct terminal lifecycle transition. It must bind to
+  // the original durable close packet, never recompute readiness after the
+  // period is locked (which would make its own close evidence appear stale).
+  if (status === "reported") {
+    const existing = db.query("SELECT id,status,reference FROM accounting_periods WHERE period_start=? AND period_end=? AND kind=? ORDER BY id DESC LIMIT 1").get(periodStart, periodEnd, kind) as {id:number;status:AccountingPeriodStatus;reference:string|null}|null;
+    if (existing?.status === "reported") {
+      const latest = db.query("SELECT packet_hash FROM period_close_decisions WHERE period_id=? ORDER BY id DESC LIMIT 1").get(existing.id) as {packet_hash:string}|null;
+      if (input.readinessPacketHash !== latest?.packet_hash) return {ok:false,appliedRules,errors:["PERIOD_REPORT_CLOSE_PACKET_MISMATCH"]};
+      if (reference !== existing.reference) return {ok:false,appliedRules,errors:["PERIOD_REPORT_REFERENCE_CONFLICT"]};
+      return {ok:true,periodId:existing.id,periodStart,periodEnd,kind,status,reference,appliedRules,errors};
+    }
+    if (existing?.status === "closed") {
+      if (!reference) return { ok:false, appliedRules, errors:["PERIOD_REPORT_REFERENCE_REQUIRED"] };
+      if (input.force) return { ok:false, appliedRules, errors:["PERIOD_REPORT_DOES_NOT_ALLOW_FORCE"] };
+      const original = db.query("SELECT p.packet_json,d.packet_hash FROM period_close_decisions d JOIN period_close_readiness_packets p ON p.packet_hash=d.packet_hash WHERE d.period_id=? AND d.decision IN ('closed','forced_closed') ORDER BY d.id DESC LIMIT 1").get(existing.id) as {packet_json:string;packet_hash:string}|null;
+      if (!original || input.readinessPacketHash !== original.packet_hash) return { ok:false, appliedRules, errors:["PERIOD_REPORT_CLOSE_PACKET_MISMATCH"] };
+      const packet = JSON.parse(original.packet_json) as CloseReadinessPacket;
+      // Some legacy ledgers carry a terminal `period_report` only in the
+      // append-only lifecycle, while the immutable row still says `closed`.
+      // A single attributable receipt backfill remains legal, but it must be
+      // bound to the original close packet — never to a freshly computed one.
+      if (effectivePeriodState(db, existing.id, "closed") === "reported" && existing.reference === null) {
+        db.query("UPDATE accounting_periods SET status='reported',reported_at=COALESCE(reported_at,CURRENT_TIMESTAMP),reference=? WHERE id=? AND status='closed'").run(reference, existing.id);
+        insertAuditLog(db,{eventType:"period_report_reference_backfill",entityType:"accounting_period",entityId:existing.id,message:`Backfilled filing reference for reported ${kind} period ${periodStart}..${periodEnd} (${reference})`,createdBy:input.createdBy,createdByProgram:input.createdByProgram});
+        return {ok:true,periodId:existing.id,periodStart,periodEnd,kind,status,reference,appliedRules,errors,readinessPacket:packet};
+      }
+      db.query("UPDATE accounting_periods SET status='reported',reported_at=CURRENT_TIMESTAMP,reference=? WHERE id=? AND status='closed'").run(reference,existing.id);
+      insertAuditLog(db,{eventType:"period_report",entityType:"accounting_period",entityId:existing.id,message:`Marked ${kind} period ${periodStart}..${periodEnd} reported (${reference})`,createdBy:input.createdBy,createdByProgram:input.createdByProgram});
+      // The v25 decision table predates a distinct `reported` enum value;
+      // retain the original close decision identity and record the terminal
+      // reporting transition in the append-only audit lifecycle.
+      recordPeriodCloseDecision(db,{periodId:existing.id,packet,decision:"closed",actor:input.createdBy??"system",reason:`reported:${reference}`,supersedesDecisionId:latestPeriodCloseDecision(db,existing.id)});
+      return {ok:true,periodId:existing.id,periodStart,periodEnd,kind,status,reference,appliedRules,errors,readinessPacket:packet};
+    }
+  }
+  const review = typeof input.readinessReviewId === "number" ? loadPeriodCloseReview(db, input.readinessReviewId) : null;
+  const currentPacket = computePeriodCloseReadiness(db, { periodStart, periodEnd, companyRoot: input.companyRoot });
+  if (!review || review.packet.periodStart !== periodStart || review.packet.periodEnd !== periodEnd || input.readinessPacketHash !== review.packet.hash || currentPacket.hash !== review.packet.hash) return { ok: false, appliedRules, errors: ["PERIOD_CLOSE_PACKET_STALE_OR_MISSING"], readinessPacket: currentPacket };
+  const packet = review.packet;
+  // A control which could not be run is not a successful control. In
+  // particular, a close must never turn an absent receivables/control-account
+  // assurance into an implicit waiver. Report an actual blocker first on a
+  // normal close, then the unavailable assurance; force may waive only an
+  // explicit waivable blocker and can never alter an unavailable result.
+  const unavailableControls = packet.items.filter(item => item.status === "unavailable");
+  const blockedControls = packet.items.filter(item => item.status === "blocked");
+  if (!input.force && blockedControls.length > 0) return { ok: false, appliedRules, errors: [`PERIOD_CLOSE_BLOCKED:${blockedControls.length}`], readinessPacket: packet };
+  if (!input.force && unavailableControls.length > 0) {
+    return {
+      ok: false,
+      appliedRules,
+      errors: [`PERIOD_CLOSE_ASSURANCE_UNAVAILABLE:${unavailableControls.length}`],
+      readinessPacket: packet,
+    };
+  }
+  const forceAuthorized = input.forceAuthorization?.permissions.includes("company.period.force-close") === true;
+  if (input.force && (!input.forceReason?.trim() || !input.createdBy?.trim() || !forceAuthorized || input.forceConfirmed !== true)) return { ok: false, appliedRules, errors: ["FORCED_CLOSE_REQUIRES_COMPANY_PERIOD_FORCE_CLOSE_PERMISSION_CONFIRM_ACTOR_AND_REASON"], readinessPacket: packet };
+  if (input.force && (unavailableControls.length > 0 || packet.items.some(item => !item.waivable && item.status === "blocked"))) return { ok: false, appliedRules, errors: ["PERIOD_CLOSE_HAS_NONWAIVABLE_BLOCKERS"], readinessPacket: packet };
 
   if (kind === "vat_period") {
     const vatPeriodType = registeredVatPeriodType(db);
@@ -833,6 +901,22 @@ export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriod
           createdBy: input.createdBy,
           createdByProgram: input.createdByProgram,
         });
+        // A re-close after reopen is a fresh lifecycle decision, not merely
+        // an audit-log line. Keep the exact reviewed packet and every waived
+        // blocker linked to this new decision in the same transaction.
+        const decisionId = recordPeriodCloseDecision(db, {
+          periodId: overlap.id,
+          packet,
+          decision: input.force ? "forced_closed" : "closed",
+          actor: input.createdBy ?? "system",
+          reason: input.force ? input.forceReason : undefined,
+          supersedesDecisionId: latestPeriodCloseDecision(db, overlap.id),
+        });
+        const waivedBlockers = packet.items.filter((item) => item.waivable && item.status === "blocked");
+        if (input.force && waivedBlockers.length > 0) {
+          recordForcedPeriodCloseOpenItems(db, overlap.id, decisionId, packet, input.forceReason!.trim(), input.createdBy!);
+          insertAuditLog(db, { eventType: "PERIOD_CLOSED_WITH_OPEN_ITEMS", entityType: "accounting_period", entityId: overlap.id, message: `Forced re-close with ${waivedBlockers.length} waived readiness blocker(s): ${input.forceReason!.trim()}`, createdBy: input.createdBy, createdByProgram: input.createdByProgram });
+        }
       })();
       const effectiveReference = reference ?? overlap.reference ?? undefined;
       return {
@@ -845,6 +929,7 @@ export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriod
         reference: effectiveReference,
         appliedRules,
         errors,
+        readinessPacket: packet,
       };
     }
     if (isSamePeriod && overlapEffective === "reported" && status === "reported") {
@@ -938,6 +1023,12 @@ export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriod
     createdBy: input.createdBy,
     createdByProgram: input.createdByProgram,
   });
+  const decisionId = recordPeriodCloseDecision(db, { periodId: inserted.id, packet, decision: input.force ? "forced_closed" : "closed", actor: input.createdBy ?? "system", reason: input.force ? input.forceReason : undefined });
+  const waivedBlockers = packet.items.filter((item) => item.waivable && item.status === "blocked");
+  if (input.force && waivedBlockers.length > 0) {
+    recordForcedPeriodCloseOpenItems(db, inserted.id, decisionId, packet, input.forceReason!.trim(), input.createdBy!);
+    insertAuditLog(db, { eventType: "PERIOD_CLOSED_WITH_OPEN_ITEMS", entityType: "accounting_period", entityId: inserted.id, message: `Forced close with ${waivedBlockers.length} waived readiness blocker(s): ${input.forceReason!.trim()}`, createdBy: input.createdBy, createdByProgram: input.createdByProgram });
+  }
 
   return {
     ok: true,
@@ -949,7 +1040,17 @@ export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriod
     reference,
     appliedRules,
     errors,
+    readinessPacket: packet,
   };
+}
+
+/**
+ * Close is one SQLite BEGIN IMMEDIATE boundary.  It deliberately owns the
+ * review/hash recheck, period transition, audit decision and obligations so a
+ * concurrent posting cannot slip between a successful check and the lock.
+ */
+export function closeAccountingPeriod(db: Database, input: CloseAccountingPeriodInput): CloseAccountingPeriodResult {
+  return db.transaction(() => closeAccountingPeriodInImmediateTransaction(db, input)).immediate();
 }
 
 export type ReopenAccountingPeriodInput = {
@@ -1089,6 +1190,12 @@ export function reopenAccountingPeriod(
     createdBy: input.createdBy,
     createdByProgram: input.createdByProgram,
   });
+  // A reopen never mutates the original close evidence. It appends a decision
+  // linked to a freshly persisted snapshot and explicitly supersedes the last
+  // lifecycle decision for this period.
+  const reopenPacket = computePeriodCloseReadiness(db, { periodStart, periodEnd });
+  reviewPeriodCloseReadiness(db, { packet: reopenPacket, reviewerActor: actor.createdBy, reviewerPrincipal: { kind: "local-trusted", subjectId: actor.createdBy } });
+  recordPeriodCloseDecision(db, { periodId: period.id, packet: reopenPacket, decision: "reopened", actor: actor.createdBy, reason, supersedesDecisionId: latestPeriodCloseDecision(db, period.id) });
 
   return {
     ok: true,

@@ -48,9 +48,9 @@ export function ManageCompanyView() {
     return { found, settings };
   }, [slug]);
 
-  if (state.loading) return <Loading />;
+  if (state.loading) return <section data-evidence-issue="657"><h2 data-evidence-heading>Administration</h2><p data-evidence-status="loading">Henter virksomhedsprofil</p><Loading /></section>;
   if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <section data-evidence-issue="657"><h2 data-evidence-heading>Administration</h2><p data-evidence-status={/403|forbudt|adgang/i.test(state.error) ? "warning-or-blocked" : "error"}>{/403|forbudt|adgang/i.test(state.error) ? "Virksomhedsprofil kræver afklaring" : "Virksomhedsprofil kunne ikke hentes"}</p><ErrorState message={state.error} onRetry={state.reload} /></section>;
 
   return (
     <ManageForm
@@ -59,6 +59,10 @@ export function ManageCompanyView() {
       onArchivedAway={() => navigate("/")}
     />
   );
+}
+
+function hasIncompleteAdministrativeProfile(settings: CompanySettings) {
+  return !settings.cvr;
 }
 
 function ManageForm({
@@ -132,14 +136,13 @@ function ManageForm({
   }
 
   return (
-    <section>
+    <section data-cockpit-page="manage" data-evidence-issue="657">
       <div className="page-head">
         <div>
-          <h2>Administrér {savedName}</h2>
+          <h2 data-evidence-heading>Administration</h2>
+          <p className="muted" data-evidence-status={hasIncompleteAdministrativeProfile(settings) ? "empty" : "normal"}>{hasIncompleteAdministrativeProfile(settings) ? "Ingen administrationsoplysninger endnu" : "Administration klar"}</p>
           <p className="muted">
-            Slug <code>{company.slug}</code> · oprettet{" "}
-            {formatDateDa(company.createdAt.slice(0, 10))}
-            {archived ? " · arkiveret" : ""}
+            Hold virksomhedens profil og den daglige opsætning på plads.
           </p>
         </div>
         <Link className="btn secondary" to={`/companies/${company.slug}`}>
@@ -150,6 +153,9 @@ function ManageForm({
       {error && <Banner kind="error">{error}</Banner>}
       {notice && <Banner kind="success">{notice}</Banner>}
 
+      <section aria-labelledby="virksomhedsprofil-heading" data-evidence-data={!hasIncompleteAdministrativeProfile(settings) ? true : undefined}>
+      <h3 id="virksomhedsprofil-heading">Virksomhedsprofil</h3>
+      <p className="muted">Redigér navn, stamdata og betalingsoplysninger. Regnskabsdata påvirkes ikke.</p>
       <form className="form" onSubmit={rename} aria-label="Omdøb virksomhed">
         <label>
           Visningsnavn
@@ -172,7 +178,32 @@ function ManageForm({
       <ProfileCard slug={company.slug} initial={settings} />
 
       <CvrCard slug={company.slug} initial={settings} />
+      </section>
 
+      <section className="card" aria-labelledby="daglig-opsætning-heading">
+        <h3 id="daglig-opsætning-heading">Daglig opsætning</h3>
+        <p>Vælg det område, du vil gøre klar til den daglige bogføring.</p>
+        <div className="row-actions">
+          <Link className="btn secondary" data-evidence-core-action to={`/companies/${company.slug}/kontoplan`}>Åbn daglig opsætning</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/dimensioner`}>Dimensioner</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/bankkonti`}>Bankkonti</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/bilagsmail`}>Bilagsmail</Link>
+        </div>
+      </section>
+
+      <section className="card" aria-labelledby="advanced-security-heading">
+        <h3 id="advanced-security-heading">Avanceret og sikkerhed</h3>
+        <p className="muted">Kontrol, opbevaring og særlige arbejdsgange er adskilt fra den almindelige profilredigering.</p>
+        <div className="row-actions">
+          <Link className="btn secondary" to={`/companies/${company.slug}/integritet`}>Integritet og backup</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/retention`}>Opbevaring</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/gdpr`}>GDPR</Link>
+          <Link className="btn secondary" to={`/companies/${company.slug}/arkiv`}>Arkiv</Link>
+        </div>
+      </section>
+
+      <details className="card" data-evidence-progressive>
+        <summary>System- og livscyklusindstillinger</summary>
       <AccountantExportCard slug={company.slug} />
 
       <div className="card" style={{ marginTop: 24, maxWidth: 460 }}>
@@ -186,6 +217,7 @@ function ManageForm({
         </p>
         <button
           className="btn secondary"
+          type="button"
           onClick={
             archived ? restoreCompany : () => setConfirmingArchive(true)
           }
@@ -211,6 +243,7 @@ function ManageForm({
           onClose={() => setConfirmingArchive(false)}
         />
       )}
+      </details>
     </section>
   );
 }
@@ -572,6 +605,7 @@ function CvrCard({ slug, initial }: { slug: string; initial: CompanySettings }) 
 
       <button
         className="btn secondary"
+        type="button"
         onClick={sync}
         disabled={buttonDisabled}
         title={buttonTitle}

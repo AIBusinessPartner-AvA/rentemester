@@ -6,6 +6,7 @@ import type {
   MultiYearResponse,
   ObligationsResponse,
   OverviewResponse,
+  ChangesSinceResponse,
 } from "../types";
 import { request } from "./_shared";
 
@@ -22,12 +23,21 @@ export const dashboardApi = {
       `/api/companies/${encodeURIComponent(slug)}/fiscal-years`,
     ).then((r) => r.fiscalYears.years),
 
-  overview: (slug: string, year?: string) =>
-    request<OverviewResponse>(
+  overview: (slug: string, year?: string, asOf?: string) => {
+    const params = new URLSearchParams();
+    if (year) params.set("year", year);
+    if (asOf) params.set("asOf", asOf);
+    const query = params.toString();
+    return request<OverviewResponse>(
       `/api/companies/${encodeURIComponent(slug)}/overview${
-        year ? `?year=${encodeURIComponent(year)}` : ""
+        query ? `?${query}` : ""
       }`,
-    ).then((r) => r.overview),
+    ).then((r) => r.overview);
+  },
+
+  changesSince: (slug: string, after = 0) => request<ChangesSinceResponse>(
+    `/api/companies/${encodeURIComponent(slug)}/changes-since?after=${encodeURIComponent(String(after))}`,
+  ).then((r) => r.changes),
 
   archive: (slug: string, year: string) =>
     request<ArchiveResponse>(

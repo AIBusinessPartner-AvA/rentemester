@@ -6,6 +6,42 @@ korrekt. Implementeringen ligger i `src/cli-actor.ts` og `src/cli.ts`.
 
 ## 1. Actor-politik for muterende kommandoer
 
+`documents party-link-apply`, `party-link-supersede`,
+`internal-no-external-party` og `internal-no-external-party-supersede` kræver
+`RENTEMESTER_SERVICE_PRINCIPAL_TOKEN` og `RENTEMESTER_WORKSPACE` i processen.
+Den aktive token og virksomhedens aktuelle `company.master-data`-membership
+verificeres før mutation. Gemt principal er `service-account:<serviceAccountId>`
+fra autentificeringen; `--actor` forbliver den separate policy-godkendte
+revisionsidentitet. Udelad normalt `--principal`: flaget er kun en valgfri
+lighedsassertion og afvises, hvis det ikke matcher den verificerede principal.
+MCP's tilsvarende dokument-part-operationer udleder også principal fra den
+autentificerede servicekonto, aldrig fra klientens actor eller inputfelter.
+Eksisterende historik omskrives ikke.
+
+Efter en godkendt legacy mapping bruges de samme identitets-/referencefelter
+fra dokument-part-planen ved apply, sammen med dens eksakte `--plan-hash`,
+`--idempotency-key`, `--confirm yes` og `--actor`. CLI's `--company` er her
+virksomhedsstien; `--workspace` og `--company-slug` skal pege på samme
+autentificerede workspace og virksomhed. Se `docs/deployment-modes.md` for
+lokal service-bootstrap og sikker tokenoverførsel til containerprocessen.
+
+`legacy-party-mapping plan` er read-only. `legacy-party-mapping apply` kræver
+`--confirm yes`, actor, en autentificeret workspace-servicekonto, idempotency
+key, eksakt plan-hash og et eksisterende kildebilag; den er idempotent. Planen
+binder bilagets hash og den gennemgåede reference. En reviewed legacy reference
+alene opretter aldrig en mapping.
+Korrektioner sker kun med `legacy-party-mapping supersede`; kontakt, bilag,
+journal og moms ændres ikke.
+
+En importeret leverandør med `identity_status=human_resolution_required` og
+manglende `country_code`/`identifier_kind` klargøres først med
+`vendor-identity-enrichment plan` og `apply`. Planen verificerer det registrerede
+originalbilags faktiske bytes og binder leverandørens nuværende navn, adresse og
+eventuelle eksisterende identifikator. `apply` kræver samme service-principal,
+actor-, confirmation-, plan-hash- og idempotency-gates som legacy mapping og
+udfylder kun de manglende typefelter. Den opfinder ikke et ID og ændrer ikke
+leverandørens ID, navn, adresse, noter, bilaget, journalen eller momsdata.
+
 Enhver **muterende** kommando (alt der skriver til ledger'en — fakturaer,
 finansposteringer, backups, kunde-/leverandøroprettelse osv.) kræver en kendt
 actor. Det fulde sæt ligger i `MUTATING_COMMANDS` i `src/cli-actor.ts`.
@@ -66,6 +102,19 @@ Parse-/brugsfejl (`exit 2`) skrives til stderr.
 
 ## 3. Confirm-flag
 
+### TastSelv momsangivelse
+
+`vat momsangivelse` / `vat filing` og MCP `vat_filing` returnerer samme
+read-only form: `salgsmoms`, `kobsmoms`, `momsAfVarekobUdland`,
+`momsAfYdelseskobUdland`, A-varer, A-ydelser, de tre B-felter, C og de seks
+afgiftsrefusionsfelter samt `momsIAlt`. Alle indtastningsfelter er signed
+integer DKK. Hvert råbeløb trunceres mod nul før `momsIAlt` beregnes; rå
+ledger- og momsrapportværdier bevarer øre. Tvetydigt B-salg eller en
+refusion uden append-only evidence afviser filing-rapporten. Ingen kommando
+indsender til Skattestyrelsen.
+
+De primære, versionsbundne kilder er [Skattestyrelsens vejledning om angivelse i hele kroner](https://info.skat.dk/data.aspx?oid=2062862) og [TastSelv-dataformatets feltdefinitioner](https://info.skat.dk/data.aspx?oid=1878548). Den lovbundne kildehash står i `DK-VAT-FILING-001` i `rules/dk/vat.yaml`; nye feltfortolkninger må ikke indføres uden fornyet kildekontrol.
+
 CLI'ens `confirm`-konvention er **anderledes** end MCP's og cockpit's, men
 ækvivalent i intention. Slå op i [`docs/confirm-contract.md`](confirm-contract.md)
 for den tabel der pr. business-operation viser hvilke stakke der kræver hvad.
@@ -90,10 +139,23 @@ for den tabel der pr. business-operation viser hvilke stakke der kræver hvad.
 |----------|----------------|------------------|
 | `system restore-backup` | Overskriver filer i `--target-company` | Exit `1`. `errors[]` slutter med `Re-run with --confirm yes to proceed.` |
 | `asset write-off` | Straksafskriver et aktiv (modposterer cost) | Exit `1`. Resultatet er `{ok:false, errors:[…]}` fra core'en. |
+| `efaktura konfigurer` / `onboard` / `registrer*` | Gemmer secret eller ændrer ekstern DigiSense/NemHandel-registrering | Exit `1`; ingen secret/state/netværksmutation udføres. |
+| `efaktura modtag` / `modtag-workspace` | Henter og indlæser eksterne bilag i én eller flere ledgers | Exit `1`; workspace-varianten preflighter actor og backup-lås for alle aktive mål før første netværkskald. |
+| `expense vat-preflight --apply yes` | Henter nødvendig EU-VAT-evidens før købspostering | Kræver actor; uden `--apply` er samme kommando en ikke-mutérende dry-run. |
+| `system migrate --apply yes` | Anvender ventende, checksummede ledger-migreringer | CLI-only; kræver actor. Uden `--apply` er kommandoen en strikt read-only plan og returnerer succes med `wouldMigrate`. Apply tager én `IMMEDIATE`-transaktion, genlæser status under låsen og er no-op hvis schema allerede er aktuelt. Ugyldige tilstande afvises uden writes; en ventende migration skal nå aktuel status og får præcis én actor-attribueret `schema_migrated`-audit-hændelse før commit. |
+| `system repair-schema-views --apply yes` | Reparerer drift i indbyggede SQL-views | CLI-only; kræver allowlisted actor og `--reason` på 1–1000 tegn. Uden `--apply` returneres kun en read-only plan. Apply låser med `BEGIN IMMEDIATE`, reparerer kun den indbyggede katalogliste, verificerer igen og skriver præcis én `schema_views_repaired`-audit-hændelse atomisk. |
+
+`system healthcheck` er altid read-only. Med `--json` eller `--format json`
+udskrives én stabil JSON-resultatlinje med `checks`, `missing` og `schema`.
+En ventende schema returnerer exit 1 og `schema_outdated`; `schema` indeholder
+`currentVersion`, `requiredVersion` og de ventende migrationsidentiteter.
+| `invoice transmit-digisense` / `efaktura leveringsstatus` | Leverer én e-faktura eller observerer eksisterende queued levering | Exit `1`; en queued identitet må kun status-poll'es og må aldrig blindt leveres igen. |
+| `workspace-access bootstrap-first` | Opretter første hosted workspace-identitet | Exit `1`; password-fil og database læses ikke før eksakt `--confirm yes`. |
 
 Alle andre muterende kommandoer (faktura-bogføring, journal-postering,
 bank-import, periode-luk, …) kræver **ikke** `--confirm yes` — `--actor`
-er kontrakten. Det modsatte gælder for samme operation på MCP (alle writes
+er kontrakten. DigiSense-kommandoerne ovenfor er en bevidst ekstra ekstern
+sikkerhedsgate. Det modsatte gælder for samme operation på MCP (alle writes
 kræver `confirm: true`); afvigelsen er bevidst og forklaret i
 [`docs/confirm-contract.md`](confirm-contract.md).
 

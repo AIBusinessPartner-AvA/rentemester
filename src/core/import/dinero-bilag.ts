@@ -87,7 +87,33 @@ export type BilagIngestResult = {
   /** Ordered, human-readable description of what happened. */
   auditTrail: string[];
   errors: string[];
+  /** Newly published originals. The atomic orchestrator removes these on rollback. */
+  publishedPaths: string[];
 };
+
+/** Pure, fail-closed receipt planning used before an atomic Dinero import mutates. */
+export function planDineroBilag(input: MultiArtifactSource, voucherRefs: readonly string[]): string[] {
+  const errors: string[] = [];
+  const known = new Set(voucherRefs);
+  const year = cutOverYearOf(input);
+  if (year != null) {
+    const prefixes = [`${year}/Bilag/`, `${year}/Faktura/`].map((prefix) => prefix.toLowerCase());
+    const bookedNames = Object.keys(input.files)
+      .filter((name) => prefixes.some((prefix) => name.toLowerCase().startsWith(prefix)))
+      .sort();
+    for (const name of bookedNames) {
+      if (!RECEIPT_EXTENSIONS.has(extOf(name))) {
+        errors.push(`bilag '${name}' has an unsupported receipt extension`);
+        continue;
+      }
+      const artifact = input.files[name]!;
+      const ref = voucherRefOf(artifact.name);
+      if (!ref) errors.push(`bilag '${artifact.name}' does not carry a '-Bilag-<n>' or '-Faktura-<n>' voucher number in its file name`);
+      else if (!known.has(ref)) errors.push(`bilag '${artifact.name}' references voucher ${ref}, which is not present in the cut-over postings`);
+    }
+  }
+  return errors;
+}
 
 /** A document that is now present in the ledger — newly ingested or pre-existing. */
 type IngestedDocument = {
@@ -96,6 +122,7 @@ type IngestedDocument = {
   sha256: string;
   /** True when the content hash was already stored — re-ingest was a no-op. */
   duplicate: boolean;
+  storedPath?: string;
 };
 
 /** The lowercase file extension of a name, including the dot (e.g. `.pdf`). */
@@ -111,13 +138,13 @@ function sha256Of(bytes: Uint8Array): string {
 }
 
 /**
- * Extracts the voucher number from a Dinero bilag file name. The export names
- * a receipt `<year>-Bilag-<n>.<ext>` (e.g. `2025-Bilag-12.pdf`); the `<n>` is
- * the voucher number. Returns `null` for a name that does not carry one.
+ * Extracts the voucher number from a Dinero booked-document file name. The
+ * export uses `<year>-Bilag-<n>.<ext>` for receipts and
+ * `<year>-Faktura-<n>.<ext>` for issued invoices.
  */
 function voucherRefOf(fileName: string): string | null {
   const base = fileName.split("/").pop() ?? fileName;
-  const match = /-Bilag-(\d+)\.[A-Za-z0-9]+$/i.exec(base);
+  const match = /-(?:Bilag|Faktura)-(\d+)\.[A-Za-z0-9]+$/i.exec(base);
   return match ? match[1]! : null;
 }
 
@@ -178,8 +205,8 @@ function ingestReceipt(
   writeFileSync(tempPath, artifact.bytes);
   const ingest = ingestDocument(db, companyRoot, tempPath, {
     source: BILAG_SOURCE,
-    documentType: "cash_register_receipt",
-  });
+    documentType: /\/Faktura\//i.test(artifact.name) ? "issued_invoice_pdf" : "cash_register_receipt",
+  }, { suppressAudit: true });
   if (!ingest.ok || ingest.documentId == null) {
     errors.push(`bilag '${artifact.name}': ${(ingest.errors ?? ["ingest failed"]).join("; ")}`);
     return null;
@@ -189,6 +216,7 @@ function ingestReceipt(
     documentNo: ingest.documentNo!,
     sha256: ingest.sha256!,
     duplicate: false,
+    storedPath: ingest.storedPath,
   };
 }
 
@@ -219,6 +247,7 @@ export function ingestDineroBilag(
   const unmatched: Array<{ fileName: string; voucherRef: string }> = [];
   const duplicates: string[] = [];
   const unbooked: UnbookedBilag[] = [];
+  const publishedPaths: string[] = [];
 
   // Voucher number -> the journal entry it was posted as (#195).
   const entryByVoucher = new Map<string, { entryId: number; entryNo: string }>();
@@ -230,13 +259,17 @@ export function ingestDineroBilag(
   }
 
   const cutOverYear = cutOverYearOf(input);
-  const bookedReceipts =
-    cutOverYear == null ? [] : receiptsUnder(input, `${cutOverYear}/Bilag/`);
+  const bookedReceipts = cutOverYear == null
+    ? []
+    : [
+        ...receiptsUnder(input, `${cutOverYear}/Bilag/`),
+        ...receiptsUnder(input, `${cutOverYear}/Faktura/`),
+      ].sort((a, b) => a.name.localeCompare(b.name));
   const unbookedReceipts = receiptsUnder(input, "Ikke-bogførte-bilag/");
 
   if (bookedReceipts.length === 0 && unbookedReceipts.length === 0) {
     auditTrail.push("Export carries no bilag — no receipts to ingest");
-    return { ok: true, linked, unmatched, duplicates, unbooked, auditTrail, errors };
+    return { ok: true, linked, unmatched, duplicates, unbooked, auditTrail, errors, publishedPaths };
   }
 
   const docBySha = db.query("SELECT id, document_no FROM documents WHERE sha256_hash = ?");
@@ -262,6 +295,7 @@ export function ingestDineroBilag(
       const doc = ingestReceipt(db, companyRoot, spillDir, artifact, docBySha, errors);
       if (!doc) continue;
       if (doc.duplicate) duplicates.push(artifact.name);
+      else if (doc.storedPath) publishedPaths.push(doc.storedPath);
 
       const entry = entryByVoucher.get(voucherRef);
       if (!entry) {
@@ -295,6 +329,7 @@ export function ingestDineroBilag(
       const doc = ingestReceipt(db, companyRoot, spillDir, artifact, docBySha, errors);
       if (!doc) continue;
       if (doc.duplicate) duplicates.push(artifact.name);
+      else if (doc.storedPath) publishedPaths.push(doc.storedPath);
 
       const exception = recordException(db, {
         type: UNBOOKED_RECEIPT_EXCEPTION,
@@ -345,5 +380,6 @@ export function ingestDineroBilag(
     unbooked,
     auditTrail,
     errors,
+    publishedPaths,
   };
 }

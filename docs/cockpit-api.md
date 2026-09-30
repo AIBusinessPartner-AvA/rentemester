@@ -1,5 +1,17 @@
 # Cockpit HTTP API — the `rentemester serve` interface contract (#296)
 
+## Legacy contact-to-party mapping
+
+The registry mapping contract is deterministic: plan is read-only, apply is
+confirmed and idempotent, and corrections are explicit supersessions. It binds
+the company, current legacy-contact fingerprint, canonical party and role,
+source-document byte/payload hashes, reviewed reference and plan hash. A
+reviewed legacy reference alone never creates a mapping; no contact, document,
+journal or VAT facts are changed. The matching routes are
+`POST /api/companies/:slug/legacy-party-mappings/plan`,
+`GET /api/companies/:slug/legacy-party-mappings`, and confirmed `apply` /
+`supersede` POST routes below that collection.
+
 `rentemester serve` starts a local JSON HTTP API over a workspace and its
 `src/core/` bookkeeping engine. It is the backend consumed by the (separate)
 React cockpit app, but it is a plain JSON API and can be driven by any HTTP
@@ -56,6 +68,10 @@ There is one auth seam (`src/server/auth.ts`), run before every route.
 - **`RENTEMESTER_APP_AUTH=required`:** a shared-secret bearer token. Every
   request must carry `Authorization: Bearer <RENTEMESTER_APP_TOKEN>`; a
   missing or wrong token is `401`.
+- **Hosted profile:** Better Auth owns individual password credentials,
+  verified e-mail, TOTP/recovery codes and cookie sessions. Every protected
+  route is authorized against append-only workspace/company membership and
+  the route's declared permission before a company ledger is opened.
 
 **The localhost write hard-gate.** When auth is *disabled* (Phase 1), a
 bookkeeping **write** is additionally refused unless the request's `Host`
@@ -127,17 +143,21 @@ agent can branch on the specific cause without parsing `errors[0]`. The
 
 All read endpoints are `GET`, side-effect free, and require no body. Unknown
 slug → `404`. The `year` query parameter, where accepted, selects a fiscal
-year; `asOf` (a `YYYY-MM-DD`) selects an as-of date — both default sensibly
-when omitted.
+year and normally defaults when omitted. `asOf` selects an as-of date; ordinary
+company/portfolio routes may default it, while every group structure,
+reconciliation, elimination and consolidated-report endpoint requires an
+explicit `YYYY-MM-DD` value and otherwise fails closed.
 
 | Method + path | Response key | Purpose |
 |---|---|---|
 | `GET /api` or `GET /api/health` | `service`, `workspace`, `authRequired`, `routes` | Health probe + server identity + route-catalog (#376). `routes` is a machine-readable list of every HTTP endpoint with `{ method, pattern, summary }` so an agent can enumerate the surface without reading source. The catalog is the same `ROUTE_CATALOG` exported from `src/server/router.ts`. |
 | `GET /api/portfolio?asOf=` | `portfolio` | Cross-company portfolio overview. |
-| `GET /api/companies` | `workspace`, `count`, `companies[]` | List workspace companies (`{slug,name,createdAt,archived}`). Discovers and adopts an unlisted-but-present company directory before listing. |
+| `GET /api/cfo-analytics?scope=company|portfolio|group&from=&to=` | analytics fields | Versioneret, kildehenvisende CFO-analyse. Hosted adgang filtreres før aggregering; portfolio er ikke konsolideret, og gruppe kræver en godkendt profil. |
+| `GET /api/companies` | `workspace`, `count`, `companies[]` | Lists canonical live workspace companies (`{slug,name,createdAt,archived,purpose}`). `workspace.json` is authoritative; unregistered, archived and non-live directories are excluded. A registered live root with missing/invalid CVR is quarantined from discovery and makes readiness fail with a safe diagnostic. An unavailable ledger or duplicate normalized CVR fails the whole discovery read with `WORKSPACE_CANONICALITY_FAILED` and safe slug/reason diagnostics. |
 | `GET /api/companies/:slug/dashboard?asOf=` | `dashboard` | The company dashboard data. |
 | `GET /api/companies/:slug/fiscal-years` | `fiscalYears` | The company's fiscal years. |
 | `GET /api/companies/:slug/overview?year=` | `overview` | Per-year overview. |
+| `GET /api/companies/:slug/attention` | `attention` | Read-only daily inbox. It aggregates canonical open exceptions (including true agent proposals exactly once), blocked close-readiness controls and actionable bookkeeping-workbench blockers; each item retains source identity, actor, reason, evidence and an existing destination. |
 | `GET /api/companies/:slug/income-statement?year=` | `incomeStatement` | Income statement (resultatopgørelse). |
 | `GET /api/companies/:slug/income-statement/export?format=csv&year=` | _binary CSV_ | #372 — Resultatopgørelse som CSV-download (text/csv attachment, dansk semikolon-separator + UTF-8 BOM, byte-deterministic for samme ledger). PDF følger i et opfølger-issue. |
 | `GET /api/companies/:slug/balance?year=` | `balance` | Balance sheet (balance). |
@@ -145,6 +165,8 @@ when omitted.
 | `GET /api/companies/:slug/trial-balance?year=` | `trialBalance` | Trial balance (saldobalance). |
 | `GET /api/companies/:slug/trial-balance/export?format=csv&year=` | _binary CSV_ | #372 — Saldobalance som CSV-download. |
 | `GET /api/companies/:slug/journal?year=&account=` | `journal` | Journal entries, optionally filtered by account. |
+| `GET /api/companies/:slug/accounting-drafts` | `accountingDrafts` | Latest append-only state for every accounting draft. |
+| `GET /api/companies/:slug/accounting-drafts/:draftId` | `accountingDraft` | One draft's current exact version and event hash. |
 | `GET /api/companies/:slug/bank?year=` | `bank` | Bank transactions. |
 | `GET /api/companies/:slug/vat?year=` | `vat` | VAT report (momsopgørelse). |
 | `GET /api/companies/:slug/documents` | `documents` | Ingested documents (bilag). |
@@ -157,6 +179,11 @@ when omitted.
 | `GET /api/companies/:slug/cashflow?year=` | `cashflow` | Cash-flow view. |
 | `GET /api/companies/:slug/budget?year=` | `budget` | Effective (latest-revision) budget lines for one fiscal year (#339). |
 | `GET /api/companies/:slug/budget-vs-actual?year=` | `budgetVsActual` | Budget-vs-faktisk comparison for one fiscal year (#339). |
+| `GET /api/group-overview?asOf=YYYY-MM-DD` | `scope` | Membership-filtered, effective-dated group structure and readiness without financial figures. Exactly one `asOf` is required. |
+| `GET /api/group-reconciliation?asOf=YYYY-MM-DD` | `scope` | Read-only intercompany reconciliation with source evidence. Exactly one `asOf` is required. |
+| `GET /api/group-eliminations?asOf=YYYY-MM-DD` | `scope` | Applied append-only balance eliminations visible to the caller. Exactly one `asOf` is required. |
+| `GET /api/group-report-profiles?asOf=YYYY-MM-DD` | `scope`, `profiles` | Active, approved reporting profiles only when the complete group is visible. Exactly one `asOf` is required. |
+| `GET /api/group-consolidated-report?profileId=&from=&asOf=` | `scope`, `status` | Profile-bound read-only consolidated result and balance. Each query parameter is required exactly once. |
 
 The detailed object shape of each read payload is the corresponding
 `build*` function's return type in `src/server/data.ts`.
@@ -207,6 +234,23 @@ Clears an open exception. `:id` must be a positive integer.
   `resolved`).
 - Response key `exception`: `{ id, resolved }`.
 
+### Accounting draft review lifecycle
+
+All lifecycle calls bind to the exact current `eventHash`. The server ignores
+any client actor fields and derives the actor from the authenticated session.
+
+| Method + path | Body | Permission | Effect |
+|---|---|---|---|
+| `POST /api/companies/:slug/accounting-drafts` | `{ draftId, payload }` | `company.draft.write` | Creates version 1 without posting. |
+| `POST /api/companies/:slug/accounting-drafts/:draftId/revise` | `{ expectedEventHash, payload }` | `company.draft.write` | Appends a new editable version. |
+| `POST /api/companies/:slug/accounting-drafts/:draftId/submit` | `{ expectedEventHash }` | `company.draft.write` | Revalidates and locks the exact version for review. |
+| `POST /api/companies/:slug/accounting-drafts/:draftId/reject` | `{ expectedEventHash, reason }` | `company.review` | Appends an explained rejection; a new version is required before resubmit. |
+| `POST /api/companies/:slug/accounting-drafts/:draftId/approve-and-post` | `{ expectedEventHash, confirm: true }` | `company.review` | An independent reviewer atomically posts and records approval. Exact retries return existing evidence. |
+
+The payload is the normal `JournalEntryInput` shape. Account, balance,
+period, document and bank-link invariants are checked on creation/submission
+and again inside the final immediate transaction.
+
 ### `POST /api/companies/:slug/bank/import`
 
 Imports a bank-statement CSV. The frontend reads the chosen CSV file in the
@@ -226,8 +270,8 @@ core resolves the MIME type from it).
 
 - Body: `{ fileName: string, fileBase64: string, metadata: {...}, vendorId?: number, force?: boolean, confirm: true }`.
 - `metadata` is the document-metadata object (mirrors the MCP `documents_ingest`
-  input): `source` is required; `documentType` is `"purchase_sale"` or
-  `"cash_register_receipt"`; optional `issueDate`, `invoiceNo`,
+  input): `source` is required; `documentType` is `"purchase_sale"`,
+  `"cash_register_receipt"` or `"internal_voucher"`; optional `issueDate`, `invoiceNo`,
   `deliveryDescription`, `amountIncVat`, `currency`, `sender`, `recipient`
   (`{name?,address?,vatOrCvr?}`), `vatAmount`, `paymentDetails`, `exemptionCode`
   (`"FOREIGN_PHYSICAL_ONLY"` or `null`). Amounts are kroner.
@@ -273,6 +317,22 @@ Settles an issued invoice against a bank payment.
 - Response key `settlement`:
   `{ entryId, paymentId, principalAmount, claimAmount, invoiceNumber, openBalance }`.
 
+### `POST /api/companies/:slug/invoices/send-public`
+
+Sends a public-recipient invoice through the selected company's locally bound
+DigiSense transport. Body: `{ invoiceDocumentId, confirm: true }`. The HTTP
+body cannot choose a DigiSense `companyKey`, access-point identity, endpoint or
+credentials; all are resolved server-side from that company's local binding.
+An already acknowledged retry is idempotent and does not call delivery again.
+
+### `POST /api/companies/:slug/invoices/send-public/status`
+
+Observes only a previously queued DigiSense submission. Body:
+`{ invoiceDocumentId, confirm: true }`. It calls DigiSense `document-status`
+and records append-only status evidence; it can never invoke document-delivery
+or redeliver the invoice. Missing DigiSense configuration or an ambiguous local
+company binding is returned as a safe `400` error.
+
 ### `POST /api/companies/:slug/budget`
 
 Appends a budget revision for one (account, period) cell (#339). The core is
@@ -309,7 +369,7 @@ a friendly health probe and any other non-`/api` path is a JSON `404`.
 |---|---|---|---|
 | Driver | The cockpit SPA / any HTTP client | An external MCP client/agent | The in-process `runAgentLoop()` |
 | Scope | A whole workspace; company by slug | One company per call; slug or path | One company, one run |
-| Surface | A small REST-ish route set | 113 loose tools | A single fixed loop |
+| Surface | A small REST-ish route set | 249 loose tools | A single fixed loop |
 | Writes | 6 `POST` routes via `withCompanyMutation` | Write tools with `confirm` | The loop books deterministically |
 
 All four rest on the same `src/core/`, the same rules and the same

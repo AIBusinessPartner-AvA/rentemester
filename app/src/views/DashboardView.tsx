@@ -8,13 +8,18 @@
 // All `/overview` money fields are kroner, so `formatKroner` is used
 // throughout (never `formatCurrency`, which expects minor units).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { Chart } from "@tanstack/react-charts";
+import { defineChart, lineY } from "@tanstack/charts";
+import { scaleLinear } from "@tanstack/charts/scales/linear";
+import { scalePoint } from "@tanstack/charts/scales/point";
 import { api } from "../lib/api";
 import { formatDateDa, formatKroner, formatPercent } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 import type {
   CompanyOverview,
+  ChangesSince,
   OverviewExceptionRow,
   OverviewMonth,
 } from "../lib/types";
@@ -28,21 +33,44 @@ import { AccountantExportCard } from "../components/AccountantExportCard";
 export function DashboardView() {
   const { slug = "" } = useParams();
   const { year, setYear } = useCompanyYear();
+  const seenKey = `rentemester:changes:local:workspace:${slug}`;
+  const [seen, setSeen] = useState(
+    () => Number(window.localStorage.getItem(seenKey) ?? "0") || 0,
+  );
   const state = useAsync<CompanyOverview>(
     () => api.overview(slug, year),
     [slug, year],
   );
+  const changes = useAsync(() => api.changesSince(slug, seen), [slug, seen]);
+  const [seenNotice, setSeenNotice] = useState(false);
+  useEffect(() => {
+    if (changes.error) {
+      window.localStorage.removeItem(seenKey);
+      setSeen(0);
+    }
+  }, [changes.error, seenKey]);
 
   if (state.loading && !state.data) return <Loading label="Henter overblik…" />;
   if (state.error)
     return <ErrorState message={state.error} onRetry={state.reload} />;
 
   const o = state.data!;
+  const chartDefinition = defineChart({
+    marks: [lineY(o.profitAndLoss.months, { x: "label", y: "income" })],
+    scales: { x: { scale: scalePoint }, y: { scale: scaleLinear, nice: true, grid: true, axis: { label: "Omsætning (kr.)" } } },
+  });
+  const markSeen = () => {
+    if (changes.data) {
+      window.localStorage.setItem(seenKey, String(changes.data.cursor));
+      setSeen(changes.data.cursor);
+    }
+    setSeenNotice(true);
+  };
   const currency = o.company.currency || "DKK";
   const positive = o.profitAndLoss.resultat >= 0;
 
   return (
-    <section className="overview">
+    <section className="overview" data-cockpit-page="dashboard" data-evidence-issue="651">
       <div className="page-head">
         <div>
           <h2>{o.company.name}</h2>
@@ -76,6 +104,21 @@ export function DashboardView() {
           : "Ingen posteringer bogført endnu"}
       </p>
 
+      <section className="card" aria-label="Status og næste handling">
+        <h3>{o.attention.status === "requires-attention" ? `${o.attention.count} forhold kræver opmærksomhed` : "Status: ingen åbne forhold"}</h3>
+        <p className="muted">{o.attention.status === "requires-attention" ? "Gennemgå de åbne forhold, før du vurderer nøgletallene." : "Regnskabsdataene er klar til gennemgang."}</p>
+        {o.attention.status === "requires-attention" ? <Link className="btn primary" to={`/companies/${slug}/opmaerksomhed`}>Se krævende handlinger</Link> : isFreshEmptyCompany(o) ? <Link className="btn primary" to={`/companies/${slug}/bilag`}>Start med bilag</Link> : <Link className="btn secondary" to={statementTo(slug, "posteringer", o.selectedYear)}>Se posteringer</Link>}
+      </section>
+
+      <section className="section" aria-labelledby="changes-heading">
+        <h3 id="changes-heading" data-evidence-heading>Siden sidst</h3>
+        {changes.loading && <p className="muted" data-evidence-status="loading">Henter ændringer…</p>}
+        {changes.error && <p role="alert" data-evidence-status={/403|forbudt|adgang/i.test(changes.error) ? "warning-or-blocked" : "error"}>{/403|forbudt|adgang/i.test(changes.error) ? "Overblik kræver opmærksomhed" : "Virksomhedsoverblik kunne ikke hentes"}</p>}
+        {changes.data && changes.data.events.length === 0 && <p className="muted" data-evidence-status="empty">Ingen nye data- eller statusændringer siden dit seneste besøg.</p>}
+        {changes.data && changes.data.events.length > 0 && <ChangesSummary changes={changes.data} onSeen={markSeen} seenNotice={seenNotice} />}
+        {changes.data && seen === 0 && <p className="muted">Første besøg: ændringer vises fra begyndelsen af det tilgængelige revisionsspor.</p>}
+      </section>
+
       <div className="kpi-row">
         <KpiCard
           label="Omsætning"
@@ -102,8 +145,12 @@ export function DashboardView() {
       <KeyFigures keyFigures={o.keyFigures} />
 
       <div className="section">
-        <h3>Indtægter og udgifter — {o.selectedYear}</h3>
+        <h3>{o.profitAndLoss.months.length > 0 ? `Omsætningen toppede i ${o.profitAndLoss.months.reduce((best, month) => month.income > best.income ? month : best, o.profitAndLoss.months[0]!).label}` : "Omsætningens udvikling kan endnu ikke vises"} — {o.selectedYear}</h3>
+        <p className="muted">Én pointe: sammenlign månedernes omsætning. Regnskabsår {o.selectedYear}.</p>
         <div className="card chart-card">
+          {o.profitAndLoss.months.length > 0 ? <Chart definition={chartDefinition} ariaLabel="Omsætning pr. måned" ariaDescription={`Omsætning i regnskabsår ${o.selectedYear}`} height={260} /> : <p className="muted">Ingen måneder at vise endnu.</p>}
+          <table data-evidence-data><caption className="sr-only">Omsætning pr. måned, regnskabsår {o.selectedYear}</caption><thead><tr><th>Måned</th><th>Beløb (kr.)</th></tr></thead><tbody>{o.profitAndLoss.months.map((month) => <tr key={month.month}><td>{month.label}</td><td>{formatKroner(month.income, currency)}</td></tr>)}</tbody></table>
+          <Link to={statementTo(slug, "resultatopgorelse", o.selectedYear)} data-evidence-progressive>Se underliggende resultatopgørelse</Link>
           <PnlChart months={o.profitAndLoss.months} />
         </div>
       </div>
@@ -133,6 +180,7 @@ export function DashboardView() {
             <ExceptionsCard
               slug={slug}
               exceptions={o.exceptions}
+              attentionCount={o.attention.count}
               archived={o.archived}
               onResolved={state.reload}
             />
@@ -156,6 +204,52 @@ export function DashboardView() {
   );
 }
 
+const changeCategoryLabels: readonly [prefix: string, singular: string, plural: string][] = [
+  ["journal_", "bogføringsændring", "bogføringsændringer"],
+  ["document_", "bilagsændring", "bilagsændringer"],
+  ["bank_", "bankændring", "bankændringer"],
+  ["invoice_", "fakturaændring", "fakturaændringer"],
+  ["exception_", "opgaveændring", "opgaveændringer"],
+  ["vat_", "momsændring", "momsændringer"],
+  ["period_", "periodeændring", "periodeændringer"],
+  ["company_", "virksomhedsændring", "virksomhedsændringer"],
+];
+
+function ChangesSummary({
+  changes,
+  onSeen,
+  seenNotice,
+}: {
+  changes: ChangesSince;
+  onSeen: () => void;
+  seenNotice: boolean;
+}) {
+  const counts = new Map<string, { count: number; singular: string; plural: string }>();
+  for (const event of changes.events) {
+    const category = changeCategoryLabels.find(([prefix]) => event.eventType.startsWith(prefix));
+    const key = category?.[0] ?? "other";
+    const current = counts.get(key) ?? {
+      count: 0,
+      singular: category?.[1] ?? "anden ændring",
+      plural: category?.[2] ?? "andre ændringer",
+    };
+    current.count += 1;
+    counts.set(key, current);
+  }
+  return <>
+    <p data-evidence-status="normal">{changes.events.length} {changes.events.length === 1 ? "ny ændring" : "nye ændringer"} siden dit seneste besøg.</p>
+    <ul aria-label="Kort ændringsoversigt" data-evidence-data>
+      {[...counts.values()].map((item) => <li key={item.singular}>{item.count} {item.count === 1 ? item.singular : item.plural}</li>)}
+    </ul>
+    <details data-evidence-progressive>
+      <summary>Evidens</summary>
+      <ul>{changes.events.map((event) => <li key={event.id}><strong>{event.eventType}</strong>: {event.message} <span className="muted">· {event.actor} · {event.createdAt}</span></li>)}</ul>
+    </details>
+    <button className="btn secondary" type="button" onClick={onSeen} data-evidence-core-action>Markér som set</button>
+    {seenNotice && <p data-evidence-task-outcome>Ændringer markeret som set</p>}
+  </>;
+}
+
 // --------------------------------------------------------------------------
 // #395 — "Sådan kommer du i gang" empty-state CTA
 // --------------------------------------------------------------------------
@@ -170,7 +264,7 @@ export function DashboardView() {
 function isFreshEmptyCompany(o: CompanyOverview): boolean {
   if (o.archived) return false;
   const noEntries = o.lastPostedDate === null && o.recentEntries.length === 0;
-  const noBank = o.bank.actualBalance === null && o.bank.balance === 0;
+  const noBank = o.bank.actualBalance === null && o.bank.balance === 0 && o.bank.bankStatementStatus !== "ambiguous";
   return noEntries && noBank;
 }
 
@@ -338,6 +432,7 @@ function BankCard({
   to: string;
 }) {
   const { balance, actualBalance, difference } = bank;
+  const ambiguous = bank.bankStatementStatus === "ambiguous";
   // The actual statement balance is the headline figure when it is known —
   // it is what the owner's bank app shows. The booked balance and the gap
   // sit below it, clearly labelled, so a difference is never mistaken.
@@ -345,11 +440,13 @@ function BankCard({
   return (
     <StatusCard title="Bank" to={to}>
       <div className="status-figure">
-        {formatKroner(actualBalance ?? balance, currency)}
+        {actualBalance === null && ambiguous ? "—" : formatKroner(actualBalance ?? balance, currency)}
       </div>
       {actualBalance === null ? (
         <p className="muted status-note">
-          Bogført saldo på bank- og kassekonti — intet kontoudtog importeret
+          {ambiguous
+            ? "Kontoudtogets rækkefølge eller løbende saldo kan ikke bevises. Se Bank og kontrollér eksporten — Rentemester viser ingen gættet saldo."
+            : "Bogført saldo på bank- og kassekonti — intet kontoudtog importeret"}
         </p>
       ) : (
         <p className="muted status-note">
@@ -398,13 +495,19 @@ function VatCard({
         ? "Frist i dag"
         : `${days} ${days === 1 ? "dag" : "dage"} tilbage`;
   const tone = days <= 30 ? (days < 0 ? "critical" : "warning") : "ok";
+  const periodStatus =
+    vat.periodStatus === "reported"
+      ? "Indberettet"
+      : vat.periodStatus === "closed"
+        ? "Lukket – klar til indberetning"
+        : "Åben";
   return (
     <StatusCard title="Moms" to={to}>
       <div className="status-figure">
         {formatKroner(vat.payable, currency)}
       </div>
       <p className="muted status-note">
-        Momsperiode {vat.periodLabel} ({vat.periodStart} – {vat.periodEnd}) ·{" "}
+        Momsperiode {vat.periodLabel} ({vat.periodStart} – {vat.periodEnd}) · {periodStatus} ·{" "}
         {vat.payable >= 0 ? "at betale" : "tilgode"}
       </p>
       <p className="muted status-note">
@@ -456,11 +559,13 @@ function exceptionLinkTo(slug: string, link: string | null): string | null {
 function ExceptionsCard({
   slug,
   exceptions,
+  attentionCount,
   archived,
   onResolved,
 }: {
   slug: string;
   exceptions: CompanyOverview["exceptions"];
+  attentionCount: number;
   /** A pre-cut-over archived year is read-only — no write action is offered. */
   archived: boolean;
   /** Re-runs the overview load after an exception is resolved. */
@@ -473,15 +578,16 @@ function ExceptionsCard({
     <StatusCard title="Opgaver">
       <div
         className={`status-figure${
-          exceptions.count > 0 ? " status-alert" : ""
+          attentionCount > 0 ? " status-alert" : ""
         }`}
       >
-        {exceptions.count}
+        {attentionCount}
       </div>
-      {exceptions.count === 0 ? (
+      {attentionCount === 0 ? (
         <p className="muted status-note">Ingen åbne opgaver.</p>
       ) : (
         <>
+          <p><Link to={`/companies/${slug}/opmaerksomhed`}>Se alle opgaver</Link></p>
           {/* The grouped summary lines — one Danish line per exception type. */}
           <ul className="status-list">
             {exceptions.groups.map((g) => {

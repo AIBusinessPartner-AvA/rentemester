@@ -1,3 +1,4 @@
+import { runSql } from "../sqlite";
 // Digisense MODTAG-sti (#efaktura) — poll-baseret modtagelse af e-fakturaer.
 //
 // Flow (poll, INGEN always-on server):
@@ -24,7 +25,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Database } from "bun:sqlite";
 import { ingestDocument, type DocumentMetadata, type IngestDocumentOptions } from "../documents";
-import { insertAuditLog } from "../actor";
+import { insertAuditLog, type ResolveActorInput } from "../actor";
 import type {
   DigisenseClient,
   ListReceivedDocumentsQuery,
@@ -88,6 +89,8 @@ export type PollDigisenseReceivedOptions = {
   ingestOptions?: IngestDocumentOptions;
   /** Hård øvre grænse på antal sider, så et fejlende nextPageUrl ikke looper. */
   maxPages?: number;
+  /** Explicit actor propagated to every document and DigiSense audit event. */
+  actor?: ResolveActorInput;
 };
 
 /**
@@ -264,7 +267,11 @@ async function ingestReceivedDocument(
     writeFileSync(xmlPath, download.xml, "utf8");
 
     const metadata = buildReceivedMetadata(doc, download.xml, options.metadata);
-    const ingest = ingestDocument(db, companyRoot, xmlPath, metadata, options.ingestOptions ?? {});
+    const ingest = ingestDocument(db, companyRoot, xmlPath, metadata, {
+      ...(options.ingestOptions ?? {}),
+      createdBy: options.actor?.createdBy ?? undefined,
+      createdByProgram: options.actor?.createdByProgram ?? undefined,
+    });
     if (!ingest.ok) {
       // TERMINAL ingest-fejl: download lykkedes, men XML'en kan ikke bookføres
       // (manglende obligatoriske felter, indholds-dublet, logisk dublet). Det er
@@ -274,7 +281,7 @@ async function ingestReceivedDocument(
       // fejler igen i det uendelige (den signerede downloadUrl udløber). Et
       // menneske kan se quarantine-rækken og håndtere bilaget manuelt.
       const reason = (ingest.errors ?? ["ingest failed"]).join("; ");
-      quarantineReceivedDocument(db, companyKey, doc, reason);
+      quarantineReceivedDocument(db, companyKey, doc, reason, options.actor);
       return { internalId, status: "quarantined", errors: ingest.errors ?? ["ingest failed"] };
     }
 
@@ -282,7 +289,7 @@ async function ingestReceivedDocument(
     // ingen, så en halv-skreven modtagelse aldrig efterlader en uregistreret
     // dublet-mulighed.
     db.transaction(() => {
-      db.run(
+      runSql(db,
         `INSERT INTO digisense_received_documents
            (internal_id, company_key, document_id, skip_reason, digisense_document_id, source_network,
             sender_participant_id, sender_name, received_at)
@@ -303,6 +310,7 @@ async function ingestReceivedDocument(
         entityType: "document",
         entityId: ingest.documentId ?? null,
         message: `Modtog e-faktura ${ingest.documentNo} via Digisense (internalId=${internalId}, ${doc.sourceNetwork ?? "ukendt netværk"}, afsender ${doc.senderName ?? doc.senderParticipantId ?? "ukendt"})`,
+        ...options.actor,
       });
     })();
 
@@ -324,9 +332,10 @@ function quarantineReceivedDocument(
   companyKey: string,
   doc: ReceivedDocument,
   reason: string,
+  actor?: ResolveActorInput,
 ): void {
   db.transaction(() => {
-    db.run(
+    runSql(db,
       `INSERT INTO digisense_received_documents
          (internal_id, company_key, document_id, skip_reason, digisense_document_id, source_network,
           sender_participant_id, sender_name, received_at)
@@ -347,6 +356,7 @@ function quarantineReceivedDocument(
       entityType: "document",
       entityId: null,
       message: `Sat modtaget e-faktura i karantæne (internalId=${doc.internalId}, afsender ${doc.senderName ?? doc.senderParticipantId ?? "ukendt"}): ${reason}`,
+      ...actor,
     });
   })();
 }
@@ -453,10 +463,10 @@ function extractUblFields(xml: string): UblFields {
     invoiceNo: tagText(xml, "ID"),
     currency: tagText(xml, "DocumentCurrencyCode"),
     senderName: supplier ? tagText(supplier, "Name") : undefined,
-    senderAddress: supplier ? tagText(supplier, "StreetName") : undefined,
+    senderAddress: supplier ? tagText(supplier, "StreetName") ?? tagText(supplier, "Line") : undefined,
     senderVatOrCvr: supplier ? tagText(supplier, "CompanyID") : undefined,
     recipientName: customer ? tagText(customer, "Name") : undefined,
-    recipientAddress: customer ? tagText(customer, "StreetName") : undefined,
+    recipientAddress: customer ? tagText(customer, "StreetName") ?? tagText(customer, "Line") : undefined,
     recipientVatOrCvr: customer ? tagText(customer, "CompanyID") : undefined,
     payableAmount: parseAmount(tagText(xml, "PayableAmount")),
     taxAmount: parseAmount(tagText(xml, "TaxAmount")),

@@ -1,13 +1,25 @@
-import { describe, expect, test, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { describe, expect, test, vi } from "bun:test";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { InvoicesView } from "./InvoicesView";
 import { renderAt } from "../test/render";
 import { invoices, mockFetch } from "../test/fixtures";
 
-function route(over = {}) {
+function route(over = {}, importedOver = {}) {
   return {
     "GET /api/companies/acme-aps/invoices": { invoices: invoices(over) },
+    "GET /api/companies/acme-aps/imported-receivables": {
+      importedReceivables: {
+        ok: true,
+        asOfDate: "2026-12-31",
+        boundary: "Importerede tilgodehavender holdes adskilt fra Rentemester-fakturaer.",
+        count: 0,
+        totalOpen: 0,
+        rows: [],
+        errors: [],
+        ...importedOver,
+      },
+    },
   };
 }
 
@@ -19,6 +31,17 @@ function renderView() {
 }
 
 describe("InvoicesView — Fakturaer", () => {
+  test("links only invoices with an explicit customer party ID", async () => {
+    const row = invoices().invoices[0];
+    mockFetch(route({ invoices: [
+      { ...row, documentId: 11, customerName: "Samme navn", partyId: "party-invoice" },
+      { ...row, documentId: 12, customerName: "Samme navn", partyId: null },
+    ] }));
+    renderView();
+    expect(await screen.findByRole("link", { name: "Samme navn" })).toHaveAttribute("href", "/companies/acme-aps/parter/party-invoice");
+    expect(screen.getAllByText("Samme navn").some((element) => element.closest("a") === null)).toBe(true);
+  });
+
   test("lists the issued invoices with their status", async () => {
     mockFetch(route());
     renderView();
@@ -77,9 +100,36 @@ describe("InvoicesView — Fakturaer", () => {
     renderView();
     const select = await screen.findByLabelText("Vælg regnskabsår");
     await userEvent.selectOptions(select, "2025");
-    const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
-    const lastUrl = String(calls[calls.length - 1]![0]);
-    expect(lastUrl).toContain("year=2025");
+    const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.some(([url]) => String(url).includes("/invoices?year=2025"))).toBe(true);
+  });
+
+  test("shows imported receivables as a separate source-evidenced archive", async () => {
+    mockFetch(route({}, {
+      count: 1,
+      totalOpen: 1250,
+      rows: [{
+        source: "imported",
+        externalInvoiceId: "SRC-1001",
+        customerExternalId: "customer-1",
+        customerName: "Kunde A/S",
+        invoiceDate: "2025-12-15",
+        dueDate: "2026-01-15",
+        grossAmount: 1250,
+        paidAmount: 0,
+        openBalance: 1250,
+        controlAccountNo: "1200",
+        sourceRecognitionRef: "source-journal-1",
+        sourceDocumentHash: "a".repeat(64),
+        scheduleHash: "b".repeat(64),
+        archiveBoundary: "cutover",
+      }],
+    }));
+    renderView();
+    const archive = await screen.findByRole("region", { name: "Importerede tilgodehavender" });
+    expect(within(archive).getByText("SRC-1001")).toBeInTheDocument();
+    expect(within(archive).getByText(/adskilt fra Rentemester-fakturaer/)).toBeInTheDocument();
+    expect(within(archive).getAllByText("1.250,00 kr.")).toHaveLength(2);
   });
 
   test("an archived year shows an honest 'not available' state", async () => {
@@ -176,7 +226,7 @@ describe("InvoicesView — write actions", () => {
     );
 
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const settleCall = calls.find((c) =>
         String(c[0]).includes("/invoices/settle"),
       );
@@ -256,19 +306,18 @@ describe("InvoicesView — write actions", () => {
   });
 
   // --------------------------------------------------------------------------
-  // #428 — Forbered e-faktura (NemHandel / PEPPOL) from the row.
+  // #428 — real DigiSense e-faktura delivery from the row.
   //
   // An SMB owner that invoices a public-sector buyer (kommune, region,
   // statslig institution) is required by law to deliver the invoice as an
   // e-faktura. Without a Cockpit button the owner has to fall back to the CLI
   // command `invoice submit-public-peppol`, which most owners never discover.
   //
-  // Audit UI-2/EJER-11: the server only RECORDS the submission envelope
-  // (status `prepared`) — the AS4 transport is not wired in yet. The button
-  // and dialog must therefore say "Forbered"/"registreres", never "Sendes nu".
+  // A prepared DigiSense delivery gets a status-only action; it is never
+  // offered as a second delivery.
   // --------------------------------------------------------------------------
 
-  test("Forbered e-faktura is offered only for rows whose buyer has an EAN-number", async () => {
+  test("Send e-faktura is offered only for rows whose buyer has an EAN-number", async () => {
     mockFetch(
       route({
         invoices: [
@@ -310,11 +359,11 @@ describe("InvoicesView — write actions", () => {
     renderView();
     await screen.findByRole("heading", { name: "Acme ApS" });
     expect(
-      screen.getAllByRole("button", { name: "Forbered e-faktura" }),
+      screen.getAllByRole("button", { name: "Send e-faktura" }),
     ).toHaveLength(1);
   });
 
-  test("Forbered e-faktura is hidden once the invoice has been acknowledged by the access point", async () => {
+  test("Send e-faktura is hidden once the invoice has been acknowledged by the access point", async () => {
     mockFetch(
       route({
         invoices: [
@@ -344,22 +393,89 @@ describe("InvoicesView — write actions", () => {
     renderView();
     await screen.findByRole("heading", { name: "Acme ApS" });
     expect(
-      screen.queryByRole("button", { name: "Forbered e-faktura" }),
+      screen.queryByRole("button", { name: "Send e-faktura" }),
     ).not.toBeInTheDocument();
-    // The "Sendt som e-faktura" status flag MUST be shown instead.
-    expect(screen.getByText("Sendt som e-faktura")).toBeInTheDocument();
+    expect(screen.getByText("E-faktura leveret")).toBeInTheDocument();
   });
 
-  test("Forbered e-faktura is hidden for an archived year (no live ledger)", async () => {
+  test("a queued e-faktura offers only the status action", async () => {
+    mockFetch(route({ invoices: [{
+      documentId: 8, invoiceNo: "2026-00008", invoiceDate: "2026-03-15",
+      customerName: "Aarhus Kommune", customerEmail: null,
+      buyerEanNumber: "5790000123456", buyerPublicRecipient: true,
+      peppolStatus: { status: "queued", submissionReference: "PEPPOL-8", transmissionId: "queued-8", acknowledgedAt: null },
+      lastEmailedAt: null, lastReminderAt: null, lastReminderSequence: 0,
+      grossAmount: 1000, openBalance: 1000, currency: "DKK", status: "open",
+      effectiveDueDate: "2026-04-14", overdueDays: 0,
+    }] }));
+    renderView();
+    await screen.findByRole("heading", { name: "Acme ApS" });
+    expect(screen.getByText("E-faktura køsat — afventer status")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Opdatér leveringsstatus" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send e-faktura" })).not.toBeInTheDocument();
+  });
+
+  test("a pre-acceptance delivery failure can be retried and is not labelled queued", async () => {
+    mockFetch(route({ invoices: [{
+      documentId: 9, invoiceNo: "2026-00009", invoiceDate: "2026-03-15",
+      customerName: "Aarhus Kommune", customerEmail: null,
+      buyerEanNumber: "5790000123456", buyerPublicRecipient: true,
+      peppolStatus: { status: "retryable", submissionReference: "PEPPOL-9", transmissionId: null, acknowledgedAt: null },
+      lastEmailedAt: null, lastReminderAt: null, lastReminderSequence: 0,
+      grossAmount: 1000, openBalance: 1000, currency: "DKK", status: "open",
+      effectiveDueDate: "2026-04-14", overdueDays: 0,
+    }] }));
+    renderView();
+    await screen.findByRole("heading", { name: "Acme ApS" });
+    expect(screen.getByText("E-faktura fejlede — kan prøves igen")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send e-faktura" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Opdatér leveringsstatus" })).not.toBeInTheDocument();
+  });
+
+  test("an accepted terminal failure cannot be sent or polled again", async () => {
+    mockFetch(route({ invoices: [{
+      documentId: 10, invoiceNo: "2026-00010", invoiceDate: "2026-03-15",
+      customerName: "Aarhus Kommune", customerEmail: null,
+      buyerEanNumber: "5790000123456", buyerPublicRecipient: true,
+      peppolStatus: { status: "failed", submissionReference: "PEPPOL-10", transmissionId: "ds-terminal-1", acknowledgedAt: null },
+      lastEmailedAt: null, lastReminderAt: null, lastReminderSequence: 0,
+      grossAmount: 1000, openBalance: 1000, currency: "DKK", status: "open",
+      effectiveDueDate: "2026-04-14", overdueDays: 0,
+    }] }));
+    renderView();
+    await screen.findByRole("heading", { name: "Acme ApS" });
+    expect(screen.getByText("E-faktura afvist — send ikke igen")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send e-faktura" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Opdatér leveringsstatus" })).not.toBeInTheDocument();
+  });
+
+  test("an uncertain delivery requires manual clarification and cannot be sent again", async () => {
+    mockFetch(route({ invoices: [{
+      documentId: 11, invoiceNo: "2026-00011", invoiceDate: "2026-03-15",
+      customerName: "Aarhus Kommune", customerEmail: null,
+      buyerEanNumber: "5790000123456", buyerPublicRecipient: true,
+      peppolStatus: { status: "uncertain", submissionReference: "PEPPOL-11", transmissionId: null, acknowledgedAt: null },
+      lastEmailedAt: null, lastReminderAt: null, lastReminderSequence: 0,
+      grossAmount: 1000, openBalance: 1000, currency: "DKK", status: "open",
+      effectiveDueDate: "2026-04-14", overdueDays: 0,
+    }] }));
+    renderView();
+    await screen.findByRole("heading", { name: "Acme ApS" });
+    expect(screen.getByText("E-faktura-status ukendt — afklar manuelt")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send e-faktura" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Opdatér leveringsstatus" })).not.toBeInTheDocument();
+  });
+
+  test("Send e-faktura is hidden for an archived year (no live ledger)", async () => {
     mockFetch(route({ archived: true, selectedYear: "2025", invoices: [] }));
     renderView();
     await screen.findByText(/Fakturaer er ikke tilgængelige for 2025/);
     expect(
-      screen.queryByRole("button", { name: "Forbered e-faktura" }),
+      screen.queryByRole("button", { name: "Send e-faktura" }),
     ).not.toBeInTheDocument();
   });
 
-  test("Forbered e-faktura posts to the send-public route with confirm: true", async () => {
+  test("Send e-faktura posts to the send-public route with confirm: true", async () => {
     mockFetch({
       "GET /api/companies/acme-aps/invoices": {
         invoices: invoices({
@@ -400,27 +516,18 @@ describe("InvoicesView — write actions", () => {
     renderView();
     await screen.findByRole("heading", { name: "Acme ApS" });
     await userEvent.click(
-      screen.getByRole("button", { name: "Forbered e-faktura" }),
+      screen.getByRole("button", { name: "Send e-faktura" }),
     );
     // Dialog body should surface the EAN and kanal so the owner can verify.
     expect(screen.getByText("5790000123456")).toBeInTheDocument();
     expect(screen.getByText(/NemHandel \(PEPPOL\)/)).toBeInTheDocument();
-    // Audit UI-2: the dialog MUST tell the truth — the invoice is only
-    // REGISTERED for dispatch (server status `prepared`); nothing is
-    // transmitted yet. The old "Sendes nu" promise must be gone.
-    expect(
-      screen.getByText("Registreres til afsendelse"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/transmissionen er endnu ikke aktiv/),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Sendes nu")).not.toBeInTheDocument();
-    await userEvent.click(
-      screen.getByRole("button", { name: "Registrér til afsendelse" }),
-    );
+    expect(screen.getByText("Sendes nu")).toBeInTheDocument();
+    expect(screen.getByText(/sendes via DigiSense/)).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog", { name: "Send e-faktura" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Send e-faktura" }));
 
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const sendCall = calls.find((c) =>
         String(c[0]).includes("/invoices/send-public"),
       );
@@ -579,7 +686,7 @@ describe("InvoicesView — write actions", () => {
     );
 
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const sendCall = calls.find((c) =>
         String(c[0]).includes("/invoices/send-email"),
       );
@@ -792,7 +899,7 @@ describe("InvoicesView — write actions", () => {
     );
 
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const sendCall = calls.find((c) =>
         String(c[0]).includes("/invoices/send-reminder"),
       );
@@ -832,7 +939,7 @@ describe("InvoicesView — write actions", () => {
     );
 
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const creditCall = calls.find((c) =>
         String(c[0]).includes("/invoices/credit-note"),
       );

@@ -31,22 +31,80 @@ import {
   registerDigisenseCompany,
   type RegisterDigisenseCompanyOptions,
 } from "../core/efaktura/digisense-register";
+import { registerDigisenseTestGln } from "../core/efaktura/digisense-register-test-gln";
+import { registerDigisenseTestSender } from "../core/efaktura/digisense-register-test-sender";
 import {
   resolveDigisenseReceiver,
   resolveDigisenseRegistrar,
+  resolveDigisenseStatusChecker,
 } from "../core/efaktura/digisense-wiring";
+import { digisenseAccessPointIdentity } from "../core/efaktura/digisense-wiring";
+import { resumePublicEInvoicePeppolSubmission } from "../core/public-einvoice";
 import { saveDigisenseSecretConfig } from "../core/efaktura/digisense-config";
-import type { DigisenseCompanyType, DigisenseEnvironment } from "../core/efaktura/digisense-client";
+import { loadDigisenseSecretConfig } from "../core/efaktura/digisense-config";
+import { createDigisenseClient, type DigisenseCompanyType, type DigisenseEnvironment } from "../core/efaktura/digisense-client";
+import { getDigisenseOnboardingStatus, onboardDigisenseCompany } from "../core/efaktura/digisense-onboarding";
+import { pollWorkspaceDigisenseInbound } from "../core/efaktura/digisense-workspace";
+import { resolveWorkspaceRoot } from "../core/workspace";
 import type { DocumentMetadata } from "../core/documents";
 import type { CommandDispatch } from "../cli-dispatch";
 
 export function register(dispatch: CommandDispatch): void {
+  dispatch.on("efaktura", "modtag-workspace", async (ctx) => {
+    if ((ctx.arg("--confirm") ?? "").trim().toLowerCase() !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to poll workspace DigiSense inbound"] });
+      process.exit(1);
+    }
+    const workspace = ctx.trimToNull(ctx.arg("--workspace"));
+    if (!workspace) {
+      ctx.emitResult({ ok: false, errors: ["Missing required --workspace <dir>"] });
+      process.exit(2);
+    }
+    try {
+      const createdBy = ctx.cliActor ?? process.env.RENTEMESTER_ACTOR ?? ctx.inferredMutationActor();
+      if (!createdBy) throw new Error("actor required for workspace DigiSense polling");
+      const createdByProgram = ctx.cliActorVia ?? process.env.RENTEMESTER_ACTOR_VIA ?? "rentemester-cli";
+      ctx.emitResult(await pollWorkspaceDigisenseInbound(resolveWorkspaceRoot(workspace), {
+        actor: { createdBy, createdByProgram },
+      }) as unknown as Record<string, unknown>);
+    } catch (error) {
+      ctx.emitResult({ ok: false, errors: [error instanceof Error ? error.message : String(error)] });
+      process.exit(1);
+    }
+  });
+  dispatch.on("efaktura", "onboarding-status", (ctx) => {
+    const db = openCommandDb(ctx); migrate(db);
+    try { ctx.emitResult({ ok: true, ...getDigisenseOnboardingStatus(db, ctx.companyRoot()) }); }
+    finally { db.close(); }
+  });
+
+  dispatch.on("efaktura", "onboard", async (ctx) => {
+    if ((ctx.arg("--confirm") ?? "").trim().toLowerCase() !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to onboard DigiSense"] }); process.exit(1);
+    }
+    const root = ctx.companyRoot(); const db = openCommandDb(ctx); migrate(db);
+    try {
+      const config = loadDigisenseSecretConfig(root);
+      if (!config) { ctx.emitResult({ ok: false, errors: ["Digisense is not configured"] }); process.exit(1); }
+      const result = await onboardDigisenseCompany(db, root, createDigisenseClient(config), {
+        createdBy: ctx.cliActor ?? process.env.RENTEMESTER_ACTOR ?? ctx.inferredMutationActor() ?? undefined,
+        createdByProgram: ctx.cliActorVia ?? process.env.RENTEMESTER_ACTOR_VIA ?? "rentemester-cli",
+      });
+      ctx.emitResult(result as unknown as Record<string, unknown>);
+      if (!result.ok) process.exit(1);
+    } finally { db.close(); }
+  });
   // `efaktura konfigurer` — gem Digisense API license-key i secret-laget
   // (config/digisense.json, 0600). UDEN denne kommando er hele Digisense-
   // overfladen (registrer/modtag/transmit) uopnåelig: de tre operationer
   // starter alle med loadDigisenseSecretConfig og fejler hvis filen mangler.
   // license-key er et SECRET og rammer ALDRIG ledger'en — kun JSON-filen.
   dispatch.on("efaktura", "konfigurer", (ctx) => {
+    const confirmValue = (ctx.arg("--confirm") ?? "").trim().toLowerCase();
+    if (confirmValue !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to save Digisense API credentials"] });
+      process.exit(1);
+    }
     const apiLicenseKey = ctx.trimToNull(ctx.arg("--api-license-key") ?? null);
     if (!apiLicenseKey) {
       ctx.emitResult({
@@ -100,7 +158,14 @@ export function register(dispatch: CommandDispatch): void {
     }
 
     const companyType: DigisenseCompanyType = { type: "DK:CVR", id: cvr };
-    const options: RegisterDigisenseCompanyOptions = { companyType, companyName };
+    const options: RegisterDigisenseCompanyOptions = {
+      companyType,
+      companyName,
+      actor: {
+        createdBy: ctx.cliActor ?? process.env.RENTEMESTER_ACTOR ?? ctx.inferredMutationActor() ?? undefined,
+        createdByProgram: ctx.cliActorVia ?? process.env.RENTEMESTER_ACTOR_VIA ?? "rentemester-cli",
+      },
+    };
     const network = ctx.trimToNull(ctx.arg("--network") ?? null);
     if (network === "nemhandel" || network === "peppol") options.network = network;
 
@@ -108,6 +173,75 @@ export function register(dispatch: CommandDispatch): void {
     migrate(db);
     try {
       const result = await registerDigisenseCompany(db, root, resolved.client, options);
+      ctx.emitResult(result as unknown as Record<string, unknown>);
+      if (!result.ok) process.exit(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  // `efaktura registrer-test-gln` has no GLN input: the only permitted GLN is
+  // returned by validate-auth for a test license, constrained to the one local
+  // company already registered in this ledger.
+  dispatch.on("efaktura", "registrer-test-gln", async (ctx) => {
+    const confirmValue = (ctx.arg("--confirm") ?? "").trim();
+    if (confirmValue !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to register the Digisense test GLN"] });
+      process.exit(1);
+    }
+    const networkValue = ctx.trimToNull(ctx.arg("--network") ?? null) ?? "nemhandel";
+    if (networkValue !== "nemhandel" && networkValue !== "peppol") {
+      ctx.emitResult({ ok: false, errors: ["--network must be nemhandel or peppol"] });
+      process.exit(1);
+    }
+    const root = ctx.companyRoot();
+    let config: ReturnType<typeof loadDigisenseSecretConfig>;
+    try {
+      config = loadDigisenseSecretConfig(root);
+    } catch {
+      ctx.emitResult({ ok: false, errors: ["Digisense test configuration is invalid"] });
+      process.exit(1);
+    }
+    if (!config) {
+      ctx.emitResult({ ok: false, errors: ["Digisense test configuration is required"] });
+      process.exit(1);
+    }
+    if (config.environment !== "test" || !config.apiLicenseKey?.trim()) {
+      ctx.emitResult({ ok: false, errors: ["Digisense test configuration is required"] });
+      process.exit(1);
+    }
+    const db = openCommandDb(ctx);
+    try {
+      const client = createDigisenseClient({ apiLicenseKey: config.apiLicenseKey, environment: "test" });
+      const result = await registerDigisenseTestGln(db, client, networkValue);
+      ctx.emitResult(result as unknown as Record<string, unknown>);
+      if (!result.ok) process.exit(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  dispatch.on("efaktura", "registrer-test-afsender", async (ctx) => {
+    if ((ctx.arg("--confirm") ?? "").trim() !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to register the Digisense test sender"] });
+      process.exit(1);
+    }
+    const root = ctx.companyRoot();
+    let config: ReturnType<typeof loadDigisenseSecretConfig>;
+    try {
+      config = loadDigisenseSecretConfig(root);
+    } catch {
+      ctx.emitResult({ ok: false, errors: ["Digisense test configuration is invalid"] });
+      process.exit(1);
+    }
+    if (!config || config.environment !== "test" || !config.apiLicenseKey?.trim()) {
+      ctx.emitResult({ ok: false, errors: ["Digisense test configuration is required"] });
+      process.exit(1);
+    }
+    const db = openCommandDb(ctx);
+    try {
+      const client = createDigisenseClient({ apiLicenseKey: config.apiLicenseKey, environment: "test" });
+      const result = await registerDigisenseTestSender(db, client);
       ctx.emitResult(result as unknown as Record<string, unknown>);
       if (!result.ok) process.exit(1);
     } finally {
@@ -144,6 +278,10 @@ export function register(dispatch: CommandDispatch): void {
       const options: PollDigisenseReceivedOptions = {
         companyKey: resolved.companyKey,
         ingestOptions: { forceDuplicateLogicalIdentity: ctx.hasFlag("--force") },
+        actor: {
+          createdBy: ctx.cliActor ?? process.env.RENTEMESTER_ACTOR ?? ctx.inferredMutationActor() ?? undefined,
+          createdByProgram: ctx.cliActorVia ?? process.env.RENTEMESTER_ACTOR_VIA ?? "rentemester-cli",
+        },
       };
 
       const limit = ctx.parseOptionalNumber("--limit");
@@ -180,4 +318,33 @@ export function register(dispatch: CommandDispatch): void {
       db.close();
     }
   });
+
+  const registerDeliveryStatus = (command: "status" | "leveringsstatus") => dispatch.on("efaktura", command, async (ctx) => {
+    const confirmValue = (ctx.arg("--confirm") ?? "").trim().toLowerCase();
+    if (confirmValue !== "yes") {
+      ctx.emitResult({ ok: false, errors: ["--confirm yes required to record Digisense delivery status evidence"] });
+      process.exit(1);
+    }
+    const documentId = Number(ctx.arg("--document-id"));
+    if (!Number.isSafeInteger(documentId) || documentId <= 0) {
+      ctx.emitResult({ ok: false, errors: ["Missing required --document-id <positive integer>"] });
+      process.exit(2);
+    }
+    const root = ctx.companyRoot();
+    const db = openCommandDb(ctx);
+    migrate(db);
+    try {
+      const resolved = resolveDigisenseStatusChecker(db, root, { companyKey: ctx.trimToNull(ctx.arg("--digisense-company-key") ?? null) ?? undefined });
+      if (!resolved.ok) { ctx.emitResult({ ok: false, errors: resolved.errors }); process.exit(1); }
+      const result = await resumePublicEInvoicePeppolSubmission(db, { invoiceDocumentId: documentId, accessPoint: digisenseAccessPointIdentity(resolved.companyKey) }, async (queuedDocumentId) => {
+        const status = await resolved.client.documentStatus(queuedDocumentId, resolved.companyKey);
+        return status.ok ? { ok: true, status: status.data.documentStatus, message: status.data.message, publicUrl: status.data.publicUrl } : { ok: false, error: `digisense document-status failed: ${status.error.message}` };
+      });
+      ctx.emitResult(result as unknown as Record<string, unknown>);
+      if (!result.ok || result.status === "failed" || result.status === "uncertain") process.exit(1);
+    } finally { db.close(); }
+  });
+  // Legacy alias; `leveringsstatus` avoids ambiguity with onboarding-status.
+  registerDeliveryStatus("status");
+  registerDeliveryStatus("leveringsstatus");
 }

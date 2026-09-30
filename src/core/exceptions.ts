@@ -1,3 +1,4 @@
+import { runSql } from "./sqlite";
 import type { Database } from "bun:sqlite";
 import { formatKronerDa, normalizeCurrency } from "./money";
 import { isValidIsoDate as looksLikeIsoDate } from "./dates";
@@ -17,6 +18,8 @@ export type RecordExceptionInput = {
   requiredAction?: string | null;
   sourceEvidence?: unknown;
   postingPreview?: unknown;
+  /** Stable identity for a resumable machine-created exception. */
+  resolutionKey?: string | null;
 };
 
 export type ListExceptionsInput = {
@@ -67,11 +70,13 @@ export function recordException(db: Database, input: RecordExceptionInput) {
   const requiredAction = input.requiredAction?.trim() || null;
   const sourceEvidence = serializeJson(input.sourceEvidence);
   const postingPreview = serializeJson(input.postingPreview);
+  const resolutionKey = input.resolutionKey?.trim() || null;
 
   const existing = db.query(
     `SELECT id
      FROM exceptions
      WHERE status = 'open'
+       AND (resolution_key = ? OR (resolution_key IS NULL AND ? IS NULL))
        AND type = ?
        AND COALESCE(related_bank_transaction_id, 0) = COALESCE(?, 0)
        AND COALESCE(related_document_id, 0) = COALESCE(?, 0)
@@ -79,6 +84,8 @@ export function recordException(db: Database, input: RecordExceptionInput) {
        AND COALESCE(required_action, '') = COALESCE(?, '')
      LIMIT 1`
   ).get(
+    resolutionKey,
+    resolutionKey,
     input.type.trim(),
     input.relatedBankTransactionId ?? null,
     input.relatedDocumentId ?? null,
@@ -91,8 +98,8 @@ export function recordException(db: Database, input: RecordExceptionInput) {
   const row = db.query(
     `INSERT INTO exceptions (
       type, severity, status, related_bank_transaction_id, related_document_id,
-      message, required_action, source_evidence, posting_preview
-    ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)
+      message, required_action, source_evidence, posting_preview, resolution_key
+    ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
     RETURNING id`
   ).get(
     input.type.trim(),
@@ -103,6 +110,7 @@ export function recordException(db: Database, input: RecordExceptionInput) {
     requiredAction,
     sourceEvidence,
     postingPreview,
+    resolutionKey,
   ) as { id: number };
 
   return { ok: true, exceptionId: row.id, duplicate: false, errors: [] };
@@ -197,7 +205,7 @@ export function resolveException(db: Database, input: ResolveExceptionInput) {
   if (!row) return { ok: false, resolved: false, errors: [`exception ${input.id} does not exist`] };
   if (row.status === "resolved") return { ok: true, resolved: false, errors: [] };
 
-  db.run(
+  runSql(db,
     `UPDATE exceptions
      SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, resolved_by = ?, resolution_note = ?
      WHERE id = ?`,
@@ -220,7 +228,7 @@ export function resolveOpenExceptionsForBankTransaction(db: Database, bankTransa
   ).all(bankTransactionId) as Array<{ id: number }>;
 
   for (const row of openRows) {
-    db.run(
+    runSql(db,
       `UPDATE exceptions
        SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, resolved_by = ?, resolution_note = ?
        WHERE id = ?`,
@@ -427,14 +435,12 @@ export function syncUnmatchedBankTransactionExceptions(db: Database) {
     `SELECT bt.id, bt.transaction_date, bt.booking_date, bt.text, bt.amount, bt.currency, bt.reference, bt.import_batch_id,
             ex.id AS exception_id, ex.message AS exception_message, ex.required_action AS exception_required_action
      FROM bank_transactions bt
-     LEFT JOIN journal_entries je
-       ON je.source_bank_transaction_id = bt.id
-      AND je.status = 'posted'
+     LEFT JOIN bank_journal_reconciliations br ON br.bank_transaction_id = bt.id
      LEFT JOIN exceptions ex
        ON ex.related_bank_transaction_id = bt.id
       AND ex.type = 'UNMATCHED_BANK_TRANSACTION'
       AND ex.status = 'open'
-     WHERE je.id IS NULL
+     WHERE br.journal_entry_id IS NULL
      ORDER BY bt.transaction_date ASC, bt.id ASC`
   ).all() as Array<any>;
 

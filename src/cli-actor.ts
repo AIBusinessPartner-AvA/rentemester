@@ -3,6 +3,31 @@ import { join } from "node:path";
 import { companyPaths } from "./core/paths";
 
 export const MUTATING_COMMANDS = new Set([
+  "workspace snapshot",
+  "workspace restore",
+  "workspace-access bootstrap-first",
+  "workspace-access bootstrap-local-service",
+  "workspace-access local-service-rotate",
+  "workspace-access local-service-revoke",
+  "group apply-manifest",
+  "group propose-mapping",
+  "group approve-mapping",
+  "group revoke-mapping",
+  "group propose-elimination",
+  "group approve-elimination",
+  "group reject-elimination",
+  "group apply-elimination",
+  "group reverse-elimination",
+  "group propose-profile",
+  "group approve-profile",
+  "group revoke-profile",
+  "group propose-disposition",
+  "group approve-disposition",
+  "group link-disposition",
+  "group settle-disposition",
+  "group reopen-disposition",
+  "group supersede-disposition",
+  "efaktura onboard",
   "accounts add",
   "accounts role-confirm",
   "customer create",
@@ -18,11 +43,14 @@ export const MUTATING_COMMANDS = new Set([
   // bug-klasse som `company sync-cvr`. Den skal være actor-gated.
   "company set-profile",
   "system backup",
+  "system migrate",
+  "system repair-schema-views",
   "system backup-archive",
   "system backup-add-destination",
   "system backup-remove-destination",
   "system backup-place",
   "system backup-confirm-placement",
+  "system backup-verify-remote-placement",
   "system backup-lock",
   "system restore-backup",
   "system export-authority",
@@ -33,6 +61,10 @@ export const MUTATING_COMMANDS = new Set([
   // gated. Samme actor-attribuerede skrivning skal gates ens.
   "system export-saft",
   "invoice issue",
+  "invoice imported-receivables-backfill-apply",
+  "invoice imported-receivable-settlement-apply",
+  "bank legacy-binding-apply",
+  "bank legacy-payable-backfill-apply",
   // #265: `invoice create` is the guided path that issues a real, locked,
   // immutable invoice through the SAME core as `invoice issue` — it MUST be
   // gated by the actor allowlist exactly like `invoice issue`.
@@ -54,22 +86,63 @@ export const MUTATING_COMMANDS = new Set([
   "invoice claim-compensation",
   "invoice post-compensation",
   "documents ingest",
+  "documents enrich",
+  "documents set-company-context",
+  "documents party-link-apply",
+  "documents party-link-supersede",
+  "documents extract-invoice",
+  "documents parse",
+  "documents parse-pending",
   "bank import",
+  "bank link-journal",
+  "bank correction-apply",
+  "bank direct-payable-apply",
   // ===== BANK CLUSTER (#187) =====
   "bank-account add",
   "bank-account update",
   // ===== END BANK CLUSTER (#187) =====
   "expense book",
+  "expense vat-preflight",
+  "bookkeeping-batch dry-run",
+  "bookkeeping-batch persist",
+  "bookkeeping-batch approve",
+  "bookkeeping-batch apply",
+  "purchase-case create",
+  "purchase-case review",
+  "purchase-case reassess",
+  "purchase-case group-review",
+  "approval-policy set",
+  "party create",
+  "party link-role",
+  "party propose-merge",
+  "party approve-merge",
+  "legacy-party-mapping apply",
+  "vendor-identity-enrichment apply",
+  "legacy-party-mapping supersede",
+  "corporate-record ingest",
+  "corporate-record link",
+  "corporate-record enrich",
+  "corporate-record supersede",
+  "ownership propose",
+  "ownership review",
+  "ownership apply",
   "vat post-eu-service-purchase",
   "vat post-representation-purchase",
   "period close",
+  "period review",
   "period reopen",
   "journal post",
   "journal reverse",
+  "accounting-draft create",
+  "accounting-draft revise",
+  "accounting-draft submit",
+  "accounting-draft reject",
+  "accounting-draft approve-and-post",
   "exceptions resolve",
   // ===== RECURRING INVOICES (#118) =====
   "recurring-invoice create",
   "recurring-invoice generate",
+  "recurring-invoice run-workspace",
   // ===== END RECURRING INVOICES (#118) =====
   // ===== MAIL INTAKE (#122) =====
   "mail-intake ingest",
@@ -130,10 +203,25 @@ export const MUTATING_COMMANDS = new Set([
   // ===== END ACCRUALS / PERIODEAFGRÆNSNINGSPOSTER =====
   // ===== BUDGET =====
   "budget set",
+  // Accounting dimensions are append-only ledger/master-data writes.  Keep
+  // every mutating subcommand here so the central actor gate, help and agent
+  // discovery cannot accidentally describe one as read-only.
+  "dimensions define",
+  "dimensions member",
+  "dimensions definition-lifecycle",
+  "dimensions member-lifecycle",
+  "dimensions apply",
+  "dimensions replace",
+  "dimensions supersede",
+  "dimensions budget-apply",
   // ===== END BUDGET =====
   // ===== PAYABLES / KREDITORSTYRING =====
   "payable register",
   "payable pay",
+  "posting-rules propose",
+  "posting-rules approve",
+  "posting-rules disable",
+  "posting-rules supersede",
   // ===== END PAYABLES / KREDITORSTYRING =====
   // ===== DIGISENSE E-FAKTURA (#efaktura) =====
   // `efaktura registrer` skriver virksomheds-/participant-state + audit_log til
@@ -142,7 +230,12 @@ export const MUTATING_COMMANDS = new Set([
   // netværket. Begge er skrivende handlinger og skal — som alle andre — kræve en
   // actor og listes under "Skrivekommandoer", ikke under "read-only".
   "efaktura registrer",
+  "efaktura registrer-test-gln",
+  "efaktura registrer-test-afsender",
+  "efaktura konfigurer",
   "efaktura modtag",
+  "efaktura modtag-workspace",
+  "efaktura status",
   // ===== END DIGISENSE E-FAKTURA (#efaktura) =====
 ]);
 
@@ -186,6 +279,24 @@ export function loadActorAllowlist(root: string): Set<string> {
     else allowlist.add(value);
   }
   return allowlist;
+}
+
+/** Explicit, local policy for the exceptional forced period-close waiver. */
+export function actorMayForcePeriodClose(root: string, actor: string | null | undefined): boolean {
+  if (!actor) return false;
+  const policyPath = join(companyPaths(root).config, "policy.yaml");
+  if (!existsSync(policyPath)) return false;
+  let inSection = false;
+  for (const rawLine of readFileSync(policyPath, "utf8").split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (trimmed === "period_close_force_actors:") { inSection = true; continue; }
+    if (inSection && !/^\s/.test(rawLine)) break;
+    if (!inSection) continue;
+    const value = rawLine.match(/^\s*-\s*(.+?)\s*$/)?.[1]?.replace(/^['"]|['"]$/g, "");
+    if (value && normaliseActorForMatching(value) === normaliseActorForMatching(actor)) return true;
+  }
+  return false;
 }
 
 /**

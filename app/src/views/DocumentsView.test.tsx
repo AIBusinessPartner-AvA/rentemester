@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test } from "bun:test";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { DocumentsView } from "./DocumentsView";
@@ -17,6 +17,8 @@ function route(over = {}) {
   return {
     "GET /api/companies/acme-aps/documents": { documents: documents(over) },
     "GET /api/companies/acme-aps/fiscal-years": { fiscalYears: FISCAL_YEARS },
+    "GET /api/companies/acme-aps/documents/party-links": { links: [] },
+    "GET /api/companies/acme-aps/documents/party-coverage": { rows: [], totals: { linked: 0, source_observed:0, unresolved_external_party:0, resolved_no_external_party: 0, exact_candidate: 0, ambiguous: 0, missing_source: 0 }, populationHash: "p".repeat(64), planHash: "h".repeat(64) },
   };
 }
 
@@ -28,6 +30,62 @@ function renderView(route = "/companies/acme-aps/bilag") {
 }
 
 describe("DocumentsView — Bilag", () => {
+  test("links only documents with an explicit canonical party ID", async () => {
+    const row = documents().documents[0];
+    mockFetch(route({ documents: [
+      { ...row, id: 11, supplierName: "Samme navn", partyId: "party-document" },
+      { ...row, id: 12, supplierName: "Samme navn", partyId: null },
+    ] }));
+    renderView();
+    expect(await screen.findByRole("link", { name: "Samme navn" })).toHaveAttribute("href", "/companies/acme-aps/parter/party-document");
+    expect(screen.getAllByText("Samme navn").some((element) => element.closest("a") === null)).toBe(true);
+  });
+
+  test("#644 shows inspectable party coverage and applies only a confirmed exact plan", async () => {
+    const applied: Array<Record<string, unknown>> = [];
+    mockFetch({
+      ...route(),
+      "GET /api/companies/acme-aps/documents/party-coverage": { rows: [{ bankTransactionId: 7, documentId: 3, status: "exact_candidate", candidate: { partyId: "party-1", role: "vendor", provenance: "typed_identifier" }, reason: "Deterministic identity.", nextAction: "Review and apply." }], totals: { linked: 2, source_observed:0, unresolved_external_party:0, resolved_no_external_party: 1, exact_candidate: 1, ambiguous: 0, missing_source: 0 }, populationHash: "p".repeat(64), planHash: "h".repeat(64) },
+      "POST /api/companies/acme-aps/documents/party-coverage/plan": { plan: { planHash: "a".repeat(64), operations: [{ actionKey: "document:3" }] } },
+      "POST /api/companies/acme-aps/documents/party-coverage/apply": (() => ({ applied: 1 })),
+    });
+    const originalFetch=globalThis.fetch;
+    globalThis.fetch=(async(input:RequestInfo|URL,init?:RequestInit)=>{const response=await originalFetch(input,init);if(String(input).endsWith("/party-coverage/apply"))applied.push(JSON.parse(String(init?.body)));return response;}) as typeof fetch;
+    const originalConfirm=window.confirm; window.confirm=()=>true;
+    try { renderView(); expect(await screen.findByText("Sikre kandidater")).toBeInTheDocument(); await userEvent.click(screen.getByText("Se grundlag og rester")); expect(await screen.findByText(/typed_identifier/)).toBeInTheDocument(); await userEvent.click(screen.getByRole("button",{name:"Anvend sikre kandidater"})); expect(applied).toEqual([{planHash:"a".repeat(64),idempotencyKey:`cockpit-party-coverage-${"a".repeat(64)}`,confirm:true}]); }
+    finally { window.confirm=originalConfirm; }
+  });
+  test("#645 records an explicit unresolved external next action through the same coverage plan",async()=>{const applied:Array<Record<string,unknown>>=[];mockFetch({...route(),"GET /api/companies/acme-aps/documents/party-coverage":{rows:[{bankTransactionId:8,documentId:4,status:"missing_source",candidate:null,reason:"No legal identity.",nextAction:"Review."}],totals:{linked:0,source_observed:0,unresolved_external_party:0,resolved_no_external_party:0,exact_candidate:0,ambiguous:0,missing_source:1},populationHash:"p".repeat(64),planHash:"h".repeat(64)},"POST /api/companies/acme-aps/documents/party-coverage/plan":{plan:{planHash:"b".repeat(64),operations:[{actionKey:"document-resolution:4"}]}},"POST /api/companies/acme-aps/documents/party-coverage/apply":(()=>({applied:1}))});const originalFetch=globalThis.fetch,originalPrompt=window.prompt,originalConfirm=window.confirm;const answers=["receipt header","legal party absent","request supplier invoice"];window.prompt=()=>answers.shift()??null;window.confirm=()=>true;globalThis.fetch=(async(input:RequestInfo|URL,init?:RequestInit)=>{const response=await originalFetch(input,init);if(String(input).endsWith("/party-coverage/apply"))applied.push(JSON.parse(String(init?.body)));return response;}) as typeof fetch;try{renderView();await userEvent.click(await screen.findByText("Se grundlag og rester"));await userEvent.click(screen.getByRole("button",{name:"Markér ekstern modpart uafklaret"}));expect(applied).toEqual([{decisions:[{bankTransactionId:8,unresolvedExternalParty:true,evidenceReference:"receipt header",rationale:"legal party absent",nextAction:"request supplier invoice"}],planHash:"b".repeat(64),idempotencyKey:`cockpit-unresolved-external-${"b".repeat(64)}`,confirm:true}]);}finally{globalThis.fetch=originalFetch;window.prompt=originalPrompt;window.confirm=originalConfirm;}});
+  test("#646 exposes exact bank-row correction without changing the document-wide link",async()=>{const applied:Array<Record<string,unknown>>=[];const decisionHash="c".repeat(64),documentHash="d".repeat(64),transactionHash="bank-row-9";mockFetch({...route(),"GET /api/companies/acme-aps/documents/party-coverage":{rows:[{bankTransactionId:9,transactionHash,documentId:4,documentHash,status:"linked",candidate:{partyId:"old-party",role:"employee",provenance:"reviewed_bank_row"},currentDecision:{id:12,decisionHash},reason:"Resolved by bank row.",nextAction:null}],totals:{linked:1,source_observed:0,unresolved_external_party:0,resolved_no_external_party:0,exact_candidate:0,ambiguous:0,missing_source:0},populationHash:"p".repeat(64),planHash:"h".repeat(64)},"POST /api/companies/acme-aps/documents/party-coverage/plan":{plan:{planHash:"e".repeat(64),operations:[{actionKey:"bank:9"}]}},"POST /api/companies/acme-aps/documents/party-coverage/apply":(()=>({applied:1}))});const originalFetch=globalThis.fetch,originalPrompt=window.prompt,originalConfirm=window.confirm;const answers=["new-party","employee","reviewed_bank_statement","statement row 9","correct payee"];window.prompt=()=>answers.shift()??null;window.confirm=()=>true;globalThis.fetch=(async(input:RequestInfo|URL,init?:RequestInit)=>{const response=await originalFetch(input,init);if(String(input).endsWith("/party-coverage/apply"))applied.push(JSON.parse(String(init?.body)));return response;}) as typeof fetch;try{renderView();await userEvent.click(await screen.findByText("Se grundlag og rester"));await userEvent.click(screen.getByRole("button",{name:"Ret bankrækkens modpart"}));expect(applied).toEqual([{decisions:[{bankTransactionId:9,scope:"bank_transaction",transactionHash,documentHash,partyId:"new-party",role:"employee",provenance:"reviewed_bank_statement",evidenceReference:"statement row 9",rationale:"correct payee",supersedesEventId:12,supersedesDecisionHash:decisionHash}],planHash:"e".repeat(64),idempotencyKey:`cockpit-bank-row-party-${"e".repeat(64)}`,confirm:true}]);}finally{globalThis.fetch=originalFetch;window.prompt=originalPrompt;window.confirm=originalConfirm;}});
+  test("#588 requires explicit reviewed plan and confirmation before applying a canonical party", async () => {
+    const applied: Array<Record<string, unknown>> = [];
+    mockFetch({
+      ...route({ linkedCount: 0, unlinkedCount: 1 }),
+      "GET /api/companies/acme-aps/workspace-parties": { rows: [{ partyId: "party-1", name: "Leverandør ApS" }], count: 1 },
+      "POST /api/companies/acme-aps/documents/party-links/plan": { plan: { planHash: "a".repeat(64), evidence: { kind: "exact_identifier" }, partySnapshot: { name: "Leverandør ApS" } } },
+      "POST /api/companies/acme-aps/documents/party-links/apply": (() => ({ id: 1 })),
+      "GET /api/companies/acme-aps/documents/1/party-links": { links: [{ id: 1, event_type: "linked" }] },
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await originalFetch(input, init);
+      if (String(input).includes("/party-links/apply")) applied.push(JSON.parse(String(init?.body)));
+      return response;
+    }) as typeof fetch;
+    renderView();
+    await userEvent.click(await screen.findByRole("button", { name: "Gennemgå part" }));
+    expect(await screen.findByText(/Navne er kun søgehjælp/)).toBeInTheDocument();
+    await screen.findByRole("option", { name: "Leverandør ApS" });
+    expect(screen.getByRole("button", { name: "Vis plan" })).toBeDisabled();
+    await userEvent.selectOptions(screen.getByLabelText("Vælg kanonisk part"), "party-1");
+    await userEvent.click(screen.getByRole("button", { name: "Vis plan" }));
+    expect(await screen.findByText("Plan klar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Bekræft og anvend" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("checkbox", { name: "Jeg har gennemgået planen og vil oprette den append-only kobling." }));
+    await userEvent.click(screen.getByRole("button", { name: "Bekræft og anvend" }));
+    expect(applied).toHaveLength(1);
+    expect(applied[0]).toMatchObject({ confirm: true, partyId: "party-1", planHash: "a".repeat(64) });
+  });
   test("lists ingested documents with their details", async () => {
     mockFetch(route());
     renderView();
@@ -36,6 +94,46 @@ describe("DocumentsView — Bilag", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("DOC-2026-000001")).toBeInTheDocument();
     expect(screen.getByText("Leverandør ApS")).toBeInTheDocument();
+  });
+
+  test("#554 shows an internal voucher's bank evidence and rationale", async () => {
+    mockFetch(route({
+      documents: [{
+        id: 9,
+        documentNo: "DOC-2026-000009",
+        source: "internal-preparation",
+        filename: "bankgebyr.txt",
+        documentType: "internal_voucher",
+        sourceBankTransactionId: 41,
+        accountingRationale: "Bankgebyr ifølge importeret kontoudtog; ingen moms.",
+        preparedBy: "user:owner",
+        preparedByProgram: "rentemester-cockpit",
+        supplierName: null,
+        supplierVatOrCvr: null,
+        supplierCountryCode: null,
+        supplierIdentifierKind: null,
+        supplierIdentityStatus: null,
+        invoiceNo: null,
+        invoiceDate: "2026-07-31",
+        amountIncVat: 417,
+        currency: "DKK",
+        status: "ingested",
+        voucherRef: null,
+        journalEntryNo: null,
+        journalEntryId: null,
+        journalEntryText: null,
+        journalEntryTotal: null,
+        hasFile: true,
+      }],
+      linkedCount: 0,
+      unlinkedCount: 1,
+    }));
+    renderView();
+    expect(
+      await screen.findByRole("cell", { name: "Internt bilag" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Bankpost #41")).toBeInTheDocument();
+    expect(screen.getByText("Bankgebyr ifølge importeret kontoudtog; ingen moms.")).toBeInTheDocument();
   });
 
   test("shows the linked journal entry for a booked document", async () => {

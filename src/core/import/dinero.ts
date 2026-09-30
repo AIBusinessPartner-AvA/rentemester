@@ -27,23 +27,28 @@
 import { requireFile } from "./source";
 import { isValidIsoDate } from "../dates";
 import { parseDineroPostings } from "./dinero-postings";
+import { validateImportedReceivableSchedule, type ImportedReceivableSchedule } from "../imported-receivables";
 import type {
   ImportAccount,
   ImportAccountType,
   ImportCompanyMasterData,
   ImportHistoricalEntry,
   ImportNormalBalance,
+  ImportOpenItemControlBalance,
   ImportOpeningBalanceLine,
   MultiArtifactSource,
   ParseResult,
   SourceParser,
 } from "./types";
 import { DINERO_VAT_CONTROL_ACCOUNTS } from "../vat-account-semantics";
+import type { AccountRole } from "../account-roles";
 
 const SYSTEM = "dinero";
 const LABEL = "Dinero (data export — chart of accounts, master data & opening balance)";
 
 const FIRMAOPLYSNINGER = "Firmaoplysninger.csv";
+/** Optional companion export authored by the versioned Rentemester adapter. */
+const RECEIVABLE_SCHEDULE = "Rentemester-modtagerposter-v1.json";
 
 // The Dinero marker for an opening-balance row: voucher number 0, voucher text
 // `Primobeholdning`. Such rows carry the fiscal year's opening balance.
@@ -51,13 +56,13 @@ const PRIMOBEHOLDNING_TEXT = "primobeholdning";
 
 // --- Dinero Momstype -> Rentemester VAT code -------------------------------
 //
-// Dinero `Momstype` cells are coded labels: a short code, a dash, a Danish
-// description (e.g. `U25 - Dansk salgsmoms`). Only the leading code is stable,
-// so the mapping keys on it.
+// Dinero `Momstype` cells occur both as coded labels (`U25 - Dansk salgsmoms`)
+// and as the bare Danish display label (`Dansk salgsmoms`) in Posteringer.csv.
+// Both forms are source-defined identities and map to the same canonical code.
 //
 // Rentemester's VAT codes (rules/dk/vat.yaml) are deliberately few:
 //   DK_SALE_25, DK_PURCHASE_25, EU_SERVICE_REVERSE_CHARGE,
-//   REPRESENTATION_SPECIAL, DK_BAD_DEBT_25.
+//   NON_EU_SERVICE_REVERSE_CHARGE, REPRESENTATION_SPECIAL.
 //
 // A Dinero code with NO Rentemester equivalent (EU/world goods, reverse-charge
 // purchase, the unindberettede EU sales code, ...) is intentionally left
@@ -67,11 +72,19 @@ const PRIMOBEHOLDNING_TEXT = "primobeholdning";
 const VAT_CODE_MAP: Record<string, string> = {
   // Danish standard-rated sales / purchases.
   U25: "DK_SALE_25",
+  "Dansk salgsmoms": "DK_SALE_25",
   I25: "DK_PURCHASE_25",
+  "Dansk købsmoms": "DK_PURCHASE_25",
   // EU service purchases settle as a reverse charge in Rentemester.
   IEUY: "EU_SERVICE_REVERSE_CHARGE",
+  "Ydelseskøb EU (rubrik A - ydelser)": "EU_SERVICE_REVERSE_CHARGE",
+  // Services bought outside the EU use the distinct non-EU reverse-charge
+  // code and therefore never feed the EU rubrik-A purchase base.
+  IVY: "NON_EU_SERVICE_REVERSE_CHARGE",
+  "Ydelseskøb fra verden": "NON_EU_SERVICE_REVERSE_CHARGE",
   // Representation has a special limited-deduction code.
   REP: "REPRESENTATION_SPECIAL",
+  "Repræsentation (kvartmoms)": "REPRESENTATION_SPECIAL",
 };
 
 // Dinero codes Rentemester has no equivalent for. Listed explicitly so the
@@ -79,7 +92,6 @@ const VAT_CODE_MAP: Record<string, string> = {
 // (both are surfaced, but the documentation is clearer this way):
 //   IEUV  - Varekøb EU (rubrik A - varer)
 //   IVV   - Varekøb fra verden
-//   IVY   - Ydelseskøb fra verden
 //   OBPK  - Dansk køb med omvendt betalingspligt
 //   UEUV  - Varesalg EU - Indberettes (rubrik B - varer)
 //   UEUV2 - Varesalg EU - Indberettes ikke (rubrik B - varer)
@@ -98,6 +110,11 @@ function vatCodeKey(momstype: string): string {
   if (trimmed.length === 0) return "";
   const dash = trimmed.indexOf("-");
   return (dash > 0 ? trimmed.slice(0, dash) : trimmed).trim();
+}
+
+function canonicalVatCode(momstype: string): string | undefined {
+  const trimmed = momstype.trim();
+  return VAT_CODE_MAP[trimmed] ?? VAT_CODE_MAP[vatCodeKey(trimmed)];
 }
 
 /**
@@ -257,6 +274,69 @@ function findPosteringer(input: MultiArtifactSource): { name: string; text: stri
   return { name, text: input.files[name]!.text };
 }
 
+function parseOpenItemControlBalances(
+  input: MultiArtifactSource,
+  posteringerName: string | undefined,
+  proposals: Array<{ role: AccountRole; accountNo: string; source: string }>,
+  errors: string[],
+): ImportOpenItemControlBalance[] {
+  if (!posteringerName) return [];
+  const sourceReference = posteringerName.replace(/Posteringer\.csv$/i, "SaldoBalance.csv");
+  const artifact = input.files[sourceReference];
+  if (!artifact) return [];
+
+  const balances = new Map<string, number>();
+  const lines = artifact.text.split(/\r?\n/);
+  let sawHeader = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!.trim();
+    if (!line) continue;
+    const cells = splitRecord(line);
+    if (!sawHeader) {
+      if ((cells[0] ?? "").toLowerCase() === "konto") {
+        sawHeader = true;
+        continue;
+      }
+      errors.push(`${sourceReference}: missing the 'Konto;Kontonavn;Beløb' header row`);
+      return [];
+    }
+    const accountNo = cells[0] ?? "";
+    const amount = parseBelob(cells[2] ?? "");
+    if (!accountNo || amount == null) {
+      errors.push(`${sourceReference} line ${i + 1}: invalid account or Beløb`);
+      continue;
+    }
+    if (balances.has(accountNo)) {
+      errors.push(`${sourceReference} repeats account '${accountNo}'`);
+      continue;
+    }
+    balances.set(accountNo, amount);
+  }
+  if (!sawHeader) errors.push(`${sourceReference}: missing the 'Konto;Kontonavn;Beløb' header row`);
+
+  const out: ImportOpenItemControlBalance[] = [];
+  for (const proposal of proposals) {
+    if (proposal.role !== "debtors" && proposal.role !== "creditors") continue;
+    const signedAmount = balances.get(proposal.accountNo);
+    if (signedAmount == null || signedAmount === 0) continue;
+    if (proposal.role === "debtors" && signedAmount < 0) {
+      errors.push(`${sourceReference}: debtor control account '${proposal.accountNo}' has an unexpected credit balance ${signedAmount}`);
+      continue;
+    }
+    if (proposal.role === "creditors" && signedAmount > 0) {
+      errors.push(`${sourceReference}: creditor control account '${proposal.accountNo}' has an unexpected debit balance ${signedAmount}`);
+      continue;
+    }
+    out.push({
+      accountNo: proposal.accountNo,
+      kind: proposal.role === "debtors" ? "receivable" : "payable",
+      amount: Math.abs(signedAmount),
+      sourceReference,
+    });
+  }
+  return out.sort((a, b) => a.accountNo.localeCompare(b.accountNo, "en"));
+}
+
 /**
  * Parses a Dinero `Beløb` cell — a signed decimal with a comma decimal
  * separator and up to six decimal places, e.g. `30116,010000` or
@@ -383,6 +463,12 @@ function parseDineroSource(input: MultiArtifactSource): ParseResult {
   const { openingBalances, cutOverDate } = posteringer
     ? parsePosteringer(posteringer.text, posteringer.name, errors)
     : { openingBalances: [] as ImportOpeningBalanceLine[], cutOverDate: "" };
+  const openItemControlBalances = parseOpenItemControlBalances(
+    input,
+    posteringer?.name,
+    accountRoleProposals,
+    errors,
+  );
 
   // Year-to-date activity (#195): the cut-over year's `Posteringer.csv` rows
   // that are NOT Primobeholdning, grouped by `Bilag` into balanced vouchers.
@@ -395,11 +481,9 @@ function parseDineroSource(input: MultiArtifactSource): ParseResult {
         entryType: voucher.voucherType,
         lines: voucher.lines.map((line) => {
           const sourceVatCode = line.vatCode?.trim() ?? "";
-          const canonicalVatCode =
-            sourceVatCode.length > 0
-              ? VAT_CODE_MAP[vatCodeKey(sourceVatCode)]
-              : undefined;
-          if (sourceVatCode.length > 0 && canonicalVatCode === undefined) {
+          const normalizedVatCode =
+            sourceVatCode.length > 0 ? canonicalVatCode(sourceVatCode) : undefined;
+          if (sourceVatCode.length > 0 && normalizedVatCode === undefined) {
             errors.push(
               `${posteringer.name}: voucher ${voucher.bilag} account ${line.accountNo} has unsupported Dinero Momstype '${sourceVatCode}'`,
             );
@@ -412,11 +496,21 @@ function parseDineroSource(input: MultiArtifactSource): ParseResult {
             // Persist Rentemester's canonical code, never Dinero's display
             // text (`I25 - ...`). Only a genuinely blank source field may use
             // the reviewed account default in the historical-import adapter.
-            ...(canonicalVatCode ? { vatCode: canonicalVatCode } : {}),
+            ...(normalizedVatCode ? { vatCode: normalizedVatCode } : {}),
           };
         }),
       }))
     : [];
+
+  let importedReceivableSchedule: ImportedReceivableSchedule | undefined;
+  const scheduleFile = input.files[RECEIVABLE_SCHEDULE];
+  if (scheduleFile) {
+    try {
+      const checked = validateImportedReceivableSchedule(JSON.parse(scheduleFile.text));
+      if (!checked.ok) errors.push(...checked.errors.map(error => `${RECEIVABLE_SCHEDULE}: ${error}`));
+      else importedReceivableSchedule = checked.schedule;
+    } catch { errors.push(`${RECEIVABLE_SCHEDULE}: invalid JSON`); }
+  }
 
   if (errors.length > 0) {
     return { ok: false, errors };
@@ -435,6 +529,8 @@ function parseDineroSource(input: MultiArtifactSource): ParseResult {
       ...(accountRoleProposals.length > 0 ? { accountRoleProposals } : {}),
       openingBalances,
       ...(historicalEntries.length > 0 ? { historicalEntries } : {}),
+      ...(openItemControlBalances.length > 0 ? { openItemControlBalances } : {}),
+      ...(importedReceivableSchedule ? { importedReceivableSchedule } : {}),
       ...(companyMasterData ? { companyMasterData } : {}),
       ...(unmappedVatCodes.length > 0 ? { unmappedVatCodes } : {}),
     },

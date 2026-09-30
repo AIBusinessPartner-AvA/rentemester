@@ -4,6 +4,8 @@ import type {
   PeriodsResponse,
   ReopenPeriodInput,
   ReopenPeriodResponse,
+  PeriodCloseReadinessResponse,
+  PeriodCloseReviewResponse,
 } from "../types";
 import { request } from "./_shared";
 
@@ -15,6 +17,10 @@ export const periodsApi = {
     request<PeriodsResponse>(
       `/api/companies/${encodeURIComponent(slug)}/periods`,
     ).then((r) => r.periods),
+  closeReadiness: (slug: string, periodStart: string, periodEnd: string) =>
+    request<PeriodCloseReadinessResponse>(`/api/companies/${encodeURIComponent(slug)}/periods/close-readiness?from=${encodeURIComponent(periodStart)}&to=${encodeURIComponent(periodEnd)}`).then((r) => r.packet),
+  reviewCloseReadiness: (slug: string, periodStart: string, periodEnd: string) =>
+    request<PeriodCloseReviewResponse>(`/api/companies/${encodeURIComponent(slug)}/periods/close-review`, { method: "POST", body: JSON.stringify({ periodStart, periodEnd, confirm: true }) }).then((r) => r.review),
 
   /**
    * Closes an accounting period (#287) — the prerequisite for a momsangivelse.
@@ -31,6 +37,9 @@ export const periodsApi = {
           periodEnd: input.periodEnd,
           ...(input.kind ? { kind: input.kind } : {}),
           ...(input.reference ? { reference: input.reference } : {}),
+          ...(input.packetHash ? { packetHash: input.packetHash } : {}),
+          reviewId: input.reviewId,
+          ...(input.force ? { force: true, reason: input.reason } : {}),
           confirm: true,
         }),
       },

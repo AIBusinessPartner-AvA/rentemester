@@ -13,14 +13,13 @@ operativsystemets secret store, når en integration kræver en hemmelighed.
 
 ## 1. Udviklerinstallation
 
-Forudsætning: [Bun](https://bun.sh) 1.2 eller nyere. En ren clone kræver både
-rodprojektets afhængigheder (CLI/MCP) og cockpit-appens afhængigheder:
+Forudsætning: [Bun](https://bun.sh) 1.4.0. Root og cockpit er ét workspace, så
+en ren clone kræver én installation:
 
 ```bash
 git clone https://github.com/mikkelkrogsholm/rentemester.git
 cd rentemester
 bun install
-(cd app && bun install)
 bun link
 rentemester --version
 command -v rentemester
@@ -32,19 +31,17 @@ command -v rentemester-mcp
 en stdio-server og må derfor ikke bruges som en interaktiv `--help`-kommando;
 dens ende-til-ende-kontrol er MCP-smoken nedenfor.
 
-De mindste grønne gates for en udviklerclone er:
+Den samlede grønne gate før push eller release candidate er:
 
 ```bash
-bun test
-(cd app && bun test && bun run build)
-bun run smoke
-bun run smoke-mcp
+bun run verify:local
 ```
 
-Root-testene dækker den delte kerne, cockpit-test/build dækker UI'en, `smoke`
-går CLI-flowet igennem, og `smoke-mcp` opretter en midlertidig virksomhed,
-gennemfører MCP-handshake, confirm-gating, fakturalivscyklus og audit-kontrol.
-Ingen af dem bruger produktionsdata.
+Kommandoen bruger Buns parallelle test-workers på alle lokale CPU-kerner til
+root- og cockpittests og kører derefter build, smoke, MCP-smoke samt
+containerens readiness- og reproducerbarhedskontrol. Ingen af kontrollerne
+bruger produktionsdata. GitHub ejer ikke den fulde testsuite; push-CI laver
+hurtige kildekontroller og bygger/verificerer Linux-imaget.
 
 ## 2. Produktionsoperatørinstallation
 
@@ -81,6 +78,12 @@ rentemester init \
 rentemester system healthcheck --company "$COMPANY"
 rentemester accounts roles-status --company "$COMPANY"
 ```
+
+Healthcheck skriver ikke til ledgeren. Brug `--json` når resultatet læses af
+automation; den maskinlæsbare `schema`-blok viser både installeret/krævet
+version og eventuelle ventende migrations. Kør kun den CLI-only migration med
+en allowlistet actor og eksakt samtykke: `rentemester system migrate --company
+"$COMPANY" --apply yes --actor "$ACTOR"`.
 
 Er virksomheden ikke momsregistreret, vælg `--no-vat` (eller
 `--vat-period none`) i stedet for `--vat-period quarter`. Før en anden person
@@ -192,3 +195,23 @@ Hvis en agent skal arbejde via MCP, følg den MCP-specifikke klientopsætning i
 [MCP-installation](mcp-install.md). MCP-write-tools kræver `confirm: true` pr.
 kald, også når CLI's daglige writes bruger actor i stedet; den præcise kontrakt
 står i [MCP-agentkontrakten](mcp-agent-contract.md).
+
+## Cockpit e-faktura
+
+The Cockpit's **Send e-faktura** action uses the selected company's local
+DigiSense configuration and bound company identity. Do not put DigiSense keys,
+access-point details or company keys in browser/API request bodies. A queued
+delivery appears as **E-faktura køsat — afventer status**; use **Opdatér
+leveringsstatus** to observe it. That action never sends the document again.
+En fejl før DigiSense har accepteret dokumentet vises derimod som
+**E-faktura fejlede — kan prøves igen** og må leveres igen med samme
+idempotente identitet.
+En terminal status efter DigiSense har accepteret dokumentet vises som
+**E-faktura afvist — send ikke igen**. Det eksisterende dokument-id bevares
+som revisionsspor, og Cockpit tilbyder hverken ny levering eller yderligere
+automatisk polling.
+Et timeout, forbindelsesbrud eller ubrugeligt svar efter selve delivery-POST'en
+vises som **E-faktura-status ukendt — afklar manuelt**. Rentemester blokerer
+automatisk gensendelse, fordi DigiSense kan have accepteret dokumentet uden at
+returnere et brugbart dokument-id. Afklar udfaldet hos DigiSense før manuel
+videre behandling.

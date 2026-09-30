@@ -27,6 +27,7 @@ import type {
   CompanyBudgetLine,
   CompanyBudgetVsActual,
   CompanyBudgetVsActualLine,
+  CompanyBudgetDimensionActuals,
 } from "../lib/types";
 import { ErrorState, Loading } from "../components/Feedback";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
@@ -57,6 +58,10 @@ export function BudgetView() {
     () => api.budgetVsActual(slug, year),
     [slug, year, mode],
   );
+  const dimensionActuals = useAsync<CompanyBudgetDimensionActuals | null>(
+    () => mode === "compare" ? api.budgetDimensionActuals(slug, year) : Promise.resolve(null),
+    [slug, year, mode],
+  );
 
   // We always need ONE of the two payloads to render. The plan/compare toggle
   // picks which one drives the body. The other one is also fetched so a
@@ -70,7 +75,7 @@ export function BudgetView() {
   const currency = data.company.currency || "DKK";
 
   return (
-    <section className="statement">
+    <section className="statement" data-cockpit-page="budget" data-evidence-issue="655">
       <div className="page-head">
         <div>
           <h2>{data.company.name}</h2>
@@ -127,10 +132,51 @@ export function BudgetView() {
           }}
         />
       ) : (
-        <BudgetVsActualTable data={compare.data!} currency={currency} />
+        <>
+          <BudgetVsActualTable data={compare.data!} currency={currency} />
+          <DimensionBudgetComparison
+            slug={slug}
+            data={dimensionActuals.data ?? null}
+            currency={currency}
+          />
+        </>
       )}
     </section>
   );
+}
+
+/**
+ * This deliberately places approved dimension actuals beside (not inside) the
+ * legal account budget. A dimension can cover only part of an account, so a
+ * variance against the whole account budget would be misleading.
+ */
+function DimensionBudgetComparison({ slug, data, currency }: {
+  slug: string; data: CompanyBudgetDimensionActuals | null; currency: string;
+}) {
+  const [selection, setSelection] = useState("");
+  if (!data || data.archived) return null;
+  const selected = selection === "" ? [] : data.rows.filter((row) =>
+    selection.includes(":") ? `${row.dimensionId}:${row.memberId}` === selection : row.dimensionId === selection,
+  );
+  const grouped = new Map<string, { accountNo: string; period: string; actual: number; journalLineIds: number[] }>();
+  for (const row of selected) {
+    const key = `${row.accountNo}\u001f${row.period}`;
+    const prior = grouped.get(key) ?? { accountNo: row.accountNo, period: row.period, actual: 0, journalLineIds: [] };
+    prior.actual += row.actual;
+    prior.journalLineIds.push(row.journalLineId);
+    grouped.set(key, prior);
+  }
+  const rows = [...grouped.values()].sort((a, b) => a.accountNo.localeCompare(b.accountNo) || a.period.localeCompare(b.period));
+  const accountActual = new Map(data.accountTotals.map((row) => [`${row.accountNo}\u001f${row.period}`, row.actual]));
+  const dimensionBudget = new Map(data.dimensionBudgets.filter((row) => selection.includes(":") ? `${row.dimensionId}:${row.memberId}` === selection : row.dimensionId === selection).map((row) => [`${row.accountNo}\u001f${row.period}`, row]));
+  return <section className="card statement-card" aria-label="Dimensionssammenligning">
+    <h3>Dimensioner mod konto-budget</h3>
+    <p className="muted">En dimensionsvariance vises kun, når der findes en eksplicit reviewet fordeling, som stemmer præcist med konto-budgettet. Ellers er budgettet konto-niveau og kan ikke sammenlignes som dimensionsbudget.</p>
+    {data.dimensionOptions.length === 0 ? <p className="muted">Ingen godkendte dimensionsklassifikationer i perioden.</p> : <>
+      <label>Filter dimension<select aria-label="Filter dimension" value={selection} onChange={(event) => setSelection(event.target.value)}><option value="">Vælg dimension eller medlem</option>{data.dimensionOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+      {selection !== "" && <div className="table-scroll"><table className="data statement-table"><thead><tr><th>Konto</th><th>Måned</th><th className="num">Dimensionsaktual</th><th className="num">Dimensionsbudget</th><th className="num">Variance</th><th className="num">Kontoaktual</th><th>Kilde</th></tr></thead><tbody>{rows.length === 0 ? <tr><td colSpan={7} className="muted">Ingen godkendte tildelinger for dette filter.</td></tr> : rows.map((row) => { const key = `${row.accountNo}\u001f${row.period}`; const reviewedBudget=dimensionBudget.get(key); return <tr key={key}><td className="account-no">{row.accountNo}</td><td>{periodLabel(row.period)}</td><td className="num">{formatKroner(row.actual, currency)}</td>{reviewedBudget ? <><td className="num">{formatKroner(reviewedBudget.budget, currency)}</td><td className="num">{formatKroner(reviewedBudget.budget-row.actual, currency)}</td></> : <><td className="num muted">Ikke understøttet</td><td className="num muted">—</td></>}<td className="num">{formatKroner(accountActual.get(key) ?? 0, currency)}</td><td><Link to={`/companies/${slug}/posteringer?journalLineId=${row.journalLineIds[0]}`}>Journal-linje {row.journalLineIds[0]}</Link>{reviewedBudget && <><br /><span className="muted">{reviewedBudget.sourceRef}</span></>}</td></tr>; })}</tbody></table></div>}
+    </>}
+  </section>;
 }
 
 /**

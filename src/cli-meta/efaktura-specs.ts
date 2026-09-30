@@ -8,13 +8,26 @@ import type { CommandSpec } from "./_shared";
 // opdagelige, dokumenterer input/flags, og slår flag-validering til.
 export const efakturaSpecs: CommandSpec[] = [
   {
+    key: "efaktura onboarding-status",
+    usage: "efaktura onboarding-status --company <path>",
+    description: "Viser lokal, secret-redacted DigiSense readiness for denne ledgers ene juridiske virksomhed.",
+    allowedFlags: ["--company"], inputNotes: ["Viser aldrig license-key eller signatureSecret."],
+  },
+  {
+    key: "efaktura onboard",
+    usage: "efaktura onboard --company <path> --confirm yes",
+    description: "Validerer DigiSense auth og registrerer ledgerens profil-CVR for både inbound og outbound. Idempotent.",
+    allowedFlags: ["--company", "--confirm"], inputNotes: ["Identitet udledes kun fra company profile; ingen CVR/navn/companyKey accepteres."],
+  },
+  {
     key: "efaktura konfigurer",
-    usage: "efaktura konfigurer --company <path> --api-license-key <secret> [--environment test|production]",
+    usage: "efaktura konfigurer --company <path> --api-license-key <secret> --confirm yes [--environment test|production]",
     description:
       "Gemmer Digisense API license-key i secret-laget (config/digisense.json, 0600). PRECONDITION for efaktura registrer/modtag og invoice transmit-digisense — uden en gemt key fejler de med 'Digisense er ikke konfigureret'. license-key er et SECRET og rammer aldrig bogføringstilstanden.",
-    allowedFlags: ["--company", "--api-license-key", "--environment"],
+    allowedFlags: ["--company", "--api-license-key", "--confirm", "--environment"],
     inputNotes: [
       "--api-license-key: én nøgle for hele Digisense-licensen (påkrævet). Gemmes kun i config/digisense.json.",
+      "--confirm yes: påkrævet bekræftelse; kommandoen kræver også en actor.",
       "--environment: 'test' (standard) eller 'production' — vælger Digisense' base-URL.",
     ],
   },
@@ -33,6 +46,30 @@ export const efakturaSpecs: CommandSpec[] = [
     ],
   },
   {
+    key: "efaktura registrer-test-gln",
+    usage: "efaktura registrer-test-gln --company <path> --confirm yes [--network nemhandel|peppol]",
+    description:
+      "Registrerer alene test-GLN'en fra en Digisense test-license som inbound GLN på det valgte TEST-netværk. GLN kan ikke angives som input; kommandoen kræver præcis én allerede lokalt registreret virksomhed, og license-constraint skal matche den. Skrivende handling — kræver '--confirm yes' og en actor.",
+    allowedFlags: ["--company", "--confirm", "--network"],
+    inputNotes: [
+      "--confirm yes: påkrævet bekræftelse (valued flag, ikke en bar boolean).",
+      "--network: 'nemhandel' (standard) eller 'peppol'.",
+      "Forudsætter gyldig Digisense test-konfiguration og præcis én lokalt registreret virksomhed.",
+      "Ingen --gln-flag: GLN'en hentes kun fra Digisense validate-auth.",
+    ],
+  },
+  {
+    key: "efaktura registrer-test-afsender",
+    usage: "efaktura registrer-test-afsender --company <path> --confirm yes",
+    description:
+      "Registrerer kun i DigiSense TEST det bare 8-cifrede CVR, som Peppol BIS3 XML bruger med scheme 0184, som outbound afsender. Identiteten udledes fra den ene lokalt registrerede DK:CVR-virksomhed og kan ikke angives som input.",
+    allowedFlags: ["--company", "--confirm"],
+    inputNotes: [
+      "--confirm yes: påkrævet bekræftelse; kommandoen kræver også en actor.",
+      "Kræver environment=test og kan ikke anvendes mod produktion.",
+    ],
+  },
+  {
     key: "efaktura modtag",
     usage: "efaktura modtag --company <path> --confirm yes [--digisense-company-key <key>] [--limit <n>] [--max-timestamp <ISO8601>] [--metadata <file.json>] [--force]",
     description:
@@ -46,6 +83,29 @@ export const efakturaSpecs: CommandSpec[] = [
       "--metadata <file.json>: valgfri DocumentMetadata (uden 'source') der flettes FELT-FOR-FELT oven på de UBL-/listning-afledte felter på hvert bilag; 'source' kan ikke overstyres (pipelinen sætter den til 'digisense_modtag').",
       "--force: tillad ingest af en logisk dublet (samme afsender + fakturanr.).",
       "Forudsætter en gemt license-key — kør `efaktura konfigurer` først.",
+    ],
+  },
+  {
+    key: "efaktura modtag-workspace",
+    usage: "efaktura modtag-workspace --company <path> --workspace <dir> --confirm yes",
+    description: "Poller aktivt-manifestets virksomheder én ad gangen uden caller companyKey eller credentials. Arkiverede og ukonfigurerede virksomheder springes over; fejl i én virksomhed stopper ikke de øvrige. Kræver actor og '--confirm yes'.",
+    allowedFlags: ["--company", "--workspace", "--confirm"],
+    inputNotes: ["Resultater er redigerede og indeholder aldrig license-key eller companyKey."],
+  },
+  {
+    key: "efaktura leveringsstatus",
+    usage: "efaktura leveringsstatus --company <path> --document-id <n> --confirm yes [--digisense-company-key <key>]",
+    description: "Tydeligt navn for dokumentets leveringsstatus; `efaktura status` bevares som kompatibilitetsalias.",
+    allowedFlags: ["--company", "--document-id", "--confirm", "--digisense-company-key"], inputNotes: [],
+  },
+  {
+    key: "efaktura status",
+    usage: "efaktura status --company <path> --document-id <n> --confirm yes [--digisense-company-key <key>]",
+    description: "Genoptager en tidligere køsat Digisense-afsendelse ved kun at kalde document-status. Skriver append-only statusevidens og kalder aldrig document-delivery igen. Kræver '--confirm yes' og en actor.",
+    allowedFlags: ["--company", "--document-id", "--confirm", "--digisense-company-key"],
+    inputNotes: [
+      "--document-id: det lokale faktura-dokument-id for en allerede køsat afsendelse.",
+      "Operationen er sikker at gentage: delivered bliver det effektive acknowledged-resultat ved senere send, uden ny levering.",
     ],
   },
 ];

@@ -5,9 +5,10 @@ modtage** e-fakturaer (OIOUBL / Peppol BIS 3.0) over **NemHandel** og **PEPPOL**
 Digisense er Rentemesters compliance-partner og leverer det **certificerede
 access point** — Rentemester genererer fakturaen, Digisense transporterer den.
 
-> Status: integrationen er bygget og testet mod fakes. Der er endnu **ikke** lavet
-> et rigtigt netkald. Kør først hele forløbet i **test-miljøet** (sandbox) før
-> produktion. Se [Test vs. produktion](#test-vs-produktion).
+> Status: integrationen er testet end-to-end mod DigiSense TEST med ægte
+> OIOUBL-validering, acknowledged levering og deduplikeret inbound. Produktion
+> er ikke aktiveret eller prøvet og kræver en særskilt go-live-godkendelse. Se
+> [Test vs. produktion](#test-vs-produktion).
 
 Relateret: [peppol-nemhandel.md](peppol-nemhandel.md) (format/transport-baggrund),
 [mcp-tool-surface.md](mcp-tool-surface.md) (agent-/MCP-kontrakten),
@@ -22,8 +23,12 @@ Relateret: [peppol-nemhandel.md](peppol-nemhandel.md) (format/transport-baggrund
 | 0 | Få en API license-key hos Digisense | *(uden for systemet — se nedenfor)* | — |
 | 1 | Gem nøglen i Rentemester | `efaktura konfigurer` | `efaktura_konfigurer` |
 | 2 | Registrér virksomheden i NemHandel | `efaktura registrer` | `efaktura_registrer` |
+| 2b | Sikker onboarding fra ledgerprofilen | `efaktura onboard` | `efaktura_onboard` |
+| 2c | Lokal readiness (redacted) | `efaktura onboarding-status` | `efaktura_onboarding_status` |
+| 2a | Registrér test-GLN (kun testmiljø) | `efaktura registrer-test-gln --company <path> --confirm yes` | — |
 | 3 | Send en udstedt e-faktura | `invoice transmit-digisense` | `efaktura_send` |
 | 4 | Modtag indkomne e-fakturaer (poll) | `efaktura modtag` | `efaktura_modtag` |
+| 4b | Poll alle aktive workspace-virksomheder | `efaktura modtag-workspace` | `efaktura_modtag_workspace` |
 
 Datamodel hos Digisense: **license (din nøgle) → company (companyKey pr. CVR) →
 participant (inbound + outbound)**. Én license-key dækker **flere virksomheder**;
@@ -69,6 +74,7 @@ og rammer **aldrig** ledger'en.
 rentemester efaktura konfigurer \
   --company <sti-eller-slug> \
   --api-license-key <din-license-key> \
+  --actor user:<dig> --confirm yes \
   --environment test
 ```
 
@@ -118,7 +124,7 @@ rentemester invoice issue --company <…> --input faktura.json
 # Send den via Digisense:
 rentemester invoice transmit-digisense \
   --company <sti-eller-slug> \
-  --invoice-number 2026-0001
+  --invoice-number 2026-0001 --actor user:<dig> --confirm yes
 ```
 
 - Brug enten `--invoice-number <no>` eller `--document-id <n>`.
@@ -179,12 +185,25 @@ igen med din produktions-nøgle.
 ## For agenter (MCP)
 
 Hele overfladen findes også som MCP-tools, så en agent kan drive forløbet:
-`efaktura_konfigurer`, `efaktura_registrer`, `efaktura_send`, `efaktura_modtag`.
+`efaktura_konfigurer`, `efaktura_registrer`, `efaktura_send`, `efaktura_status`, `efaktura_modtag`.
+
+Hvis en afsendelse ender som `prepared` med et Digisense documentId, brug
+`efaktura leveringsstatus --document-id <lokalt-id> --confirm yes` (eller den kompatible alias
+`efaktura status`, eller
+`efaktura_status`). Den kalder kun `document-status`, gemmer append-only
+statusevidens og kalder aldrig `document-delivery` igen. Når status er
+`delivered`, bliver resultatet effektivt `acknowledged` for senere send.
+
+KSeF-værdierne følger Digisense-kontrakten: `PROD`, `TEST` og `DEMO`.
 De følger samme forudsætninger og confirm/actor-gates som CLI'en. Se de
 autoritative input/output-shapes i [mcp-tool-surface.md](mcp-tool-surface.md).
 
 En typisk agent-sætning: *"Registrér virksomheden CVR DK12345678 i NemHandel"* →
 agenten kalder `efaktura_registrer`. *"Hent nye fakturaer"* → `efaktura_modtag`.
+
+## Legal-company boundary
+
+Every ledger is one legal company. DigiSense registration identity is derived from the local company profile (CVR and legal name); conflicting caller values and company keys belonging to another CVR fail before a network request. `efaktura_onboarding_status` is local-only and never exposes the API key or DigiSense `signatureSecret`. `efaktura_onboard` validates auth and idempotently ensures both inbound and outbound registration.
 
 ---
 
@@ -201,12 +220,20 @@ agenten kalder `efaktura_registrer`. *"Hent nye fakturaer"* → `efaktura_modtag
 
 ## Onboarding af andre brugere
 
-En anden virksomhed (fx et søsterselskab eller en kollega) der vil bruge
-Rentemester + Digisense skal:
+En anden virksomhed der vil bruge Rentemester + Digisense skal altid have sin
+egen Rentemester-virksomhedsmappe og sin egen DigiSense-`companyKey`:
 
-1. Anskaffe sin **egen** license-key hos Digisense (trin 0).
-2. Køre `efaktura konfigurer` i sin egen virksomhedsmappe (trin 1).
-3. Registrere sit eget CVR (trin 2) og derefter sende/modtage.
+1. Opret virksomheden med korrekt juridisk navn og CVR.
+2. Kør `efaktura konfigurer` i netop dens mappe. Den samme operatør-license-key
+   kan genbruges, hvis DigiSense-aftalen tillader flere CVR-numre; en separat
+   kunde/licens skal bruge sin egen nøgle.
+3. Kør `efaktura onboard`; Rentemester afleder identiteten fra ledgerprofilen
+   og gemmer kun den returnerede `companyKey` i denne virksomheds ledger.
+4. Kontrollér `efaktura onboarding-status` før send/modtag.
+
+En `companyKey` må aldrig kopieres mellem virksomhedsmapper. Workspace-polling
+bruger hver virksomheds lokale binding og laver actor-/backup-preflight på alle
+aktive virksomheder før første netværkskald.
 
 > ⚠️ **TODO — partner-/PR-omtale.** Digisense ønsker at Rentemester nævner dem som
 > compliance-partner (og vil selv bruge Rentemester i deres PR). Når den fælles
@@ -219,5 +246,5 @@ Rentemester + Digisense skal:
 - [ ] **Trin 0:** Digisense' officielle, delbare proces for at få en license-key.
 - [ ] **Go-live:** test- vs. produktions-nøgle, og krav til produktions-registrering.
 - [ ] **Partner-/PR-tekst** til omtale af Digisense som compliance-partner.
-- [ ] **Rigtig sandbox-e2e:** kør forløbet mod `test-api.digisense.dk` med en
-      rigtig nøgle og bekræft send + modtag end-to-end (endnu kun testet mod fakes).
+- [x] **Rigtig sandbox-e2e:** validering, acknowledged outbound, status-idempotens
+      og deduplikeret inbound er verificeret mod `test-api.digisense.dk`.

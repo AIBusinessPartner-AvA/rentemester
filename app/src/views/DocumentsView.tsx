@@ -24,10 +24,11 @@ import type {
   DocumentRow,
   FiscalYearEntry,
 } from "../lib/types";
-import { ErrorState, Loading } from "../components/Feedback";
+import { PageState } from "../components/CockpitPrimitives";
 import { CompanyNav, useCompanyYear } from "../components/CompanyNav";
 import { DocumentIngestModal } from "../components/DocumentIngestModal";
 import { DocumentBookExpenseModal } from "../components/DocumentBookExpenseModal";
+import { PartyLink } from "../components/PartyLink";
 
 type DocumentsPage = {
   documents: CompanyDocuments;
@@ -37,24 +38,39 @@ type DocumentsPage = {
 const DOC_TYPE_LABELS: Record<string, string> = {
   purchase_sale: "Køb/salg",
   cash_register_receipt: "Kassebon",
+  internal_voucher: "Internt bilag",
+  external_accounting_evidence: "Eksternt lønbilag",
 };
 
 // #433 — the keys we own in the URL. Listed once so "Ryd filtre" can clear
 // them all without touching other params (e.g. `?year=`).
-const FILTER_PARAM_KEYS = ["q", "from", "to", "status", "type"] as const;
+const FILTER_PARAM_KEYS = ["q", "from", "to", "status", "type", "party"] as const;
 
 type StatusFilter = "all" | "booked" | "unbooked";
-type TypeFilter = "all" | "purchase_sale" | "cash_register_receipt";
+type TypeFilter = "all" | "purchase_sale" | "cash_register_receipt" | "internal_voucher" | "external_accounting_evidence";
 
 type SortKey = "date" | "amount";
 type SortDir = "asc" | "desc";
+type PartyFilter = "all" | "linked" | "unlinked" | "internal_no_external_party" | "ambiguous";
+type PartyCandidate = { partyId: string; name: string };
+type PartyPlan = {
+  planHash: string;
+  documentSha256?: string;
+  documentPayloadSha256?: string;
+  evidence?: { kind?: string; jurisdiction?: string; identifierKind?: string; identifier?: string };
+  partySnapshot?: { name?: string };
+};
 
 function isStatusFilter(v: string): v is StatusFilter {
   return v === "all" || v === "booked" || v === "unbooked";
 }
 function isTypeFilter(v: string): v is TypeFilter {
   return (
-    v === "all" || v === "purchase_sale" || v === "cash_register_receipt"
+    v === "all" ||
+    v === "purchase_sale" ||
+    v === "cash_register_receipt" ||
+    v === "internal_voucher" ||
+    v === "external_accounting_evidence"
   );
 }
 
@@ -70,6 +86,16 @@ function documentMatchesText(doc: DocumentRow, needle: string): boolean {
   if (doc.documentNo && doc.documentNo.toLowerCase().includes(needle))
     return true;
   if (doc.invoiceNo && doc.invoiceNo.toLowerCase().includes(needle))
+    return true;
+  if (
+    doc.accountingRationale &&
+    doc.accountingRationale.toLowerCase().includes(needle)
+  )
+    return true;
+  if (
+    doc.sourceBankTransactionId !== null &&
+    String(doc.sourceBankTransactionId).includes(needle)
+  )
     return true;
   if (
     doc.journalEntryText &&
@@ -88,6 +114,7 @@ export function DocumentsView() {
   const { slug = "" } = useParams();
   const { year, setYear } = useCompanyYear();
   const [params, setParams] = useSearchParams();
+  const documentId = Number(params.get("documentId")) || null;
   const state = useAsync<DocumentsPage>(
     async () => {
       const [documents, fiscalYears] = await Promise.all([
@@ -98,12 +125,44 @@ export function DocumentsView() {
     },
     [slug],
   );
+  const partyLinks = useAsync(() => api.documentPartyLinks(slug), [slug]);
+  const partyCoverage = useAsync(() => api.partyCoverage(slug), [slug]);
+  const [coverageBusy,setCoverageBusy]=useState(false);
+  const [coverageError,setCoverageError]=useState<string|null>(null);
   // True while the document-intake modal (#213, slice 3) is open.
   const [ingesting, setIngesting] = useState(false);
   // Holds the bilag id whose Bogfør-modal is open (#407); null when none.
   const [bookingDocumentId, setBookingDocumentId] = useState<number | null>(
     null,
   );
+  // #588: a deliberately small, reviewed flow. A person selects a document,
+  // sees its recorded identity, then selects a visible canonical party. Names
+  // only help find a candidate; the server still requires exact evidence.
+  const [partyReviewId, setPartyReviewId] = useState<number | null>(null);
+  const [partyCandidates, setPartyCandidates] = useState<PartyCandidate[]>([]);
+  const [selectedPartyId, setSelectedPartyId] = useState("");
+  const [partyRole, setPartyRole] = useState<"vendor" | "customer" | "bank" | "payee" | "establishment" | "location" | "payment_descriptor">("vendor");
+  const [partyPlan, setPartyPlan] = useState<PartyPlan | null>(null);
+  const [partyError, setPartyError] = useState<string | null>(null);
+  const [partyBusy, setPartyBusy] = useState(false);
+  const [partyConfirmed, setPartyConfirmed] = useState(false);
+  const [sourceReviewEnabled, setSourceReviewEnabled] = useState(false);
+  const [observedName, setObservedName] = useState("");
+  const [observedAddress, setObservedAddress] = useState("");
+  const [observedJurisdiction, setObservedJurisdiction] = useState("");
+  const [observedIdentifierKind, setObservedIdentifierKind] = useState<"dk_cvr"|"eu_vat"|"non_eu">("dk_cvr");
+  const [observedIdentifier, setObservedIdentifier] = useState("");
+  const [sourceReference, setSourceReference] = useState("");
+  const [sourceLocation, setSourceLocation] = useState("");
+  const [sourceRationale, setSourceRationale] = useState("");
+  const [contextSourceReference, setContextSourceReference] = useState("");
+  const [contextBusinessUseReason, setContextBusinessUseReason] = useState("");
+  const [contextConfirmed, setContextConfirmed] = useState(false);
+  const [vatEvidenceBankTransactionId, setVatEvidenceBankTransactionId] = useState("");
+  const [vatEvidenceReference, setVatEvidenceReference] = useState("");
+  const [vatEvidenceSha256, setVatEvidenceSha256] = useState("");
+  const [vatEvidenceRationale, setVatEvidenceRationale] = useState("");
+  const [vatEvidenceConfirmed, setVatEvidenceConfirmed] = useState(false);
 
   // --- #433 filter-bar params (client-side; reflected in URL) ---------------
   const q = params.get("q") ?? "";
@@ -111,8 +170,10 @@ export function DocumentsView() {
   const toDate = params.get("to") ?? "";
   const statusRaw = params.get("status") ?? "all";
   const typeRaw = params.get("type") ?? "all";
+  const partyRaw = params.get("party") ?? "all";
   const status: StatusFilter = isStatusFilter(statusRaw) ? statusRaw : "all";
   const type: TypeFilter = isTypeFilter(typeRaw) ? typeRaw : "all";
+  const party: PartyFilter = partyRaw === "linked" || partyRaw === "unlinked" || partyRaw === "internal_no_external_party" || partyRaw === "ambiguous" ? partyRaw : "all";
 
   // #433 — sorter for the date/amount columns. Default is the order returned
   // by the server (the document id), which is what the page used to do; only
@@ -142,7 +203,9 @@ export function DocumentsView() {
     fromDate !== "" ||
     toDate !== "" ||
     status !== "all" ||
-    type !== "all";
+    type !== "all" ||
+    party !== "all" ||
+    documentId !== null;
 
   function toggleSort(key: SortKey) {
     setSort((prev) => {
@@ -158,11 +221,14 @@ export function DocumentsView() {
   }
 
   const allDocuments = state.data?.documents.documents ?? [];
+  const linkedIds = useMemo(() => new Set((partyLinks.data ?? []).filter((link) => link.linked === 1).map((link) => link.id)), [partyLinks.data]);
+  const internalNoPartyIds = useMemo(() => new Set((partyLinks.data ?? []).filter((link) => link.resolution_state === "internal_no_external_party").map((link) => link.id)), [partyLinks.data]);
 
   const filteredDocuments = useMemo(() => {
     if (!hasActiveFilter) return allDocuments;
     const needle = q.trim().toLowerCase();
     return allDocuments.filter((doc) => {
+      if (documentId !== null && doc.id !== documentId) return false;
       if (needle !== "" && !documentMatchesText(doc, needle)) return false;
       if (fromDate !== "") {
         if (!doc.invoiceDate || doc.invoiceDate < fromDate) return false;
@@ -173,9 +239,15 @@ export function DocumentsView() {
       if (status === "booked" && doc.journalEntryNo === null) return false;
       if (status === "unbooked" && doc.journalEntryNo !== null) return false;
       if (type !== "all" && doc.documentType !== type) return false;
+      if (party === "linked" && !linkedIds.has(doc.id)) return false;
+      if (party === "unlinked" && (linkedIds.has(doc.id) || internalNoPartyIds.has(doc.id))) return false;
+      if (party === "internal_no_external_party" && !internalNoPartyIds.has(doc.id)) return false;
+      // Ambiguity is intentionally not inferred: it needs an explicit reviewed
+      // plan conflict, so this view offers the bounded unlinked review queue.
+      if (party === "ambiguous") return false;
       return true;
     });
-  }, [allDocuments, hasActiveFilter, q, fromDate, toDate, status, type]);
+  }, [allDocuments, hasActiveFilter, q, fromDate, toDate, status, type, party, documentId, linkedIds, internalNoPartyIds]);
 
   const sortedDocuments = useMemo(() => {
     if (!sort) return filteredDocuments;
@@ -199,9 +271,9 @@ export function DocumentsView() {
     return out;
   }, [filteredDocuments, sort]);
 
-  if (state.loading && !state.data) return <Loading label="Henter bilag…" />;
+  if (state.loading && !state.data) return <PageState kind="loading" title="Henter bilag" />;
   if (state.error)
-    return <ErrorState message={state.error} onRetry={state.reload} />;
+    return <PageState kind="error" title="Bilag kunne ikke hentes" onRetry={state.reload}>{state.error}</PageState>;
 
   const { documents: d, fiscalYears } = state.data!;
   const currency = d.company.currency || "DKK";
@@ -217,6 +289,133 @@ export function DocumentsView() {
 
   const totalCount = d.documents.length;
   const matchCount = sortedDocuments.length;
+  const reviewedDocument = partyReviewId === null ? null : allDocuments.find((doc) => doc.id === partyReviewId) ?? null;
+  const observationRole=partyRole==="establishment"||partyRole==="location"||partyRole==="payment_descriptor";
+
+  async function beginPartyReview(doc: DocumentRow) {
+    setPartyReviewId(doc.id);
+    setSelectedPartyId("");
+    setPartyRole("vendor");
+    setPartyPlan(null);
+    setPartyError(null);
+    setPartyConfirmed(false);
+    setSourceReviewEnabled(!doc.supplierVatOrCvr);
+    setObservedName(doc.supplierName ?? ""); setObservedAddress(""); setObservedJurisdiction(""); setObservedIdentifierKind("dk_cvr"); setObservedIdentifier(""); setSourceReference(""); setSourceLocation(""); setSourceRationale("");
+    setContextSourceReference("");
+    setContextBusinessUseReason("");
+    setContextConfirmed(false);
+    setPartyBusy(true);
+    try {
+      // This is a membership-scoped search. It is not a match decision.
+      const result = await api.searchCanonicalParties(slug, doc.supplierName ?? "");
+      setPartyCandidates(result.rows);
+    } catch (error) {
+      setPartyCandidates([]);
+      setPartyError(error instanceof Error ? error.message : "Kunne ikke hente synlige parter.");
+    } finally {
+      setPartyBusy(false);
+    }
+  }
+
+  async function applySafeCoverage(){setCoverageBusy(true);setCoverageError(null);try{const planned=await api.planPartyCoverage(slug);if(!planned.plan.operations.length){await partyCoverage.reload();return;}if(!window.confirm(`Anvend ${planned.plan.operations.length} sikre, hash-bundne modpartskoblinger?`))return;const result=await api.applyPartyCoverage(slug,{planHash:planned.plan.planHash,idempotencyKey:`cockpit-party-coverage-${planned.plan.planHash}`,confirm:true});if(!result.ok)throw new Error(result.errors?.join(", ")??"Coverage-planen blev afvist.");await Promise.all([partyCoverage.reload(),partyLinks.reload(),state.reload()]);}catch(error){setCoverageError(error instanceof Error?error.message:"Coverage-planen kunne ikke anvendes.");}finally{setCoverageBusy(false);}}
+
+  async function markUnresolvedExternal(bankTransactionId:number){const evidenceReference=window.prompt("Kildereference for den ukendte eksterne modpart:")?.trim(),rationale=evidenceReference?window.prompt("Hvorfor kan den juridiske modpart ikke identificeres nu?")?.trim():null,nextAction=rationale?window.prompt("Næste konkrete handling:")?.trim():null;if(!evidenceReference||!rationale||!nextAction)return;const decisions=[{bankTransactionId,unresolvedExternalParty:true,evidenceReference,rationale,nextAction}];setCoverageBusy(true);setCoverageError(null);try{const planned=await api.planPartyCoverage(slug,decisions);if(!window.confirm("Gem den hash-bundne opfølgning append-only?"))return;const result=await api.applyPartyCoverage(slug,{decisions,planHash:planned.plan.planHash,idempotencyKey:`cockpit-unresolved-external-${planned.plan.planHash}`,confirm:true});if(!result.ok)throw new Error(result.errors?.join(", ")??"Beslutningen blev afvist.");await Promise.all([partyCoverage.reload(),partyLinks.reload()]);}catch(error){setCoverageError(error instanceof Error?error.message:"Beslutningen kunne ikke gemmes.");}finally{setCoverageBusy(false);}}
+
+  async function linkBankRowParty(row:{bankTransactionId:number;transactionHash:string;documentHash?:string|null;currentDecision?:{id:number;decisionHash:string}}){
+    const partyId=window.prompt("Kanonisk party-id for netop denne bankrække:")?.trim();
+    const role=partyId?window.prompt("Rolle, fx employee eller authority:")?.trim():null;
+    const provenance=role?window.prompt("Provenance for den række-specifikke identifikation:")?.trim():null;
+    const evidenceReference=provenance?window.prompt("Præcis kildereference:")?.trim():null;
+    const rationale=evidenceReference?window.prompt("Begrundelse for koblingen:")?.trim():null;
+    if(!partyId||!role||!provenance||!evidenceReference||!rationale)return;
+    const decision={bankTransactionId:row.bankTransactionId,scope:"bank_transaction",transactionHash:row.transactionHash,...(row.documentHash?{documentHash:row.documentHash}:{}),partyId,role,provenance,evidenceReference,rationale,...(row.currentDecision?{supersedesEventId:row.currentDecision.id,supersedesDecisionHash:row.currentDecision.decisionHash}:{})};
+    setCoverageBusy(true);setCoverageError(null);
+    try{const planned=await api.planPartyCoverage(slug,[decision]);if(!window.confirm(row.currentDecision?"Erstat den eksakte nuværende bankrækkebeslutning append-only?":"Gem koblingen kun på denne eksakte bankrække?"))return;const result=await api.applyPartyCoverage(slug,{decisions:[decision],planHash:planned.plan.planHash,idempotencyKey:`cockpit-bank-row-party-${planned.plan.planHash}`,confirm:true});if(!result.ok)throw new Error(result.errors?.join(", ")??"Bankrækkekoblingen blev afvist.");await partyCoverage.reload();}catch(error){setCoverageError(error instanceof Error?error.message:"Bankrækkekoblingen kunne ikke gemmes.");}finally{setCoverageBusy(false);}
+  }
+
+  function identityInput(doc: DocumentRow) {
+    return {
+      documentId: doc.id,
+      partyId: selectedPartyId,
+      role: partyRole,
+      jurisdiction: doc.supplierCountryCode ?? undefined,
+      identifierKind: doc.supplierIdentifierKind ?? undefined,
+      identifier: doc.supplierVatOrCvr ?? undefined,
+      ...(sourceReviewEnabled ? { sourceReview:{ observedName, observedAddress:observedAddress||undefined, ...(!observationRole?{jurisdiction:observedJurisdiction.toUpperCase(),identifierKind:observedIdentifierKind,identifier:observedIdentifier||undefined}:{}), sourceReference, sourceLocation, rationale:sourceRationale } } : {}),
+    };
+  }
+
+  async function planPartyLink() {
+    if (!reviewedDocument || !selectedPartyId) return;
+    setPartyBusy(true);
+    setPartyError(null);
+    setPartyPlan(null);
+    try {
+      const result = await api.planDocumentPartyLink(slug, identityInput(reviewedDocument));
+      if (!result.ok || !result.plan) {
+        setPartyError(result.errors?.join(", ") ?? "Planen kunne ikke godkendes.");
+        return;
+      }
+      setPartyPlan(result.plan as PartyPlan);
+    } catch (error) {
+      setPartyError(error instanceof Error ? error.message : "Kunne ikke planlægge koblingen.");
+    } finally {
+      setPartyBusy(false);
+    }
+  }
+
+  async function applyPartyLink() {
+    if (!reviewedDocument || !partyPlan || !partyConfirmed) return;
+    setPartyBusy(true);
+    setPartyError(null);
+    try {
+      const result = await api.applyDocumentPartyLink(slug, {
+        ...identityInput(reviewedDocument),
+        planHash: partyPlan.planHash,
+        confirm: true,
+        // A UI retry remains safe for this exact reviewed plan.
+        idempotencyKey: `document-party-link-${reviewedDocument.id}-${partyPlan.planHash}`,
+      });
+      if (!result.ok) {
+        setPartyError(result.errors?.join(", ") ?? "Koblingen kunne ikke gemmes.");
+        return;
+      }
+      await Promise.all([partyLinks.reload(), state.reload()]);
+      // Inspect after the write so the visible status/history is current.
+      await api.documentPartyLinkHistory(slug, reviewedDocument.id);
+      setPartyReviewId(null);
+    } catch (error) {
+      setPartyError(error instanceof Error ? error.message : "Koblingen kunne ikke gemmes.");
+    } finally {
+      setPartyBusy(false);
+    }
+  }
+
+  async function confirmInternalNoParty() {
+    if (!reviewedDocument || reviewedDocument.documentType !== "internal_voucher" || !window.confirm("Bekræft at dette interne bilag bevidst ikke har en ekstern part.")) return;
+    setPartyBusy(true); setPartyError(null);
+    try { const result = await api.confirmInternalNoExternalParty(slug, { documentId: reviewedDocument.id, reason: "Confirmed in Documents Cockpit", idempotencyKey: `internal-no-party-${reviewedDocument.id}`, confirm: true }); if (!result.ok) { setPartyError(result.errors?.join(", ") ?? "Beslutningen kunne ikke gemmes."); return; } await partyLinks.reload(); setPartyReviewId(null); }
+    catch (error) { setPartyError(error instanceof Error ? error.message : "Beslutningen kunne ikke gemmes."); }
+    finally { setPartyBusy(false); }
+  }
+
+  async function recordCompanyContext() {
+    if (!reviewedDocument || reviewedDocument.documentType !== "purchase_sale" || !contextConfirmed || !contextSourceReference.trim() || !contextBusinessUseReason.trim()) return;
+    setPartyBusy(true); setPartyError(null);
+    try {
+      const result = await api.setDocumentCompanyContext(slug, { documentId: reviewedDocument.id, sourceReference: contextSourceReference.trim(), businessUseReason: contextBusinessUseReason.trim() });
+      if (!result.ok) { setPartyError(result.errors?.join(", ") ?? "Virksomhedskonteksten kunne ikke gemmes."); return; }
+      setContextConfirmed(false);
+    } catch (error) { setPartyError(error instanceof Error ? error.message : "Virksomhedskonteksten kunne ikke gemmes."); }
+    finally { setPartyBusy(false); }
+  }
+  async function reviewPurchaseVatEvidence() {
+    if (!reviewedDocument || !vatEvidenceConfirmed || !/^\d+$/.test(vatEvidenceBankTransactionId) || !/^[a-fA-F0-9]{64}$/.test(vatEvidenceSha256) || !vatEvidenceReference.trim() || !vatEvidenceRationale.trim()) return;
+    setPartyBusy(true); setPartyError(null);
+    try { const result=await api.reviewPurchaseVatEvidence(slug,{documentId:reviewedDocument.id,bankTransactionId:Number(vatEvidenceBankTransactionId),businessEvidenceReference:vatEvidenceReference.trim(),businessEvidenceSha256:vatEvidenceSha256.toLowerCase(),rationale:vatEvidenceRationale.trim()}); if(!result.ok){setPartyError(result.errors?.join(", ")??"Momsbeviset kunne ikke gennemgås.");return;} setVatEvidenceConfirmed(false); }
+    catch(error){setPartyError(error instanceof Error?error.message:"Momsbeviset kunne ikke gennemgås.");}
+    finally{setPartyBusy(false);}
+  }
 
   return (
     <section className="statement">
@@ -287,6 +486,16 @@ export function DocumentsView() {
           />
         </label>
         <label className="journal-filter-field">
+          <span className="muted">Kanonisk part</span>
+          <select value={party} onChange={(e) => setFilter("party", e.target.value)}>
+            <option value="all">Alle</option>
+            <option value="linked">Koblet</option>
+            <option value="unlinked">Mangler review</option>
+            <option value="internal_no_external_party">Internt uden ekstern part</option>
+            <option value="ambiguous">Tvetydige (kræver review)</option>
+          </select>
+        </label>
+        <label className="journal-filter-field">
           <span className="muted">Til</span>
           <input
             type="date"
@@ -314,6 +523,8 @@ export function DocumentsView() {
             <option value="all">Alle</option>
             <option value="purchase_sale">Køb/salg</option>
             <option value="cash_register_receipt">Kassebon</option>
+            <option value="internal_voucher">Internt bilag</option>
+            <option value="external_accounting_evidence">Eksternt lønbilag</option>
           </select>
         </label>
         {hasActiveFilter && (
@@ -335,13 +546,42 @@ export function DocumentsView() {
         {d.linkedCount} bogført · {d.unlinkedCount} ubehandlet
       </p>
 
+      {partyCoverage.data&&<section className="card" aria-label="Modpartsdækning"><div className="page-head"><div><h3>Modpartsdækning</h3><p className="muted">Én kanonisk projektion fra bank til afstemning, bilag og part.</p></div><button type="button" className="btn secondary" disabled={coverageBusy||partyCoverage.data.totals.exact_candidate===0} onClick={applySafeCoverage}>Anvend sikre kandidater</button></div><div className="stats-grid"><div><strong>{partyCoverage.data.totals.linked+partyCoverage.data.totals.resolved_no_external_party}</strong><span>Dækket</span></div><div><strong>{partyCoverage.data.totals.exact_candidate}</strong><span>Sikre kandidater</span></div><div><strong>{partyCoverage.data.totals.source_observed+partyCoverage.data.totals.unresolved_external_party+partyCoverage.data.totals.ambiguous+partyCoverage.data.totals.missing_source}</strong><span>Kræver menneske</span></div></div><details><summary>Se grundlag og rester</summary><p className="muted">Population <code>{partyCoverage.data.populationHash}</code> · plan <code>{partyCoverage.data.planHash}</code></p><ul>{partyCoverage.data.rows.filter((row)=>row.status!=="linked"&&row.status!=="resolved_no_external_party"||Boolean(row.currentDecision)).map((row)=><li key={row.bankTransactionId}>Bankpost #{row.bankTransactionId}{row.documentId?` · bilag #${row.documentId}`:""}: {row.reason}{row.candidate?.provenance?` (${row.candidate.provenance})`:""}{row.nextAction?` ${row.nextAction}`:""}{row.documentHash&&<button type="button" className="btn secondary" disabled={coverageBusy} onClick={()=>linkBankRowParty(row)}>{row.currentDecision?"Ret bankrækkens modpart":"Knyt modpart til bankrække"}</button>}{row.documentId&&(row.status==="missing_source"||row.status==="source_observed")&&<button type="button" className="btn secondary" disabled={coverageBusy} onClick={()=>markUnresolvedExternal(row.bankTransactionId)}>Markér ekstern modpart uafklaret</button>}</li>)}</ul></details>{coverageError&&<p className="flag warning" role="alert">{coverageError}</p>}</section>}
+
+      {reviewedDocument && (
+        <section className="card" aria-label="Gennemgå kanonisk part">
+          <div className="page-head">
+            <div>
+              <h3>Gennemgå kanonisk part</h3>
+              <p className="muted">Bilag {reviewedDocument.documentNo ?? `#${reviewedDocument.id}`}. Navne er kun søgehjælp — koblingen kræver den uforanderlige identitet nedenfor.</p>
+            </div>
+            <button type="button" className="btn secondary" onClick={() => setPartyReviewId(null)}>Luk</button>
+          </div>
+          <dl className="key-value-list">
+            <div><dt>Identitet på bilaget</dt><dd>{reviewedDocument.supplierCountryCode ?? "—"} · {reviewedDocument.supplierIdentifierKind ?? "—"} · {reviewedDocument.supplierVatOrCvr ?? "Ingen verificerbar identifikator"}</dd></div>
+            <div><dt>Bevis</dt><dd>Originalfilen og bogføringen ændres ikke. Planen binder bilagets hash til den valgte part.</dd></div>
+          </dl>
+          <div className="row-actions">
+            <label>Rolle <select value={partyRole} onChange={(event) => { const role=event.target.value as typeof partyRole;setPartyRole(role);if(role==="establishment"||role==="location"||role==="payment_descriptor")setSourceReviewEnabled(true);setPartyPlan(null); }}><option value="vendor">Juridisk leverandør</option><option value="customer">Kunde</option><option value="bank">Bank</option><option value="payee">Betalingsmodtager</option><option value="establishment">Observeret forretning</option><option value="location">Observeret sted</option><option value="payment_descriptor">Observeret betalingstekst</option></select></label>
+            <label>Vælg kanonisk part <select aria-label="Vælg kanonisk part" value={selectedPartyId} onChange={(event) => { setSelectedPartyId(event.target.value); setPartyPlan(null); }} disabled={partyBusy}><option value="">Vælg en synlig part…</option>{partyCandidates.map((candidate) => <option key={candidate.partyId} value={candidate.partyId}>{candidate.name}</option>)}</select></label>
+            <button type="button" className="btn secondary" disabled={partyBusy || !selectedPartyId || ((observationRole||!reviewedDocument.supplierVatOrCvr) && !sourceReviewEnabled)} onClick={planPartyLink}>Vis plan</button>
+          </div>
+          {(!reviewedDocument.supplierVatOrCvr||observationRole) && <div className="card"><label><input type="checkbox" checked={sourceReviewEnabled} disabled={observationRole} onChange={(event)=>{setSourceReviewEnabled(event.target.checked);setPartyPlan(null);}}/> Observationen er manuelt aflæst i den uforanderlige original</label>{sourceReviewEnabled&&<><p className="muted">Indtast kun det, der faktisk står i kilden. En observeret forretning eller betalingstekst er ikke den juridiske leverandør.</p><label className="modal-field">Observeret navn<input value={observedName} onChange={(e)=>setObservedName(e.target.value)}/></label><label className="modal-field">Observeret adresse (valgfri)<input value={observedAddress} onChange={(e)=>setObservedAddress(e.target.value)}/></label>{!observationRole&&<div className="row-actions"><label>Land<input size={4} maxLength={2} value={observedJurisdiction} onChange={(e)=>setObservedJurisdiction(e.target.value)}/></label><label>ID-type<select value={observedIdentifierKind} onChange={(e)=>setObservedIdentifierKind(e.target.value as typeof observedIdentifierKind)}><option value="dk_cvr">Dansk CVR</option><option value="eu_vat">EU VAT</option><option value="non_eu">Ikke-EU</option></select></label><label>Observeret ID<input value={observedIdentifier} onChange={(e)=>setObservedIdentifier(e.target.value)}/></label></div>}<label className="modal-field">Kildereference<input value={sourceReference} onChange={(e)=>setSourceReference(e.target.value)}/></label><label className="modal-field">Placering i kilden<input value={sourceLocation} onChange={(e)=>setSourceLocation(e.target.value)}/></label><label className="modal-field">Review-begrundelse<input value={sourceRationale} onChange={(e)=>setSourceRationale(e.target.value)}/></label></>}</div>}
+          {partyError && <p className="flag warning" role="alert">{partyError}</p>}
+          {partyPlan && <div className="card"><p><strong>Plan klar</strong> — {partyPlan.partySnapshot?.name ?? "Valgt part"}; bevis: {partyPlan.evidence?.kind ?? "exact_identifier"}.</p><p className="muted">Plan-hash: <code>{partyPlan.planHash}</code></p><label><input type="checkbox" checked={partyConfirmed} onChange={(event) => setPartyConfirmed(event.target.checked)} /> Jeg har gennemgået planen og vil oprette den append-only kobling.</label><div className="row-actions"><button type="button" className="btn" disabled={partyBusy || !partyConfirmed} onClick={applyPartyLink}>Bekræft og anvend</button></div></div>}
+          {reviewedDocument.documentType === "internal_voucher" && <div className="card"><p className="muted">Interne bilag kan bekræftes uden ekstern part. Beslutningen er append-only og ændrer ikke bilag, moms eller journal.</p><button type="button" className="btn secondary" disabled={partyBusy} onClick={confirmInternalNoParty}>Bekræft ingen ekstern part</button></div>}
+          {reviewedDocument.documentType === "purchase_sale" && <div className="card"><h4>Separat virksomhedskontekst</h4><p className="muted">Brug kun når det oprindelige købsbilag faktisk er ufuldstændigt eller et dansk forenklet bilag. Det ændrer aldrig modtageren på fakturaen og godkender ikke moms.</p><label className="modal-field">Kildereference<input value={contextSourceReference} onChange={(event) => setContextSourceReference(event.target.value)} disabled={partyBusy} /></label><label className="modal-field">Forretningsmæssig begrundelse<input value={contextBusinessUseReason} onChange={(event) => setContextBusinessUseReason(event.target.value)} disabled={partyBusy} /></label><label><input type="checkbox" checked={contextConfirmed} onChange={(event) => setContextConfirmed(event.target.checked)} disabled={partyBusy} /> Jeg har gennemgået den uforanderlige kilde og vil gemme denne attribution append-only.</label><div className="row-actions"><button type="button" className="btn secondary" disabled={partyBusy || !contextConfirmed || !contextSourceReference.trim() || !contextBusinessUseReason.trim()} onClick={recordCompanyContext}>Gem virksomhedskontekst</button></div></div>}
+          {reviewedDocument.documentType === "purchase_sale" && <div className="card"><h4>Momsbevis ved formel fakturamangel</h4><p className="muted">Kun for et sandfærdigt ufuldstændigt standardbilag. Det er ikke en override: leverandør, 25 % moms, eksakt virksomhedsbetaling og erhvervsbevis skal kunne efterprøves.</p><label className="modal-field">Bankpost-id<input value={vatEvidenceBankTransactionId} onChange={(event)=>setVatEvidenceBankTransactionId(event.target.value)} disabled={partyBusy}/></label><label className="modal-field">Erhvervsbevis – reference<input value={vatEvidenceReference} onChange={(event)=>setVatEvidenceReference(event.target.value)} disabled={partyBusy}/></label><label className="modal-field">Erhvervsbevis – SHA-256<input value={vatEvidenceSha256} onChange={(event)=>setVatEvidenceSha256(event.target.value)} disabled={partyBusy}/></label><label className="modal-field">Review-begrundelse<input value={vatEvidenceRationale} onChange={(event)=>setVatEvidenceRationale(event.target.value)} disabled={partyBusy}/></label><label><input type="checkbox" checked={vatEvidenceConfirmed} onChange={(event)=>setVatEvidenceConfirmed(event.target.checked)} disabled={partyBusy}/> Jeg bekræfter, at dette alene vedrører en formel fakturamangel.</label><div className="row-actions"><button type="button" className="btn secondary" disabled={partyBusy||!vatEvidenceConfirmed||!/^\d+$/.test(vatEvidenceBankTransactionId)||!/^[a-fA-F0-9]{64}$/.test(vatEvidenceSha256)||!vatEvidenceReference.trim()||!vatEvidenceRationale.trim()} onClick={reviewPurchaseVatEvidence}>Gem momsbevis-review</button></div></div>}
+        </section>
+      )}
+
       <div className="card statement-card table-scroll">
-        <table className="data statement-table">
+        <table className="data statement-table responsive-table" aria-label="Bilag">
           <thead>
             <tr>
               <th>Bilagsnr.</th>
               <th>Type</th>
-              <th>Leverandør</th>
+              <th>Modpart / grundlag</th>
               <th>Faktura</th>
               <th>
                 <button
@@ -386,12 +626,24 @@ export function DocumentsView() {
                     {DOC_TYPE_LABELS[doc.documentType] ?? doc.documentType}
                   </td>
                   <td>
-                    <div>{doc.supplierName ?? "—"}</div>
+                    <div>
+                      {doc.documentType === "internal_voucher"
+                        ? doc.internalVoucherKind === "non_cash_balance_correction"
+                          ? "Internt balancekorrektionsbilag — ingen bankbevægelse"
+                          : `Bankpost #${doc.sourceBankTransactionId ?? "—"}`
+                        : <PartyLink slug={slug} partyId={doc.partyId}>{doc.supplierName ?? "—"}</PartyLink>}
+                    </div>
+                    {doc.documentType === "internal_voucher" && doc.accountingRationale ? (
+                      <div className="muted">{doc.accountingRationale}</div>
+                    ) : null}
+                    {doc.documentType === "internal_voucher" && doc.preparedBy ? <div className="muted">Forberedt af {doc.preparedBy}{doc.preparedByProgram ? ` via ${doc.preparedByProgram}` : ""}{doc.preparedAt ? ` · ${doc.preparedAt}` : ""}</div> : null}
                     {(doc.supplierCountryCode || doc.supplierIdentifierKind || doc.supplierIdentityStatus) && (
                       <div className="muted">
                         {doc.supplierCountryCode ?? "—"} · {doc.supplierIdentifierKind ?? "—"} · {doc.supplierIdentityStatus ?? "—"}
                       </div>
                     )}
+                    <div className="muted">{internalNoPartyIds.has(doc.id) ? "Bekræftet internt bilag uden ekstern part" : linkedIds.has(doc.id) ? "Kanonisk part koblet" : "Kanonisk part ikke koblet — gennemgå før anvendelse"}</div>
+                    {!linkedIds.has(doc.id) && !internalNoPartyIds.has(doc.id) && <button type="button" className="btn small secondary" onClick={() => beginPartyReview(doc)}>Gennemgå part</button>}
                   </td>
                   <td>{doc.invoiceNo ?? "—"}</td>
                   <td className="entry-date">{doc.invoiceDate ?? "—"}</td>
@@ -418,7 +670,7 @@ export function DocumentsView() {
                     ) : (
                       <div className="doc-posting">
                         <span className="flag warning">Ikke bogført</span>
-                        {!selectedYearArchived && (
+                        {!selectedYearArchived && <>
                           <button
                             type="button"
                             className="btn small"
@@ -426,7 +678,8 @@ export function DocumentsView() {
                           >
                             Bogfør bilag
                           </button>
-                        )}
+                          <Link className="btn small secondary" to={`/companies/${slug}/koebsoverblik?sourceKind=document&sourceId=${doc.id}`}>Åbn købscase</Link>
+                        </>}
                       </div>
                     )}
                   </td>

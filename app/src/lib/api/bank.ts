@@ -42,6 +42,15 @@ export const bankApi = {
       }`,
     ).then((r) => r.bank),
 
+  correctionPlan: (slug:string, bankTransactionId:number, replacementJournalEntryId:number) =>
+    request<{ok:true;plan:unknown}>(`/api/companies/${encodeURIComponent(slug)}/bank/reconciliation-correction-plan?bankTransactionId=${bankTransactionId}&replacementJournalEntryId=${replacementJournalEntryId}`).then(r=>r.plan),
+
+  applyCorrection: (slug:string, input:{bankTransactionId:number;replacementJournalEntryId:number;expectedReconciliationId:string;planHash:string;reason:string;idempotencyKey:string}) =>
+    request<{ok:true;correction:unknown}>(`/api/companies/${encodeURIComponent(slug)}/bank/reconciliation-correction`,{method:"POST",body:JSON.stringify({...input,confirm:true})}).then(r=>r.correction),
+
+  planLegacyBinding:(slug:string,input:{bankAccountId:number;ledgerAccountNo:string;cutoff:string})=>request<{ok:true;plan:{planHash:string}}>(`/api/companies/${encodeURIComponent(slug)}/bank/legacy-binding/plan`,{method:"POST",body:JSON.stringify(input)}).then(r=>r.plan),
+  applyLegacyBinding:(slug:string,input:{bankAccountId:number;ledgerAccountNo:string;cutoff:string;planHash:string;idempotencyKey:string})=>request<{ok:true;binding:unknown}>(`/api/companies/${encodeURIComponent(slug)}/bank/legacy-binding/apply`,{method:"POST",headers:{"idempotency-key":input.idempotencyKey},body:JSON.stringify({...input,confirm:true})}).then(r=>r.binding),
+
   /**
    * Imports a bank-statement CSV (#213, slice 2). The browser reads the file
    * and passes its text as `csvContent`; the server writes it to a temp file
@@ -57,6 +66,7 @@ export const bankApi = {
           csvContent: input.csvContent,
           ...(input.account ? { account: input.account } : {}),
           ...(input.profile ? { profile: input.profile } : {}),
+          ...(input.statementOrder ? { statementOrder: input.statementOrder } : {}),
           confirm: true,
         }),
       },
@@ -68,6 +78,7 @@ export type BankImportInput = {
   csvContent: string;
   account?: string;
   profile?: string;
+  statementOrder?: "ascending" | "descending";
 };
 
 /** The bank-import result the server echoes back. */

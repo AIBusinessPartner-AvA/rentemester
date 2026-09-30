@@ -21,7 +21,15 @@ export type ClosePeriodInput = {
   periodEnd: string;
   kind?: "vat_period" | "vat_quarter" | "fiscal_year" | "custom";
   reference?: string;
+  packetHash: string;
+  reviewId: number;
+  force?: boolean;
+  reason?: string;
 };
+
+export type HumanReadiness = { status: "Ikke klar" | "Kræver stillingtagen" | "Klar" | "Lukket/endelig"; openControls: number; reason: string };
+export type PeriodCloseReadinessPacket = { hash: string; blockers: number; warnings: number; items: Array<{ code: string; status: "passed" | "warning" | "blocked" | "unavailable"; waivable: boolean; count: number }> };
+export type PeriodCloseReview = { id: number; packet: PeriodCloseReadinessPacket };
 
 /** The result of `POST /api/companies/:slug/periods/reopen` (#301). */
 export type ReopenPeriodResult = {
@@ -83,3 +91,6 @@ export type PeriodsResponse = {
   ok: true;
   periods: CompanyPeriods;
 };
+
+export type PeriodCloseReadinessResponse = { ok: true; packet: PeriodCloseReadinessPacket; readiness: HumanReadiness };
+export type PeriodCloseReviewResponse = { ok: true; review: PeriodCloseReview };

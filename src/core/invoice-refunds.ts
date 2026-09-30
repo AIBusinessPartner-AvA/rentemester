@@ -37,7 +37,7 @@ function getOutgoingRefundBankTransaction(db: Database, input: RefundInvoiceToBa
   }
   const bank = (input.bankTransactionId !== undefined
     ? db.query(`SELECT id, transaction_date, amount, text, reference FROM bank_transactions WHERE id = ?`).get(input.bankTransactionId)
-    : db.query(`SELECT id, transaction_date, amount, text, reference FROM bank_transactions WHERE reference = ? ORDER BY id DESC LIMIT 1`).get(input.bankTransactionReference)) as { id: number; transaction_date: string; amount: number; text: string; reference: string | null } | null;
+    : db.query(`SELECT id, transaction_date, amount, text, reference FROM bank_transactions WHERE reference = ? ORDER BY id DESC LIMIT 1`).get(input.bankTransactionReference ?? "")) as { id: number; transaction_date: string; amount: number; text: string; reference: string | null } | null;
   if (!bank) {
     return { error: input.bankTransactionId !== undefined ? `bank transaction ${input.bankTransactionId} does not exist` : `no bank transaction found with reference ${input.bankTransactionReference}` };
   }
@@ -71,7 +71,7 @@ export function refundInvoiceToBank(db: Database, input: RefundInvoiceToBankInpu
     return { ok: false, appliedRules: [RULE_ID], errors: [`refusion af faktura ${invoice.invoice_no} i fremmed valuta understøttes ikke endnu — refusionsstien er ikke valuta-bevidst (foreign-currency invoice refunds are not supported)`] };
   }
 
-  const existingJournal = db.query(`SELECT id FROM journal_entries WHERE source_bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
+  const existingJournal = db.query(`SELECT journal_entry_id AS id FROM bank_journal_reconciliations WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
   if (existingJournal) return { ok: false, appliedRules: [RULE_ID], errors: [`bank transaction ${bank.id} is already linked to journal entry ${existingJournal.id}`] };
 
   if (db.query(`SELECT id FROM invoice_refunds WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id)) {
@@ -185,7 +185,7 @@ export function refundInvoiceToBank(db: Database, input: RefundInvoiceToBankInpu
         remainingCreditBalance: roundDkk(Math.max(0, -(after.openBalance ?? 0))),
         appliedRules: [...new Set([RULE_ID, ...(journal.appliedRules ?? [])])],
       };
-    }, { immediate: true })();
+    }).immediate();
     return result;
   } catch (error) {
     const parsed = typeof error === "object" && error && "message" in error ? (() => {

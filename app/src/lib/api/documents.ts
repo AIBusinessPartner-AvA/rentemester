@@ -7,6 +7,42 @@ export const documentsApi = {
       `/api/companies/${encodeURIComponent(slug)}/documents`,
     ).then((r) => r.documents),
 
+  /** #588: review-only party-link state, kept separate from invoice facts. */
+  documentPartyLinks: (slug: string, status?: "linked" | "unlinked" | "resolved" | "source_observed" | "unresolved_external_party" | "internal_no_external_party" | "unresolved") =>
+    request<{ ok: true; links: Array<{ id: number; document_no: string | null; linked: 0 | 1; resolution_state: "resolved" | "source_observed" | "unresolved_external_party" | "internal_no_external_party" | "unresolved" }> }>(
+      `/api/companies/${encodeURIComponent(slug)}/documents/party-links${status ? `?status=${status}` : ""}`,
+    ).then((r) => r.links),
+
+  documentPartyLinkHistory: (slug: string, documentId: number) =>
+    request<{ ok: true; links: Array<Record<string, unknown>> }>(
+      `/api/companies/${encodeURIComponent(slug)}/documents/${documentId}/party-links`,
+    ).then((r) => r.links),
+
+  searchCanonicalParties: (slug: string, query: string) =>
+    request<{ ok: true; rows: Array<{ partyId: string; name: string }>; count: number }>(
+      `/api/companies/${encodeURIComponent(slug)}/workspace-parties?query=${encodeURIComponent(query)}`,
+    ),
+
+  planDocumentPartyLink: (slug: string, input: Record<string, unknown>) =>
+    request<{ ok: boolean; plan?: { planHash: string }; errors?: string[] }>(`/api/companies/${encodeURIComponent(slug)}/documents/party-links/plan`, { method: "POST", body: JSON.stringify(input) }),
+
+  applyDocumentPartyLink: (slug: string, input: Record<string, unknown>) =>
+      request<{ ok: boolean; id?: number; errors?: string[] }>(`/api/companies/${encodeURIComponent(slug)}/documents/party-links/apply`, { method: "POST", body: JSON.stringify(input) }),
+
+  partyCoverage: (slug:string)=>request<{ok:true;rows:Array<{bankTransactionId:number;transactionHash:string;documentId:number|null;documentHash?:string|null;status:"linked"|"source_observed"|"unresolved_external_party"|"resolved_no_external_party"|"exact_candidate"|"ambiguous"|"missing_source";candidate:null|{partyId?:string;role?:string;provenance?:string;candidates?:Array<{partyId:string;role?:string;provenance:string}>};currentDecision?:{id:number;decisionHash:string;provenance?:string};reason:string;nextAction:string|null}>;totals:Record<"linked"|"source_observed"|"unresolved_external_party"|"resolved_no_external_party"|"exact_candidate"|"ambiguous"|"missing_source",number>;populationHash:string;planHash:string}>(`/api/companies/${encodeURIComponent(slug)}/documents/party-coverage`),
+  planPartyCoverage: (slug:string,decisions?:Array<Record<string,unknown>>)=>request<{ok:true;plan:{planHash:string;operations:Array<Record<string,unknown>>}}>(`/api/companies/${encodeURIComponent(slug)}/documents/party-coverage/plan`,{method:"POST",body:JSON.stringify({decisions})}),
+  applyPartyCoverage: (slug:string,input:{planHash:string;idempotencyKey:string;confirm:true;decisions?:Array<Record<string,unknown>>})=>request<{ok:boolean;applied:number;errors?:string[]}>(`/api/companies/${encodeURIComponent(slug)}/documents/party-coverage/apply`,{method:"POST",body:JSON.stringify(input)}),
+
+  confirmInternalNoExternalParty: (slug: string, input: Record<string, unknown>) =>
+    request<{ ok: boolean; id?: number; errors?: string[] }>(`/api/companies/${encodeURIComponent(slug)}/documents/internal-no-external-party`, { method: "POST", body: JSON.stringify(input) }),
+
+  /** #618: audited attribution separate from the source invoice and VAT gate. */
+  setDocumentCompanyContext: (slug: string, input: { documentId: number; sourceReference: string; businessUseReason: string }) =>
+    request<{ ok: boolean; applied?: boolean; errors?: string[] }>(`/api/companies/${encodeURIComponent(slug)}/documents/company-context`, { method: "POST", body: JSON.stringify({ ...input, confirm: true }) }),
+
+  reviewPurchaseVatEvidence: (slug: string, input: { documentId:number; bankTransactionId:number; businessEvidenceReference:string; businessEvidenceSha256:string; rationale:string }) =>
+    request<{ ok:boolean; applied?:boolean; errors?:string[] }>(`/api/companies/${encodeURIComponent(slug)}/documents/purchase-vat-evidence-review`, { method:"POST", body:JSON.stringify({ ...input, confirm:true }) }),
+
   /**
    * URL of a stored bilag file — opened directly in a new browser tab, so it
    * is a plain URL builder rather than a fetch. The server serves the file
@@ -67,6 +103,19 @@ export const documentsApi = {
       `/api/companies/${encodeURIComponent(slug)}/documents/${documentId}/booking-options`,
     ).then((r) => r.options),
 
+  /** Read-only preflight: no provider call and no state change. */
+  documentVatPreflight: (slug: string, documentId: number) =>
+    request<{ ok: true; preflight: DocumentVatPreflight }>(
+      `/api/companies/${encodeURIComponent(slug)}/documents/${documentId}/vat-preflight`,
+    ).then((r) => r.preflight),
+
+  /** Actor-attributed provider call, gated by the same mutation boundary as posting. */
+  applyDocumentVatPreflight: (slug: string, documentId: number) =>
+    request<{ ok: true; preflight: DocumentVatPreflight }>(
+      `/api/companies/${encodeURIComponent(slug)}/documents/${documentId}/vat-preflight/apply`,
+      { method: "POST", body: JSON.stringify({ confirm: true }) },
+    ).then((r) => r.preflight),
+
   /**
    * #407 — books an ingested purchase document (bilag) as an expense against
    * an unmatched outgoing bank transaction. Third caller of the SAME
@@ -105,6 +154,16 @@ export type ExpenseAccountOption = {
   defaultVatCode: string | null;
 };
 
+export type DocumentVatPreflight = {
+  ok: boolean;
+  derivedRegion: "DK" | "EU" | "NON_EU" | "CONFLICT";
+  requiredValidation: string | null;
+  cache: { reused: boolean; freshUntil: string | null };
+  applyWouldCallProvider: boolean;
+  errors: string[];
+  exception: { id: number; status: string; severity: string; message: string; requiredAction: string | null; createdAt: string } | null;
+};
+
 /** Wire type for one unmatched outgoing bank transaction (#407). */
 export type UnmatchedBankOption = {
   id: number;
@@ -122,6 +181,7 @@ export type DocumentBookingOptionsDocument = {
   id: number;
   documentNo: string | null;
   documentType: string;
+  sourceBankTransactionId: number | null;
   invoiceNo: string | null;
   invoiceDate: string | null;
   supplierName: string | null;
@@ -212,7 +272,8 @@ export type DataImportSummary = {
 /** Document metadata for `api.ingestDocument` — amounts are kroner (decimal DKK). */
 export type DocumentIngestMetadata = {
   source: string;
-  documentType?: "purchase_sale" | "cash_register_receipt";
+  documentType?: "purchase_sale" | "cash_register_receipt" | "internal_voucher" | "external_accounting_evidence";
+  internalVoucherKind?: "bank_evidenced" | "non_cash_balance_correction";
   issueDate?: string;
   invoiceNo?: string;
   deliveryDescription?: string;
@@ -223,7 +284,14 @@ export type DocumentIngestMetadata = {
   vatAmount?: number;
   purchaseVatLines?: Array<{ classification: "dk_purchase_25" | "exempt"; netAmount: number; vatAmount?: number }>;
   reverseChargeWordingConfirmed?: boolean;
+  reverseChargeWordingEvidence?: { excerpt: string; location: string };
+  /** Source fact only; company identity is recorded separately and never copied into recipient. */
+  danishSimplifiedPurchaseInvoice?: boolean;
+  incompleteStandardPurchaseInvoice?: boolean;
   paymentDetails?: string;
+  sourceBankTransactionId?: number;
+  accountingRationale?: string;
+  externalAccountingEvidence?: { category: "payroll"; accountingPeriod: string; externalReference: string; totals: { debitAmount: number; creditAmount: number } };
 };
 
 /** Input for `api.ingestDocument` — the base64 file plus its metadata. */

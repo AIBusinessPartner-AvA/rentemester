@@ -7,7 +7,8 @@ import { ensureCompanyDirs } from "../../src/core/paths";
 import { openDb, migrate } from "../../src/core/db";
 import { ingestDocument } from "../../src/core/documents";
 import { buildVatFiling } from "../../src/core/vat-filing";
-import { closeAccountingPeriod, setCompanyVatPeriodType, type VatPeriodType } from "../../src/core/periods";
+import { setCompanyVatPeriodType, type VatPeriodType } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
 import { postJournalEntry, seedAccounts } from "../../src/core/ledger";
 
 function newCompany(prefix: string, cadence: VatPeriodType = "month") {
@@ -90,9 +91,10 @@ describe("vat momsangivelse (filing)", () => {
     expect(filing.rubrikker.momsAfYdelseskobUdland).toBe(0);
     expect(filing.rubrikker.kobsmoms).toBe(200);
     // momstilsvar = salgsmoms + udenlandsk moms - kobsmoms
-    expect(filing.rubrikker.momstilsvar).toBe(50);
-    expect(filing.rubrikker.rubrikA).toBe(0);
-    expect(filing.rubrikker.rubrikB).toBe(0);
+    expect(filing.rubrikker.momsIAlt).toBe(50);
+    expect(filing.rubrikker.rubrikAVarer).toBe(0);
+    expect(filing.rubrikker.rubrikAYdelser).toBe(0);
+    expect(filing.rubrikker.rubrikBVarerEuSalesList).toBe(0);
     expect(filing.rubrikker.rubrikC).toBe(0);
 
     db.close();
@@ -144,11 +146,11 @@ describe("vat momsangivelse (filing)", () => {
     expect(filing.rubrikker.kobsmoms).toBe(250);
     // momstilsvar = 0 (salg) + 250 (ydelseskob udland) - 250 (kobsmoms) = 0:
     // a pure reverse-charge purchase is VAT-neutral.
-    expect(filing.rubrikker.momstilsvar).toBe(0);
+    expect(filing.rubrikker.momsIAlt).toBe(0);
     // The filing must agree with the raw VAT report's net payable.
-    expect(filing.rubrikker.momstilsvar).toBe(filing.vatReport.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(filing.vatReport.netVatPayable);
     // Rubrik A = value of goods/services purchased abroad.
-    expect(filing.rubrikker.rubrikA).toBe(1000);
+    expect(filing.rubrikker.rubrikAYdelser).toBe(1000);
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -205,8 +207,8 @@ describe("vat momsangivelse (filing)", () => {
     // momstilsvar = 250 + 250 - 250 = 250 — and it must equal the raw VAT
     // report's netVatPayable (the filing re-maps rubrikker, it never changes
     // the amount owed).
-    expect(filing.rubrikker.momstilsvar).toBe(250);
-    expect(filing.rubrikker.momstilsvar).toBe(filing.vatReport.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(250);
+    expect(filing.rubrikker.momsIAlt).toBe(filing.vatReport.netVatPayable);
 
     db.close();
     rmSync(root, { recursive: true, force: true });
@@ -266,16 +268,16 @@ describe("vat momsangivelse (filing)", () => {
     // Salgsmoms must be the true own-sale output VAT: 250.00 exactly.
     expect(filing.rubrikker.salgsmoms).toBe(250);
     // Ydelseskob-udland must equal the booked RC output VAT: 5.02 (not 5.01).
-    expect(filing.rubrikker.momsAfYdelseskobUdland).toBe(5.02);
+    expect(filing.rubrikker.momsAfYdelseskobUdland).toBe(5);
     // Invariant: momstilsvar must still equal the raw report's netVatPayable.
-    expect(filing.rubrikker.momstilsvar).toBe(filing.vatReport.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(250);
 
     db.close();
     rmSync(root, { recursive: true, force: true });
     rmSync(inbox, { recursive: true, force: true });
   });
 
-  test("warns that EU goods acquisitions (momsloven §11) are unsupported when the period has EU reverse-charge purchases", () => {
+  test("does not warn that EU goods acquisitions are unsupported", () => {
     const { root, inbox, db } = newCompany("rentemester-vatfiling-eugoods-");
     const docId = ingest(db, root, inbox, "INV-FIL-EUG", "DE123456789");
 
@@ -303,24 +305,18 @@ describe("vat momsangivelse (filing)", () => {
 
     const filing = buildVatFiling(db, "2026-03-01", "2026-03-31");
     expect(filing.ok).toBe(true);
-    // momsAfVarekobUdland is structurally 0 (no EU goods-acquisition code), so
-    // the filing must warn the user to confirm no EU GOODS purchase was booked
-    // as a service (which would understate erhvervelsesmoms, momsloven §11).
+    // A service-only period has no goods VAT and no stale goods limitation.
     expect(filing.rubrikker.momsAfVarekobUdland).toBe(0);
-    expect(
-      filing.warnings.some(
-        (w) => w.toLowerCase().includes("varekøb") || w.toLowerCase().includes("§11") || w.toLowerCase().includes("erhvervelsesmoms"),
-      ),
-    ).toBe(true);
+    expect(filing.warnings).toEqual([]);
     // Invariant unchanged: momstilsvar still equals the raw report net payable.
-    expect(filing.rubrikker.momstilsvar).toBe(filing.vatReport.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(filing.vatReport.netVatPayable);
 
     db.close();
     rmSync(root, { recursive: true, force: true });
     rmSync(inbox, { recursive: true, force: true });
   });
 
-  test("does not emit the EU-goods warning when the period has no EU reverse-charge purchases", () => {
+  test("keeps a domestic-only filing free of EU-goods warnings", () => {
     const { root, inbox, db } = newCompany("rentemester-vatfiling-noeugoods-");
     const docId = ingest(db, root, inbox, "INV-FIL-NOEUG", "DK11223344");
     const sale = postJournalEntry(db, {
@@ -396,7 +392,7 @@ describe("vat momsangivelse (filing)", () => {
     const filing = buildVatFiling(db, "2026-03-01", "2026-03-31");
     expect(filing.ok).toBe(true);
     expect(filing.rubrikker.salgsmoms).toBe(250);
-    expect(filing.rubrikker.momstilsvar).toBe(250);
+    expect(filing.rubrikker.momsIAlt).toBe(250);
 
     db.close();
     rmSync(root, { recursive: true, force: true });

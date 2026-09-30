@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "bun:test";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PayablesView } from "./PayablesView";
@@ -70,7 +70,7 @@ describe("PayablesView — Leverandørfaktura-arbejdsbordet", () => {
     await screen.findByRole("heading", { name: "Acme ApS" });
     await userEvent.click(screen.getByRole("button", { name: "Forfaldne" }));
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const lastUrl = String(calls[calls.length - 1]![0]);
       expect(lastUrl).toContain("status=overdue");
     });
@@ -86,6 +86,30 @@ describe("PayablesView — Leverandørfaktura-arbejdsbordet", () => {
     expect(
       screen.getByRole("dialog", { name: "Registrér leverandørfaktura" }),
     ).toBeInTheDocument();
+  });
+
+  test("direct bank purchase correction is reviewed before confirmed apply", async () => {
+    mockFetch({
+      "GET /api/companies/acme-aps/payables": { payables: payables() },
+      "POST /api/companies/acme-aps/payables/direct-bank-correction/plan": { plan: { documentId:201,bankTransactionId:777,billDate:"2026-05-01",dueDate:"2026-05-01",expenseAccountNo:"3000",vatTreatment:"standard",schemaVersion:"rentemester-direct-bank-purchase-payable-correction-v1",planHash:"a".repeat(64),documentHash:"b".repeat(64),originalJournalHash:"c".repeat(64),originalJournalEntryId:9,bankDate:"2026-05-03",bankAmount:625 } },
+      "POST /api/companies/acme-aps/payables/direct-bank-correction/apply": { correction: { ok:true,id:1 } },
+    });
+    renderView();
+    await screen.findByRole("heading",{name:"Acme ApS"});
+    await userEvent.click(screen.getByRole("button",{name:"Ret direkte bankkøb"}));
+    const dialog=screen.getByRole("dialog",{name:"Ret direkte bankkøb"});
+    await userEvent.type(within(dialog).getByLabelText("Banktransaktions-id"),"777");
+    await userEvent.click(within(dialog).getByRole("button",{name:"Opret plan"}));
+    expect(await within(dialog).findByText(/Bankdato 2026-05-03/)).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button",{name:"Bekræft korrektion"}));
+    await waitFor(()=>{
+      const calls=(globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
+      const apply=calls.find(call=>String(call[0]).endsWith("/direct-bank-correction/apply"));
+      expect(apply).toBeTruthy();
+      const init=apply![1] as {body:string;headers:Record<string,string>};
+      expect(JSON.parse(init.body)).toMatchObject({documentId:201,bankTransactionId:777,planHash:"a".repeat(64),confirm:true});
+      expect(init.headers["idempotency-key"]).toBeTruthy();
+    });
   });
 
   test("the per-row Markér betalt action opens the pay confirm dialog", async () => {
@@ -167,7 +191,7 @@ describe("PayablesView — Leverandørfaktura-arbejdsbordet", () => {
       within(dialog).getByRole("button", { name: "Markér betalt" }),
     );
     await waitFor(() => {
-      const calls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mock.calls;
       const post = calls.find(
         (c) =>
           String(c[0]).includes("/payables/11/pay") &&

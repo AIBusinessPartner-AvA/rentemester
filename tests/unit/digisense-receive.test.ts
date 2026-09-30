@@ -56,12 +56,12 @@ function xmlFor(internalId: string): string {
   <cbc:DocumentCurrencyCode>DKK</cbc:DocumentCurrencyCode>
   <cac:AccountingSupplierParty><cac:Party>
     <cac:PartyName><cbc:Name>Leverandør ApS</cbc:Name></cac:PartyName>
-    <cac:PostalAddress><cbc:StreetName>Leverandørvej 2</cbc:StreetName></cac:PostalAddress>
+    <cac:PostalAddress><cbc:AddressFormatCode>Unstructured</cbc:AddressFormatCode><cac:AddressLine><cbc:Line>Leverandørvej 2</cbc:Line></cac:AddressLine></cac:PostalAddress>
     <cac:PartyTaxScheme><cbc:CompanyID>DK98765432</cbc:CompanyID></cac:PartyTaxScheme>
   </cac:Party></cac:AccountingSupplierParty>
   <cac:AccountingCustomerParty><cac:Party>
     <cac:PartyName><cbc:Name>Min Virksomhed ApS</cbc:Name></cac:PartyName>
-    <cac:PostalAddress><cbc:StreetName>Testvej 1</cbc:StreetName></cac:PostalAddress>
+    <cac:PostalAddress><cbc:AddressFormatCode>Unstructured</cbc:AddressFormatCode><cac:AddressLine><cbc:Line>Testvej 1</cbc:Line></cac:AddressLine></cac:PostalAddress>
     <cac:PartyTaxScheme><cbc:CompanyID>DK12345678</cbc:CompanyID></cac:PartyTaxScheme>
   </cac:Party></cac:AccountingCustomerParty>
   <cac:TaxTotal><cbc:TaxAmount currencyID="DKK">250.00</cbc:TaxAmount></cac:TaxTotal>
@@ -192,6 +192,7 @@ describe("pollDigisenseReceived — MODTAG happy path", () => {
 
       const result = await pollDigisenseReceived(db, root, client, downloader, {
         companyKey: "ck-abc",
+        actor: { createdBy: "agent:workspace-poller", createdByProgram: "rentemester-mcp" },
       });
 
       expect(result.ok).toBe(true);
@@ -242,6 +243,10 @@ describe("pollDigisenseReceived — MODTAG happy path", () => {
         .query("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'digisense_document_received'")
         .get() as { n: number };
       expect(audit.n).toBe(1);
+      const actors = db
+        .query("SELECT DISTINCT actor FROM audit_log WHERE event_type IN ('document_ingest', 'digisense_document_received')")
+        .all() as Array<{ actor: string }>;
+      expect(actors).toEqual([{ actor: "agent:workspace-poller via rentemester-mcp" }]);
     } finally {
       db.close();
       rmSync(root, { recursive: true, force: true });

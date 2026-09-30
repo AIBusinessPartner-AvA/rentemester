@@ -3,18 +3,21 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
-import { ingestDocument, type DocumentMetadata } from "../../core/documents";
-import { resolveDocumentMasterData } from "../../core/master-data";
-import type { SupplierIdentifierKind } from "../../core/supplier-identity";
+import { applyPurchaseVatPreflight } from "../../cli/purchase-vat-preflight";
+import { parseRegisteredPdfBatch, parseRegisteredPdfDocument, planCurrentPdfParses } from "../../core/document-pdf-parser";
+import { type DocumentMetadata, ingestDocumentAsync } from "../../core/documents";
 import {
   bookExpenseFromBank,
   type ExpenseVatTreatment,
 } from "../../core/expense-booking";
+import { removePathWithRetry } from "../../core/fs-cleanup";
+import { resolveDocumentMasterData } from "../../core/master-data";
+import type { SupplierIdentifierKind } from "../../core/supplier-identity";
+import { withCockpitActor } from "../actor";
 import type { ServerConfig } from "../config";
 import { ApiError } from "../errors";
-import { withCockpitActor } from "../actor";
+import { extractDocumentInvoice, invoiceExtractionSurface } from "../invoice-extraction-surface";
 import { withCompanyMutation } from "../mutations";
-import { removePathWithRetry } from "../../core/fs-cleanup";
 import {
   MAX_UPLOAD_BODY_BYTES,
   okResponse,
@@ -23,6 +26,39 @@ import {
   requireBodyPositiveInt,
   requireBodyString,
 } from "./_shared";
+
+/** The write boundary returns operational facts, never parser pages/layout. */
+function parseSummary(run: any, documentId?: number) {
+  return {
+    documentId, status: run?.status, errorCode: run?.errorCode ?? null,
+    cached: Boolean(run?.cached), pageCount: Array.isArray(run?.pages) ? run.pages.length : 0,
+    itemCount: Array.isArray(run?.pages) ? run.pages.reduce((n: number, p: any) => n + (p.layout?.length ?? 0), 0) : 0,
+    textLength: Array.isArray(run?.pages) ? run.pages.reduce((n: number, p: any) => n + (p.text?.length ?? 0), 0) : 0,
+    resultHash: run?.resultHash,
+  };
+}
+
+/** Parse routes are explicit opt-in: ingest never invokes this service. */
+export async function handleDocumentPdfParse(config: ServerConfig, request: Request, slug: string, idRaw: string): Promise<Response> {
+  const documentId = Number(idRaw); if (!Number.isInteger(documentId) || documentId <= 0) throw ApiError.badRequest("document id must be a positive integer");
+  const result = await withCompanyMutation(request, config, slug, async ({ db, actor, companyRoot }) => {
+    try { return { ok: true, parse: parseSummary(await parseRegisteredPdfDocument(db, companyRoot, { documentId, createdBy: actor.createdBy, createdByProgram: actor.createdByProgram }), documentId) }; }
+    catch { return { ok: false, errors: ["PDF_PARSE_FAILED"] }; }
+  }, { requireConfirm: true });
+  return okResponse(result.ok ? { parse: result.parse } : { errors: ["PDF_PARSE_FAILED"] });
+}
+
+export async function handleDocumentPdfParsePending(config: ServerConfig, request: Request, slug: string): Promise<Response> {
+  const result = await withCompanyMutation(request, config, slug, async ({ db, actor, companyRoot }, body) => {
+    const limit = body.limit === undefined ? 100 : Number(body.limit); if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw ApiError.badRequest("limit must be an integer between 1 and 100");
+    const cursor = body.cursor === undefined ? 0 : Number(body.cursor); if (!Number.isInteger(cursor) || cursor < 0) throw ApiError.badRequest("cursor must be a non-negative integer");
+    const plan=planCurrentPdfParses(db,{limit,cursor});
+    const parses = await parseRegisteredPdfBatch(db, companyRoot, plan.documentIds, { createdBy: actor.createdBy, createdByProgram: actor.createdByProgram });
+    const failed = parses.filter((entry: any) => !entry.ok);
+    return { ok: true, batch: { requested: plan.documentIds.length, parsed: parses.length - failed.length, failed: failed.length, cursor:plan.cursor, nextCursor:plan.nextCursor, resume: failed.length ? { documentIds: failed.map((entry: any) => entry.documentId) } : null } };
+  }, { requireConfirm: true });
+  return okResponse({ batch: result.batch });
+}
 
 /**
  * Parses + validates the `metadata` body field into a core `DocumentMetadata`.
@@ -96,10 +132,11 @@ function parseDocumentMetadata(raw: unknown): DocumentMetadata {
   if (
     documentType !== undefined &&
     documentType !== "purchase_sale" &&
-    documentType !== "cash_register_receipt"
+    documentType !== "cash_register_receipt" &&
+    documentType !== "internal_voucher"
   ) {
     throw ApiError.badRequest(
-      "metadata.documentType must be 'purchase_sale' or 'cash_register_receipt'",
+      "metadata.documentType must be 'purchase_sale', 'cash_register_receipt' or 'internal_voucher'",
     );
   }
   const exemptionCode = m.exemptionCode;
@@ -125,6 +162,23 @@ function parseDocumentMetadata(raw: unknown): DocumentMetadata {
       return { classification: item.classification as any, netAmount: item.netAmount, ...(item.vatAmount === undefined ? {} : { vatAmount: item.vatAmount as number }) };
     });
   }
+  const rawWordingEvidence = m.reverseChargeWordingEvidence;
+  let reverseChargeWordingEvidence: DocumentMetadata["reverseChargeWordingEvidence"];
+  if (rawWordingEvidence !== undefined) {
+    if (!rawWordingEvidence || typeof rawWordingEvidence !== "object" || Array.isArray(rawWordingEvidence)) throw ApiError.badRequest("metadata.reverseChargeWordingEvidence must be an object");
+    const evidence = rawWordingEvidence as Record<string, unknown>;
+    if (typeof evidence.excerpt !== "string" || typeof evidence.location !== "string") throw ApiError.badRequest("metadata.reverseChargeWordingEvidence requires excerpt and location strings");
+    reverseChargeWordingEvidence = { excerpt: evidence.excerpt, location: evidence.location };
+  }
+  const rawExternalEvidence = m.externalAccountingEvidence;
+  let externalAccountingEvidence: DocumentMetadata["externalAccountingEvidence"];
+  if (rawExternalEvidence !== undefined) {
+    if (!rawExternalEvidence || typeof rawExternalEvidence !== "object" || Array.isArray(rawExternalEvidence)) throw ApiError.badRequest("metadata.externalAccountingEvidence must be an object");
+    const evidence = rawExternalEvidence as Record<string, unknown>;
+    const totals = evidence.totals;
+    if (evidence.category !== "payroll" || typeof evidence.accountingPeriod !== "string" || typeof evidence.externalReference !== "string" || !totals || typeof totals !== "object" || Array.isArray(totals) || typeof (totals as Record<string, unknown>).debitAmount !== "number" || typeof (totals as Record<string, unknown>).creditAmount !== "number") throw ApiError.badRequest("metadata.externalAccountingEvidence requires payroll category, period, reference and numeric totals");
+    externalAccountingEvidence = { category: "payroll", accountingPeriod: evidence.accountingPeriod, externalReference: evidence.externalReference, totals: { debitAmount: (totals as Record<string, number>).debitAmount, creditAmount: (totals as Record<string, number>).creditAmount } };
+  }
 
   return {
     source,
@@ -139,8 +193,17 @@ function parseDocumentMetadata(raw: unknown): DocumentMetadata {
     vatAmount: num("vatAmount"),
     purchaseVatLines,
     reverseChargeWordingConfirmed: bool("reverseChargeWordingConfirmed"),
+    reverseChargeWordingEvidence,
+    danishSimplifiedPurchaseInvoice: bool("danishSimplifiedPurchaseInvoice"),
+    incompleteStandardPurchaseInvoice: bool("incompleteStandardPurchaseInvoice"),
     paymentDetails: str("paymentDetails"),
     exemptionCode: (exemptionCode ?? undefined) as DocumentMetadata["exemptionCode"],
+    sourceBankTransactionId: num("sourceBankTransactionId"),
+    internalVoucherKind: str("internalVoucherKind") as DocumentMetadata["internalVoucherKind"],
+    legacyOpeningJournalEntryId: num("legacyOpeningJournalEntryId"),
+    legacyOpeningJournalLineId: num("legacyOpeningJournalLineId"),
+    accountingRationale: str("accountingRationale"),
+    externalAccountingEvidence,
   };
 }
 
@@ -168,7 +231,7 @@ export async function handleDocumentIngest(
     request,
     config,
     slug,
-    (ctx, body) => {
+    async (ctx, body) => {
       const fileName = requireBodyString(body, "fileName");
       const fileBase64 = requireBodyString(body, "fileBase64");
       const metadata = parseDocumentMetadata(body.metadata);
@@ -207,14 +270,27 @@ export async function handleDocumentIngest(
         if (!resolved.ok) {
           return { ok: false, errors: resolved.errors ?? ["master-data resolution failed"] };
         }
-        const ingested = ingestDocument(ctx.db, ctx.companyRoot, filePath, resolved.metadata, {
+        const ingested = await ingestDocumentAsync(ctx.db, ctx.companyRoot, filePath, resolved.metadata, {
           forceDuplicateLogicalIdentity: force,
+          createdBy: ctx.actor.createdBy,
+          createdByProgram: ctx.actor.createdByProgram,
+          // Hosted composition injects this only after validating the
+          // deployment scanner contract. Local CLI/cockpit remains explicitly
+          // scanner-off; a required policy with no runtime provider fails
+          // closed in the core rather than accepting an unscanned upload.
+          scannerPolicy: config.documentScannerPolicy ?? "off",
+          scanner: config.documentScanner,
+          scannerTimeoutMs: config.hostedDocumentScanning?.provider?.timeoutMs,
         });
+        const extraction = ingested.ok && ingested.documentId && config.invoiceExtractor
+          ? await extractDocumentInvoice(ctx.db, ctx.companyRoot, ingested.documentId, config.invoiceExtractor, ctx.actor.createdBy)
+          : undefined;
         return {
           ok: ingested.ok,
           errors: ingested.errors,
           documentId: ingested.documentId,
           documentNo: ingested.documentNo,
+          ...(extraction ? { extraction: invoiceExtractionSurface(ctx.db, ingested.documentId!) } : {}),
         };
       } finally {
         removePathWithRetry(tmpDir);
@@ -225,8 +301,8 @@ export async function handleDocumentIngest(
 
   return okResponse({
     document: {
-      id: result.documentId ?? null,
-      documentNo: result.documentNo ?? null,
+      id: result.ok ? result.documentId ?? null : null,
+      documentNo: result.ok ? result.documentNo ?? null : null,
     },
   });
 }
@@ -328,4 +404,15 @@ export async function handleDocumentBookExpense(
       fxRateToDkk: result.fxRateToDkk ?? null,
     },
   });
+}
+
+/** POST /documents/:id/vat-preflight/apply — actor-attributed provider call. */
+export async function handleDocumentVatPreflightApply(config: ServerConfig, request: Request, slug: string, idRaw: string): Promise<Response> {
+  const documentId = Number(idRaw);
+  if (!Number.isInteger(documentId) || documentId <= 0) throw ApiError.badRequest("document id must be a positive integer");
+  const result = await withCompanyMutation(request, config, slug, async (ctx) => {
+    const preflight = await applyPurchaseVatPreflight(ctx.db, documentId, ctx.actor.createdBy);
+    return { ok: preflight.ok, errors: preflight.errors, preflight };
+  }, { requireConfirm: true });
+  return okResponse({ preflight: result.preflight });
 }

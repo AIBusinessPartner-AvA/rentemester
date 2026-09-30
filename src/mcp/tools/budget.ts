@@ -12,9 +12,14 @@
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import { setBudget, listBudget, buildBudgetVsActual } from "../../core/budget";
-import { buildLiquidityForecast } from "../../core/liquidity-forecast";
+import { buildLiquidityForecast, buildThirteenWeekLiquidityForecast } from "../../core/liquidity-forecast";
+import { buildWorkspaceThirteenWeekLiquidityForecast } from "../../core/intercompany-liquidity";
+import { resolveConfiguredWorkspaceRoot, listWorkspaceCompanies, companyRootForSlug } from "../../core/workspace";
+import { openWorkspaceControlReadOnlyDb, workspaceControlPaths } from "../../core/workspace-control";
+import { isValidIsoDate } from "../../core/dates";
 import { envelopeShape, wrapCoreResult } from "../envelope";
 import { withCompanyDb, withCompanyDbConfirmed, confirmField } from "../tool-runtime";
 
@@ -136,4 +141,6 @@ export function registerBudgetTools(server: McpServer): void {
       return wrapCoreResult(result);
     }),
   );
+
+  server.registerTool("liquidity_forecast_13_week", { title:"Source-linked 13-week liquidity forecast", description:"Read-only weekly cash forecast. `closingCash` is canonical-base cash; `scenarioClosingCash` adds only dated reviewed assumptions. Monthly account budgets without a payment date stay informational. VAT is canonical only when filing-safe and closed/reported; payment settlement remains explicitly unknown. Non-DKK remains excluded without dated FX.", inputSchema:{company:z.string().min(1),startDate:z.string().min(1),weeks:z.number().int().min(1).max(13).optional()},outputSchema:envelopeShape,annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false}}, withCompanyDb<{company:string;startDate:string;weeks?:number}>(server,({db,args})=>{const workspace=resolveConfiguredWorkspaceRoot();if(!workspace||!isValidIsoDate(args.startDate))return wrapCoreResult(buildThirteenWeekLiquidityForecast(db,{startDate:args.startDate,weeks:args.weeks}));const entry=listWorkspaceCompanies(workspace).find(item=>item.slug===args.company||companyRootForSlug(workspace,item.slug)===args.company);if(!entry)return wrapCoreResult(buildThirteenWeekLiquidityForecast(db,{startDate:args.startDate,weeks:args.weeks}));const control=existsSync(workspaceControlPaths(workspace).db)?openWorkspaceControlReadOnlyDb(workspace):null;try{return wrapCoreResult(buildWorkspaceThirteenWeekLiquidityForecast(control,db,entry.slug,args.startDate,args.weeks));}finally{control?.close();}}));
 }

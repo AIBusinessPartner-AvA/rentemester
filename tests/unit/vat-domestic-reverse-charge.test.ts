@@ -17,8 +17,9 @@ import { issueCreditNote } from "../../src/core/credit-notes";
 import { seedAccounts, verifyAuditChain } from "../../src/core/ledger";
 import { buildVatReport } from "../../src/core/vat";
 import { buildVatFiling } from "../../src/core/vat-filing";
+import { recordVatFilingEvidence } from "../../src/core/vat-filing-evidence";
 import { buildViesRecapitulativeStatement } from "../../src/core/vat-vies-list";
-import { closeAccountingPeriod } from "../../src/core/periods";
+import { closeAccountingPeriod } from "../helpers/close-period";
 import { storeViesValidation } from "../../src/core/vies";
 
 function newDb() {
@@ -33,8 +34,6 @@ function cacheVies(db: ReturnType<typeof openDb>) {
   storeViesValidation(db, {
     vatOrCvr: "DE123456789",
     valid: true,
-    validatedAt: "2026-05-15T00:00:00.000Z",
-    expiresAt: "2026-08-15T00:00:00.000Z",
     rawResponse: JSON.stringify({ valid: true }),
   });
 }
@@ -109,10 +108,10 @@ describe("domestic vs foreign reverse-charge VAT rubrik placement (JUR-2/KODE-2)
     const filing = buildVatFiling(db, "2026-01-01", "2026-03-31");
     expect(filing.ok).toBe(true);
     // Domestic §46 -> rubrik C, NOT rubrik B.
-    expect(filing.rubrikker.rubrikB).toBe(0);
+    expect(filing.rubrikker.rubrikBVarerEuSalesList).toBe(0);
     expect(filing.rubrikker.rubrikC).toBe(1000);
     // Momsfri salg: påvirker ikke tilsvaret.
-    expect(filing.rubrikker.momstilsvar).toBe(report.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(report.netVatPayable);
 
     const vies = buildViesRecapitulativeStatement(db, "2026-01-01", "2026-03-31");
     expect(vies.ok).toBe(true);
@@ -138,11 +137,13 @@ describe("domestic vs foreign reverse-charge VAT rubrik placement (JUR-2/KODE-2)
     expect(report.domesticReverseChargeSalesBase).toBe(0);
 
     closeQuarter(db);
+    expect(buildVatFiling(db, "2026-01-01", "2026-03-31")).toMatchObject({ ok: false, errors: [expect.stringContaining("classification")] });
+    expect(recordVatFilingEvidence(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31", fieldName: "rubrikBVarerEuSalesList", amountDkk: 2000, evidenceRef: "synthetic EU sales-list evidence", actor: "agent:test", principal: "user:test", confirm: true }).ok).toBe(true);
     const filing = buildVatFiling(db, "2026-01-01", "2026-03-31");
     expect(filing.ok).toBe(true);
-    expect(filing.rubrikker.rubrikB).toBe(2000);
+    expect(filing.rubrikker.rubrikBVarerEuSalesList).toBe(2000);
     expect(filing.rubrikker.rubrikC).toBe(0);
-    expect(filing.rubrikker.momstilsvar).toBe(report.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(report.netVatPayable);
 
     const vies = buildViesRecapitulativeStatement(db, "2026-01-01", "2026-03-31");
     expect(vies.invoiceCount).toBe(1);
@@ -150,6 +151,28 @@ describe("domestic vs foreign reverse-charge VAT rubrik placement (JUR-2/KODE-2)
     expect(vies.customers[0]).toMatchObject({ vatNumber: "DE123456789", totalValue: 2000 });
 
     expect(verifyAuditChain(db).ok).toBe(true);
+    db.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("EU-sales-list evidence cannot be hidden in the non-list B-goods field", () => {
+    const { root, db } = newDb();
+    cacheVies(db);
+    const issued = issueForeign(db, root, "2026-0001", 2000);
+    expect(issued.ok).toBe(true);
+    expect(postIssuedInvoiceToLedger(db, { invoiceDocumentId: issued.documentId! }).ok).toBe(true);
+    closeQuarter(db);
+
+    expect(recordVatFilingEvidence(db, {
+      periodStart: "2026-01-01", periodEnd: "2026-03-31",
+      fieldName: "rubrikBVarerIkkeEuSalesList", amountDkk: 2000,
+      evidenceRef: "synthetic non-list classification", actor: "agent:test", principal: "user:test", confirm: true,
+    }).ok).toBe(true);
+
+    expect(buildVatFiling(db, "2026-01-01", "2026-03-31")).toMatchObject({
+      ok: false,
+      errors: [expect.stringContaining("EU-sales-list total")],
+    });
     db.close();
     rmSync(root, { recursive: true, force: true });
   });
@@ -173,12 +196,13 @@ describe("domestic vs foreign reverse-charge VAT rubrik placement (JUR-2/KODE-2)
     expect(report.reverseChargeSalesBase).toBe(4000);
 
     closeQuarter(db);
+    expect(recordVatFilingEvidence(db, { periodStart: "2026-01-01", periodEnd: "2026-03-31", fieldName: "rubrikBVarerEuSalesList", amountDkk: 3000, evidenceRef: "synthetic EU sales-list evidence", actor: "agent:test", principal: "user:test", confirm: true }).ok).toBe(true);
     const filing = buildVatFiling(db, "2026-01-01", "2026-03-31");
     expect(filing.ok).toBe(true);
-    expect(filing.rubrikker.rubrikB).toBe(3000);
+    expect(filing.rubrikker.rubrikBVarerEuSalesList).toBe(3000);
     expect(filing.rubrikker.rubrikC).toBe(1000);
-    expect(filing.rubrikker.momstilsvar).toBe(report.netVatPayable);
-    expect(filing.rubrikker.momstilsvar).toBe(0);
+    expect(filing.rubrikker.momsIAlt).toBe(report.netVatPayable);
+    expect(filing.rubrikker.momsIAlt).toBe(0);
 
     const vies = buildViesRecapitulativeStatement(db, "2026-01-01", "2026-03-31");
     expect(vies.invoiceCount).toBe(1);

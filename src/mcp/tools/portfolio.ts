@@ -29,7 +29,7 @@ import { createCompany, getCompanySettings } from "../../core/company";
 import { companyPaths } from "../../core/paths";
 import { vatPeriodWindowFor } from "../../core/periods";
 import { diffDaysSafe as daysBetween } from "../../core/dates";
-import { openDb, migrate } from "../../core/db";
+import { inspectOpenLedger, openLedgerReadOnly } from "../../core/ledger-inspection";
 import { verifyAuditChain } from "../../core/ledger";
 import { buildInvoiceList } from "../../core/invoice-list";
 import { listExceptions } from "../../core/exceptions";
@@ -37,7 +37,8 @@ import { buildVatReport } from "../../core/vat";
 import { getBackupComplianceStatus } from "../../core/system-backups";
 import {
   companyRootForSlug,
-  listWorkspaceCompanies,
+  requireCanonicalLiveCompanies,
+  WorkspaceCanonicalityError,
   resolveConfiguredWorkspaceRoot,
   resolveWorkspaceRoot,
 } from "../../core/workspace";
@@ -79,9 +80,9 @@ function todayIsoDate(): string {
 }
 
 /**
- * Builds the juxtaposed status row for a single company. Opens, migrates and
- * closes the company's ledger; failures are captured per-company so one broken
- * volume never sinks the whole overview.
+ * Builds the juxtaposed status row for a single company. It opens an existing
+ * snapshot only; failures are captured per-company so one broken volume never
+ * sinks the whole overview.
  */
 function companyStatusRow(
   slug: string,
@@ -94,9 +95,12 @@ function companyStatusRow(
   if (!existsSync(dbPath)) {
     return { ...base, ok: false, error: "company ledger not found on disk" };
   }
-  const db = openDb(dbPath);
+  const db = openLedgerReadOnly(dbPath);
   try {
-    migrate(db);
+    const schema = inspectOpenLedger(db);
+    if (schema.status !== "current") {
+      return { ...base, ok: false, error: `schema_${schema.status}` };
+    }
     const settings = getCompanySettings(db);
     // The VAT period window follows the company's real SKAT cadence
     // (`vatPeriodType`) — a monthly filer gets a one-month window, a
@@ -131,7 +135,7 @@ function companyStatusRow(
     const overdue = buildInvoiceList(db, { status: "overdue", asOfDate });
     const exceptions = listExceptions(db, { status: "open" });
     const backup = getBackupComplianceStatus(db, companyRoot, asOfDate);
-    const audit = verifyAuditChain(db);
+    const audit = verifyAuditChain(db, { companyRoot });
     const openReceivables = open.rows.reduce((acc, r) => acc + r.openBalance, 0);
     return {
       ...base,
@@ -303,22 +307,24 @@ export function registerPortfolioTools(server: McpServer): void {
         return envelopeToCallResult(errorEnvelope(redactPaths(ws.error)));
       }
       const asOfDate = args.asOf ?? todayIsoDate();
-      let registered;
+      let canonical: ReturnType<typeof requireCanonicalLiveCompanies>;
       try {
-        registered = listWorkspaceCompanies(ws.root);
+        canonical = requireCanonicalLiveCompanies(ws.root);
       } catch (error) {
+        if (error instanceof WorkspaceCanonicalityError) {
+          return envelopeToCallResult(errorEnvelope(error.message, { code: "WORKSPACE_CANONICALITY_FAILED" }));
+        }
         const message = error instanceof Error ? error.message : String(error);
         return envelopeToCallResult(errorEnvelope(redactPaths(message)));
       }
-      const active = registered.filter((c) => !c.archived);
-      const companies = active
+      const companies = canonical
         .slice()
-        .sort((a, b) => a.slug.localeCompare(b.slug))
-        .map((entry) =>
+        .sort((a, b) => a.entry.slug.localeCompare(b.entry.slug))
+        .map((item) =>
           companyStatusRow(
-            entry.slug,
-            entry.name,
-            companyRootForSlug(ws.root, entry.slug),
+            item.entry.slug,
+            item.entry.name,
+            item.companyRoot,
             asOfDate,
           ),
         );

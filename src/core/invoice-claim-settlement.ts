@@ -35,7 +35,7 @@ function getIncomingClaimBankTransaction(db: Database, input: SettleInvoiceClaim
   }
   const bank = (input.bankTransactionId !== undefined
     ? db.query(`SELECT id, transaction_date, amount, currency, text, reference FROM bank_transactions WHERE id = ?`).get(input.bankTransactionId)
-    : db.query(`SELECT id, transaction_date, amount, currency, text, reference FROM bank_transactions WHERE reference = ? ORDER BY id DESC LIMIT 1`).get(input.bankTransactionReference)) as { id: number; transaction_date: string; amount: number; currency: string | null; text: string; reference: string | null } | null;
+    : db.query(`SELECT id, transaction_date, amount, currency, text, reference FROM bank_transactions WHERE reference = ? ORDER BY id DESC LIMIT 1`).get(input.bankTransactionReference ?? "")) as { id: number; transaction_date: string; amount: number; currency: string | null; text: string; reference: string | null } | null;
   if (!bank) {
     return { error: input.bankTransactionId !== undefined ? `bank transaction ${input.bankTransactionId} does not exist` : `no bank transaction found with reference ${input.bankTransactionReference}` };
   }
@@ -66,7 +66,7 @@ export function settleInvoiceClaimsFromBank(db: Database, input: SettleInvoiceCl
   ).get(input.invoiceDocumentId) as { id: number; invoice_no: string } | null;
   if (!invoice) return { ok: false, appliedRules: [RULE_ID], errors: [`invoice document ${input.invoiceDocumentId} is not an issued invoice`] };
 
-  const existingJournal = db.query(`SELECT id FROM journal_entries WHERE source_bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
+  const existingJournal = db.query(`SELECT journal_entry_id AS id FROM bank_journal_reconciliations WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
   if (existingJournal) return { ok: false, appliedRules: [RULE_ID], errors: [`bank transaction ${bank.id} is already linked to journal entry ${existingJournal.id}`] };
   if (db.query(`SELECT id FROM invoice_claim_payments WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id)) {
     return { ok: false, appliedRules: [RULE_ID], errors: [`bank transaction ${bank.id} is already applied to an invoice claim payment`] };
@@ -201,7 +201,7 @@ export function settleInvoiceClaimsFromBank(db: Database, input: SettleInvoiceCl
         remainingClaimOpenBalance: roundDkk(Number(after.claimOpenBalance ?? 0)),
         appliedRules: [...new Set([RULE_ID, ...(journal.appliedRules ?? [])])],
       };
-    }, { immediate: true })();
+    }).immediate();
     return result;
   } catch (error) {
     const parsed = typeof error === "object" && error && "message" in error ? (() => {

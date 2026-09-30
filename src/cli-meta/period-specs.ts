@@ -2,16 +2,38 @@ import type { CommandSpec } from "./_shared";
 
 export const periodSpecs: CommandSpec[] = [
   {
+    key: "period readiness",
+    usage: "period readiness --company <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD>",
+    description: "Genererer et deterministisk, read-only og hash-bundet periodelukningspacket.",
+    allowedFlags: ["--company", "--from", "--to"],
+    inputNotes: ["Kør derefter 'period review --packet-hash <hash> --confirm yes' for at gemme det eksakte packet. Lukning kræver både --packet-hash og --review-id.", "Packeten navngiver alle kontroller, inklusive passed kontroller med nul observationer."],
+  },
+  {
+    key: "period review",
+    usage: "period review --company <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD> --packet-hash <sha256> --confirm yes",
+    description: "Gemmer den netop beregnede periodelukningspacket som append-only review-evidens. Lukker ikke perioden.",
+    allowedFlags: ["--company", "--from", "--to", "--packet-hash", "--confirm"],
+    inputNotes: ["Kræver actor, den eksakte hash fra 'period readiness' og --confirm yes.", "Returnerer --review-id, som sammen med packet-hash kræves ved 'period close'."],
+  },
+  {
+    key: "period status",
+    usage: "period status --company <path> --review-id <positive integer>",
+    description: "Viser den persistede review-packet uden at genberegne eller ændre ledgeren.",
+    allowedFlags: ["--company", "--review-id"],
+  },
+  {
     key: "period close",
-    usage: "period close --company <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--kind vat_period|fiscal_year|custom] [--status closed|reported] [--reference <text>]",
+    usage: "period close --company <path> --from <YYYY-MM-DD> --to <YYYY-MM-DD> --packet-hash <sha256> --review-id <positive integer> --confirm yes [--kind vat_period|fiscal_year|custom] [--status closed|reported] [--reference <text>] [--force yes --reason <text>]",
     description: "Lukker eller markerer en regnskabsperiode. En lukket periode blokerer ny bogføring med transaktionsdato i perioden — og er en forudsætning for 'vat momsangivelse' og 'report annual'.",
-    allowedFlags: ["--company", "--from", "--to", "--kind", "--status", "--reference"],
+    allowedFlags: ["--company", "--from", "--to", "--packet-hash", "--review-id", "--kind", "--status", "--reference", "--force", "--reason", "--confirm"],
     inputNotes: [
       "--from / --to afgrænser perioden (begge YYYY-MM-DD, inklusive). Perioder af samme --kind må ikke overlappe.",
       "--kind: vat_period (momsperiode for virksomhedens registrerede kadence — kræves af 'vat momsangivelse'), fiscal_year (regnskabsår — kræves af 'report annual'), custom. Standard: vat_period. vat_quarter accepteres kun som legacy-alias.",
       "--status: 'closed' = perioden er afsluttet og bogføringen låst; 'reported' = derudover indberettet til myndigheden (SKAT/Erhvervsstyrelsen). Standard: closed.",
       "Begge statusser låser bogføringen lige hårdt — forskellen er kun om indberetning er sket. Vælg 'reported' når du allerede har indsendt; ellers 'closed'.",
       "--reference: valgfri fri tekst der gemmes på perioden (fx kvittering/journalnummer fra indberetningen).",
+      "--packet-hash og --review-id: PÅKRÆVET eksakt par fra 'period readiness' efterfulgt af 'period review'. En ændring i ledgeren gør pakken stale og lukningen afvises.",
+      "--confirm yes og actor er påkrævet. --force yes kræver desuden en levende owner-authorisation; lokal CLI failer lukket, fordi actor aldrig giver adgang. Åbne forhold gemmes som permanente obligationsposter.",
       "En for tidligt lukket periode kan åbnes igen med 'period reopen' — en kontrolleret, fuldt revisionssporet handling. En 'reported'-periode (indberettet til myndigheden) kan dog ikke åbnes igen.",
     ],
   },

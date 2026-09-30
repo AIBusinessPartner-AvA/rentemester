@@ -1,11 +1,20 @@
 import type { Database } from "bun:sqlite";
 import { getCompanySettings } from "./company";
-import { postJournalEntry, type JournalPostResult } from "./ledger";
-import { postForeignServiceReverseChargePurchase, postRepresentationPurchase } from "./vat";
-import { absDkk, compareDkk, fromOre, normalizeCurrency, percentOfDkk, roundDkk, subtractDkk, toOre } from "./money";
+import { postJournalEntry, postJournalEntryInCurrentTransaction, type JournalLineInput, type JournalPostResult } from "./ledger";
+import {
+  postEuGoodsAcquisitionPurchase,
+  postEuGoodsAcquisitionPurchaseInCurrentTransaction,
+  postForeignServiceReverseChargePurchase,
+  postForeignServiceReverseChargePurchaseInCurrentTransaction,
+  postRepresentationPurchase,
+  postRepresentationPurchaseInCurrentTransaction,
+} from "./vat";
+import { absDkk, compareDkk, fromOre, normalizeCurrency, percentOfDkk, roundDkk, roundRate6, subtractDkk, toOre } from "./money";
 import { resolveAccountRole } from "./account-roles";
 import { parsePurchaseVatLinesPayload, type PurchaseVatLine } from "./documents";
 import { deductibleDanishPurchaseSupplierErrors } from "./supplier-identity";
+import { validSimplifiedPurchaseCompanyContext } from "./document-company-context";
+import { validIncompleteStandardPurchaseVatEvidenceReview } from "./document-purchase-vat-evidence-review";
 
 /**
  * `non_deductible` (DK-VAT-NON-DEDUCTIBLE-001 / Momsloven § 37) is the
@@ -18,6 +27,7 @@ import { deductibleDanishPurchaseSupplierErrors } from "./supplier-identity";
 export type ExpenseVatTreatment =
   | "standard"
   | "reverse_charge"
+  | "eu_goods_acquisition"
   | "representation"
   | "exempt"
   | "non_deductible";
@@ -46,6 +56,10 @@ export type BookExpenseFromBankResult = JournalPostResult & {
   netAmountDkk?: number;
   vatAmountDkk?: number;
   fxRateToDkk?: number;
+  /** Whether the FX rate was imported with the bank row or derived from its DKK settlement. */
+  fxRateSource?: "imported_bank" | "derived_dkk_settlement";
+  /** DKK amount reconstructed from the persisted six-decimal rate minus the settlement. */
+  fxReconstructionDifferenceDkk?: number;
 };
 
 type FxBookingBasis = {
@@ -53,6 +67,8 @@ type FxBookingBasis = {
   grossAmountForeign: number;
   grossAmountDkk: number;
   fxRateToDkk: number;
+  fxRateSource?: "imported_bank" | "derived_dkk_settlement";
+  fxReconstructionDifferenceDkk?: number;
 };
 
 // Internal-only union: "unknown" is never exposed via the public
@@ -105,6 +121,7 @@ function inferVatTreatment(
   // so the core post path refuses it with the § 50 b guidance rather than
   // silently hiding an owed-VAT liability.
   if (defaultVatCode === "EU_SERVICE_REVERSE_CHARGE") return "reverse_charge";
+  if (defaultVatCode === "EU_GOODS_ACQUISITION") return "eu_goods_acquisition";
   if (defaultVatCode === "REPRESENTATION_SPECIAL") {
     return companyIsVatRegistered ? "representation" : "non_deductible";
   }
@@ -139,26 +156,31 @@ function resolveFxBookingBasis(document: { currency: string; amount_inc_vat: num
   }
 
   const bankCurrency = normalizeCurrency(bank.currency);
-  const fxRateToDkk = bank.fx_rate_to_dkk == null ? NaN : Number(bank.fx_rate_to_dkk);
-  if (!(fxRateToDkk > 0)) {
-    if (bankCurrency === "DKK") {
-      return {
-        ok: false,
-        error: "foreign-currency expense booking requires bank amount_dkk and fx_rate_to_dkk for DKK-settled payments; re-import the bank CSV with amount_dkk and fx_rate_to_dkk columns",
-      };
-    }
-    return { ok: false, error: "foreign-currency expense booking requires bank fx_rate_to_dkk" };
-  }
-
-  const expectedAmountDkk = roundDkk(grossAmountForeign * fxRateToDkk);
-
   if (bankCurrency === "DKK") {
     const grossAmountDkk = roundDkk(Math.abs(Number(bank.amount)));
     if (bank.amount_dkk != null && compareDkk(Math.abs(Number(bank.amount_dkk)), grossAmountDkk) !== 0) {
       return { ok: false, error: `bank transaction ${bank.id} amount_dkk ${roundDkk(Math.abs(Number(bank.amount_dkk)))} does not match DKK settlement amount ${grossAmountDkk}` };
     }
+    const importedFxRate = bank.fx_rate_to_dkk == null ? null : Number(bank.fx_rate_to_dkk);
+    if (importedFxRate !== null && !(importedFxRate > 0)) {
+      return { ok: false, error: `bank transaction ${bank.id} fx_rate_to_dkk must be positive when provided` };
+    }
+    const fxRateSource = importedFxRate !== null ? "imported_bank" as const : "derived_dkk_settlement" as const;
+    if (!(grossAmountForeign > 0)) return { ok: false, error: `document foreign gross amount must be positive to derive DKK settlement FX rate` };
+    // A DKK bank row is itself the settlement evidence. When the import did
+    // not include a rate, derive one once and retain precisely the six-decimal
+    // value that journal metadata persists. Reject rates whose stored precision
+    // cannot reproduce the settlement to the øre: silently persisting a rate
+    // that changes the documented payment would undermine reconciliation.
+    const fxRateToDkk = importedFxRate !== null
+      ? importedFxRate
+      : roundRate6(grossAmountDkk / grossAmountForeign);
+    const expectedAmountDkk = roundDkk(grossAmountForeign * fxRateToDkk);
+    const fxReconstructionDifferenceDkk = subtractDkk(expectedAmountDkk, grossAmountDkk);
     if (compareDkk(grossAmountDkk, expectedAmountDkk) !== 0) {
-      return { ok: false, error: `bank transaction amount ${grossAmountDkk} DKK does not match document gross amount ${grossAmountForeign} ${currency} at fx_rate_to_dkk ${roundDkk(fxRateToDkk)} (${expectedAmountDkk} DKK)` };
+      return { ok: false, error: fxRateSource === "derived_dkk_settlement"
+        ? `derived fx_rate_to_dkk ${fxRateToDkk} cannot reconstruct DKK settlement ${grossAmountDkk} from document gross amount ${grossAmountForeign} ${currency} (${expectedAmountDkk} DKK)`
+        : `bank transaction amount ${grossAmountDkk} DKK does not match document gross amount ${grossAmountForeign} ${currency} at fx_rate_to_dkk ${roundDkk(fxRateToDkk)} (${expectedAmountDkk} DKK)` };
     }
     return {
       ok: true,
@@ -167,9 +189,15 @@ function resolveFxBookingBasis(document: { currency: string; amount_inc_vat: num
         grossAmountForeign,
         grossAmountDkk,
         fxRateToDkk,
+        fxRateSource,
+        fxReconstructionDifferenceDkk,
       },
     };
   }
+
+  const fxRateToDkk = bank.fx_rate_to_dkk == null ? NaN : Number(bank.fx_rate_to_dkk);
+  if (!(fxRateToDkk > 0)) return { ok: false, error: "foreign-currency expense booking requires bank fx_rate_to_dkk" };
+  const expectedAmountDkk = roundDkk(grossAmountForeign * fxRateToDkk);
 
   if (bankCurrency !== currency) {
     return { ok: false, error: `bank transaction ${bank.id} currency ${bankCurrency} does not match document currency ${currency} or DKK settlement` };
@@ -198,17 +226,23 @@ function resolveFxBookingBasis(document: { currency: string; amount_inc_vat: num
       grossAmountForeign,
       grossAmountDkk,
       fxRateToDkk,
+      fxRateSource: "imported_bank",
+      fxReconstructionDifferenceDkk: subtractDkk(expectedAmountDkk, grossAmountDkk),
     },
   };
 }
 
-export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInput): BookExpenseFromBankResult {
+function bookExpenseFromBankInternal(db: Database, input: BookExpenseFromBankInput, inCurrentTransaction: boolean): BookExpenseFromBankResult {
+  const post = inCurrentTransaction ? postJournalEntryInCurrentTransaction : postJournalEntry;
+  const postForeignService = inCurrentTransaction ? postForeignServiceReverseChargePurchaseInCurrentTransaction : postForeignServiceReverseChargePurchase;
+  const postEuGoods = inCurrentTransaction ? postEuGoodsAcquisitionPurchaseInCurrentTransaction : postEuGoodsAcquisitionPurchase;
+  const postRepresentation = inCurrentTransaction ? postRepresentationPurchaseInCurrentTransaction : postRepresentationPurchase;
   const errors: string[] = [];
   if (!Number.isInteger(input.documentId) || input.documentId <= 0) errors.push("documentId must be a positive integer");
   if (!Number.isInteger(input.bankTransactionId) || input.bankTransactionId <= 0) errors.push("bankTransactionId must be a positive integer");
   if (typeof input.expenseAccountNo !== "string" || input.expenseAccountNo.trim().length === 0) errors.push("expenseAccountNo is required");
-  if (input.vatTreatment && !["standard", "reverse_charge", "representation", "exempt", "non_deductible"].includes(input.vatTreatment)) {
-    errors.push("vatTreatment must be one of standard, reverse_charge, representation, exempt, non_deductible when present");
+  if (input.vatTreatment && !["standard", "reverse_charge", "eu_goods_acquisition", "representation", "exempt", "non_deductible"].includes(input.vatTreatment)) {
+    errors.push("vatTreatment must be one of standard, reverse_charge, eu_goods_acquisition, representation, exempt, non_deductible when present");
   }
   if (errors.length > 0) return { ok: false, appliedRules: [], errors };
 
@@ -223,10 +257,14 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
   if (!account.active) return { ok: false, appliedRules: [], errors: [`account ${input.expenseAccountNo} is inactive`] };
 
   const document = db.query(
-    `SELECT id, document_type, invoice_no, invoice_date, amount_inc_vat, vat_amount, currency, sender_name, payload_json,
-            sender_vat_cvr, supplier_country_code, supplier_identifier_kind, supplier_identity_status
-     FROM documents
-     WHERE id = ?`
+    `SELECT d.id, d.document_type, d.invoice_no, d.invoice_date,
+            d.amount_inc_vat, d.vat_amount, d.currency, d.sender_name,
+            d.payload_json, d.sender_vat_cvr, d.recipient_vat_cvr, d.supplier_country_code,
+            d.supplier_identifier_kind, d.supplier_identity_status,
+            ive.bank_transaction_id AS evidence_bank_transaction_id
+     FROM documents d
+     LEFT JOIN internal_voucher_evidence ive ON ive.document_id = d.id
+     WHERE d.id = ?`
   ).get(input.documentId) as {
     id: number;
     document_type: string;
@@ -238,13 +276,33 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     sender_name: string | null;
     payload_json: string | null;
     sender_vat_cvr: string | null;
+    recipient_vat_cvr: string | null;
     supplier_country_code: string | null;
     supplier_identifier_kind: string | null;
     supplier_identity_status: string | null;
+    evidence_bank_transaction_id: number | null;
   } | null;
   if (!document) return { ok: false, appliedRules: [], errors: [`document ${input.documentId} does not exist`] };
-  if (document.document_type !== "purchase_sale" && document.document_type !== "cash_register_receipt") {
+  if (
+    document.document_type !== "purchase_sale" &&
+    document.document_type !== "cash_register_receipt" &&
+    document.document_type !== "internal_voucher"
+  ) {
     return { ok: false, appliedRules: [], errors: [`document ${input.documentId} is not a purchase document`] };
+  }
+  if (
+    document.document_type === "internal_voucher" &&
+    document.evidence_bank_transaction_id !== input.bankTransactionId
+  ) {
+    return {
+      ok: false,
+      appliedRules: [],
+      errors: [
+        document.evidence_bank_transaction_id === null
+          ? `internal voucher document ${input.documentId} has no bank-statement evidence`
+          : `internal voucher document ${input.documentId} is bound to bank transaction ${document.evidence_bank_transaction_id}, not ${input.bankTransactionId}`,
+      ],
+    };
   }
   const grossAmount = roundDkk(Number(document.amount_inc_vat ?? 0));
   const vatAmount = roundDkk(Number(document.vat_amount ?? 0));
@@ -263,7 +321,7 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
   if (!bank) return { ok: false, appliedRules: [], errors: [`bank transaction ${input.bankTransactionId} does not exist`] };
   if (!(Number(bank.amount) < 0)) return { ok: false, appliedRules: [], errors: [`bank transaction ${input.bankTransactionId} is not an outgoing payment`] };
 
-  const existingJournal = db.query(`SELECT id FROM journal_entries WHERE source_bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
+  const existingJournal = db.query(`SELECT journal_entry_id AS id FROM bank_journal_reconciliations WHERE bank_transaction_id = ? LIMIT 1`).get(bank.id) as { id: number } | null;
   if (existingJournal) return { ok: false, appliedRules: [], errors: [`bank transaction ${bank.id} is already linked to journal entry ${existingJournal.id}`] };
 
   const companySettings = getCompanySettings(db);
@@ -278,6 +336,13 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     };
   }
   const vatTreatment: ExpenseVatTreatment = inferredTreatment;
+  if (document.document_type === "internal_voucher" && vatTreatment !== "exempt") {
+    return {
+      ok: false,
+      appliedRules: [],
+      errors: ["internal voucher expense booking requires explicit vatTreatment exempt"],
+    };
+  }
   if (vatTreatment === "standard" || vatTreatment === "representation") {
     const supplierErrors = deductibleDanishPurchaseSupplierErrors({
       supplierVatOrCvr: document.sender_vat_cvr,
@@ -287,7 +352,36 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     });
     if (supplierErrors.length > 0) return { ok: false, appliedRules: [], errors: supplierErrors };
   }
+  // A stated simplified-invoice fact can only support standard purchase VAT
+  // through a separately hash-bound company context. It never replaces the
+  // supplier identity checks above and ordinary documents get no exception.
+  if (vatTreatment === "standard") {
+    try {
+      const payload = document.payload_json ? JSON.parse(document.payload_json) as Record<string, unknown> : {};
+      if (payload.incompleteStandardPurchaseInvoice === true) {
+        if (!validIncompleteStandardPurchaseVatEvidenceReview(db, input.documentId)) return { ok: false, appliedRules: [], errors: ["incomplete standard invoice requires a valid hash-bound VAT evidence review before input-VAT deduction"] };
+      }
+      const invoiceStatesCompany = typeof document.recipient_vat_cvr === "string" && document.recipient_vat_cvr.trim().length > 0;
+      const contextIsValid = (payload.danishSimplifiedPurchaseInvoice === true && validSimplifiedPurchaseCompanyContext(db, input.documentId))
+        || (payload.incompleteStandardPurchaseInvoice === true && validIncompleteStandardPurchaseVatEvidenceReview(db, input.documentId));
+      if (document.document_type === "purchase_sale" && !invoiceStatesCompany && !contextIsValid) {
+        return { ok: false, appliedRules: [], errors: ["standard purchase VAT requires invoice-stated recipient identity or a valid hash-bound simplified-invoice company context"] };
+      }
+    } catch { return { ok: false, appliedRules: [], errors: ["document payload_json is not valid JSON"] }; }
+  }
   const transactionDate = input.transactionDate ?? bank.transaction_date;
+  if (
+    document.document_type === "internal_voucher" &&
+    transactionDate !== bank.transaction_date
+  ) {
+    return {
+      ok: false,
+      appliedRules: [],
+      errors: [
+        `internal voucher transaction date ${transactionDate} must match bank transaction date ${bank.transaction_date}`,
+      ],
+    };
+  }
   // Posting text is read by a Danish owner — keep it fully Danish. The
   // supplier name is used when known; otherwise fall back to a Danish word.
   const supplierName = document.sender_name?.trim();
@@ -323,6 +417,10 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     grossAmountForeign: fxBasis.basis.grossAmountForeign,
     grossAmountDkk: fxBasis.basis.grossAmountDkk,
     fxRateToDkk: fxBasis.basis.fxRateToDkk,
+    ...(fxBasis.basis.currency === "DKK" ? {} : {
+      fxRateSource: fxBasis.basis.fxRateSource,
+      fxReconstructionDifferenceDkk: fxBasis.basis.fxReconstructionDifferenceDkk,
+    }),
   };
 
   const parsedPurchaseVatLines = parsePurchaseVatLinesPayload(document.payload_json, {
@@ -340,12 +438,12 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     const scale = fxBasis.basis.currency === "DKK" ? 1 : fxBasis.basis.fxRateToDkk;
     const scaledPurchaseVatLines = scalePurchaseVatNetAmounts(purchaseVatLines, scale, grossAmountDkk, vatAmountDkk);
     if (!scaledPurchaseVatLines.ok) return { ok: false, appliedRules: [], errors: [scaledPurchaseVatLines.error] };
-    const lines = scaledPurchaseVatLines.lines.flatMap(({ line, netAmountDkk }) => {
+    const lines: JournalLineInput[] = scaledPurchaseVatLines.lines.flatMap(({ line, netAmountDkk }) => {
       if (line.classification === "dk_purchase_25") return [{ accountNo: account.account_no, debitAmount: netAmountDkk, vatCode: "DK_PURCHASE_25", text: document.invoice_no ?? "Udgift, momspligtigt grundbeløb" }];
       return [{ accountNo: account.account_no, debitAmount: netAmountDkk, vatCode: "DK_PURCHASE_EXEMPT", text: document.invoice_no ?? "Udgift, momsfrit grundbeløb" }];
     });
     lines.push({ accountNo: inputVat!.accountNo, debitAmount: vatAmountDkk, text: "Købsmoms" }, { accountNo: paymentAccountNo, creditAmount: grossAmountDkk, text: bank.text });
-    const result = postJournalEntry(db, { transactionDate, text, documentId: input.documentId, sourceBankTransactionId: input.bankTransactionId, createdBy: input.createdBy, createdByProgram: input.createdByProgram, ...journalMetadata, lines });
+    const result = post(db, { transactionDate, text, documentId: input.documentId, sourceBankTransactionId: input.bankTransactionId, createdBy: input.createdBy, createdByProgram: input.createdByProgram, ...journalMetadata, lines });
     return { ...result, documentId: input.documentId, bankTransactionId: input.bankTransactionId, grossAmount, netAmount: netAmountDkk, vatAmount: vatAmountDkk, vatTreatment, ...fxSummary, netAmountDkk, vatAmountDkk };
   }
 
@@ -369,7 +467,7 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
 
   if (vatTreatment === "standard") {
     if (!(vatAmount > 0)) return { ok: false, appliedRules: [], errors: ["standard expense booking requires document vat_amount > 0"] };
-    const result = postJournalEntry(db, {
+    const result = post(db, {
       transactionDate,
       text,
       documentId: input.documentId,
@@ -388,7 +486,7 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
 
   if (vatTreatment === "reverse_charge") {
     if (vatAmount !== 0) return { ok: false, appliedRules: [], errors: ["reverse-charge expense booking requires document vat_amount = 0"] };
-    const result = postForeignServiceReverseChargePurchase(db, {
+    const result = postForeignService(db, {
       transactionDate,
       text,
       documentId: input.documentId,
@@ -403,9 +501,15 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     return { ...result, documentId: input.documentId, bankTransactionId: input.bankTransactionId, grossAmount, netAmount: grossAmountDkk, vatAmount: 0, vatTreatment, ...fxSummary, netAmountDkk: grossAmountDkk, vatAmountDkk: 0 };
   }
 
+  if (vatTreatment === "eu_goods_acquisition") {
+    if (vatAmount !== 0) return { ok: false, appliedRules: [], errors: ["EU-goods acquisition expense booking requires document vat_amount = 0"] };
+    const result = postEuGoods(db, { transactionDate, text, documentId: input.documentId, netAmount: grossAmountDkk, expenseAccountNo: account.account_no, paymentAccountNo, sourceBankTransactionId: input.bankTransactionId, createdBy: input.createdBy, createdByProgram: input.createdByProgram, ...journalMetadata });
+    return { ...result, documentId: input.documentId, bankTransactionId: input.bankTransactionId, grossAmount, netAmount: grossAmountDkk, vatAmount: 0, vatTreatment, ...fxSummary, netAmountDkk: grossAmountDkk, vatAmountDkk: 0 };
+  }
+
   if (vatTreatment === "representation") {
     if (!(vatAmount > 0)) return { ok: false, appliedRules: [], errors: ["representation expense booking requires document vat_amount > 0"] };
-    const result = postRepresentationPurchase(db, {
+    const result = postRepresentation(db, {
       transactionDate,
       text,
       documentId: input.documentId,
@@ -422,7 +526,7 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
 
   if (vatTreatment === "exempt") {
     if (vatAmount !== 0) return { ok: false, appliedRules: [], errors: ["exempt expense booking requires document vat_amount = 0"] };
-    const result = postJournalEntry(db, {
+    const result = post(db, {
       transactionDate,
       text,
       documentId: input.documentId,
@@ -447,7 +551,7 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
     // 25 %-ratio sanity check is skipped because non-deductible VAT is not
     // part of any input-VAT total, and a non-25 % bilag (e.g. a foreign-VAT
     // receipt) is legitimately bookable this way.
-    const result = postJournalEntry(db, {
+    const result = post(db, {
       transactionDate,
       text,
       documentId: input.documentId,
@@ -468,4 +572,34 @@ export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInpu
   // forces a compile-time error rather than a silent runtime fall-through.
   const _exhaustive: never = vatTreatment;
   throw new Error(`unhandled vatTreatment: ${_exhaustive}`);
+}
+
+export function bookExpenseFromBank(db: Database, input: BookExpenseFromBankInput): BookExpenseFromBankResult {
+  return db.transaction(() => bookExpenseFromBankInternal(db, input, true)).immediate();
+}
+
+/** Exact path for #583's outer BEGIN IMMEDIATE. */
+export function bookExpenseFromBankInCurrentTransaction(db: Database, input: BookExpenseFromBankInput): BookExpenseFromBankResult {
+  return bookExpenseFromBankInternal(db, input, true);
+}
+
+/**
+ * Runs the exact expense-booking path in an immediate transaction that is
+ * always rolled back. This keeps preview validation, journal metadata,
+ * reconciliation and audit behavior aligned with an applied booking without
+ * exposing a second booking implementation or retaining any writes.
+ */
+export function previewBookExpenseFromBank(db: Database, input: BookExpenseFromBankInput): BookExpenseFromBankResult {
+  let result: BookExpenseFromBankResult | undefined;
+  const rollback = new Error("expense booking preview rollback");
+  try {
+    db.transaction(() => {
+      result = bookExpenseFromBankInCurrentTransaction(db, input);
+      throw rollback;
+    }).immediate();
+  } catch (error) {
+    if (error !== rollback) throw error;
+  }
+  if (!result) throw new Error("expense booking preview completed without a result");
+  return result;
 }

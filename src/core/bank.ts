@@ -198,7 +198,9 @@ export function updateBankAccount(db: Database, input: UpdateBankAccountInput) {
   if (!existing) return { ok: false as const, account: undefined, errors: [`bank account '${input.idOrSlug}' does not exist`] };
   const nextCurrency = input.currency === undefined ? existing.currency : normalizeCurrency(input.currency);
   if (nextCurrency.length !== 3) return { ok: false as const, account: undefined, errors: ["currency must be a 3-letter ISO currency code"] };
-  const nextLedger = input.ledgerAccountNo === undefined ? existing.ledgerAccountNo : nullableTrim(input.ledgerAccountNo);
+  const nextLedger: string | null = input.ledgerAccountNo === undefined
+    ? existing.ledgerAccountNo ?? null
+    : nullableTrim(input.ledgerAccountNo) ?? null;
   const ledgerError = validateBankLedgerAccount(db, nextLedger);
   if (ledgerError) return { ok: false as const, account: undefined, errors: [ledgerError] };
   const used = (db.query("SELECT COUNT(*) AS n FROM bank_transactions WHERE bank_account_id = ?").get(existing.id) as { n: number }).n;
@@ -276,6 +278,7 @@ const HEADER_ALIASES: Record<string, string[]> = {
   reference: ["reference", "ref", "bilagsnummer"],
   amount_dkk: ["amount_dkk", "beløb_dkk", "belob_dkk"],
   fx_rate_to_dkk: ["fx_rate_to_dkk", "kurs", "valutakurs"],
+  balance_after: ["balance_after", "running_balance", "saldo"],
 };
 
 const REQUIRED_COLUMNS = ["transaction_date", "text", "amount"] as const;
@@ -427,7 +430,9 @@ function parseCsv(content: string): CsvParseResult {
       continue;
     }
     const row: Record<string, string> = {};
-    header.forEach((key, idx) => row[key] = parsed.values[idx] ?? "");
+    header.forEach((key, idx) => {
+      row[key] = parsed.values[idx] ?? "";
+    });
     rows.push(row);
   }
   return { rows, errors };
@@ -516,6 +521,7 @@ function toRow(input: Record<string, string>): BankImportRow {
     reference: input.reference || undefined,
     amountDkk: parseLocalizedNumber(input.amount_dkk),
     fxRateToDkk: parseLocalizedNumber(input.fx_rate_to_dkk),
+    balanceAfter: parseLocalizedNumber(input.balance_after),
   };
 }
 
@@ -845,6 +851,8 @@ export type ImportBankCsvOptions = {
   account?: string | number;
   /** Named CSV import profile, e.g. "danske-bank" (#186). */
   profile?: string;
+  /** Explicit chronology for a generic CSV; required to make same-date rows authoritative. */
+  statementOrder?: "ascending" | "descending";
 };
 // ===== END BANK CLUSTER (#186-189) =====
 
@@ -917,11 +925,12 @@ export function importBankCsv(
       transaction_date, booking_date, text, amount, currency, reference, amount_dkk, fx_rate_to_dkk,
       source_file_hash, import_batch_id, transaction_hash, status, retain_until,
       bank_account_id, counterparty_name, counterparty_account, message, archive_reference, customer_reference, balance_after, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      , statement_row_index, statement_order, statement_order_provenance
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'imported', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   db.transaction(() => {
-    for (const row of rows) {
+    for (const [sourceRowIndex, row] of rows.entries()) {
       const contentHash = transactionFingerprint(row, 0, bankAccountId);
       const occurrence = occurrenceByContent.get(contentHash) ?? 0;
       occurrenceByContent.set(contentHash, occurrence + 1);
@@ -953,6 +962,19 @@ export function importBankCsv(
         row.customerReference?.trim() || null,
         row.balanceAfter == null ? null : normalizeAmount(row.balanceAfter),
         row.raw ? JSON.stringify(row.raw) : null,
+        // A profile can declare the source chronology. Generic CSV parsing
+        // deliberately leaves it unknown: source file order is not banking
+        // evidence unless an importer/profile says what it means.
+        (profile?.statementOrder ?? options.statementOrder) ? sourceRowIndex : null,
+        profile?.statementOrder ?? options.statementOrder ?? null,
+        // The source hash binds chronology to this exact immutable export.
+        // A later import on the same date is deliberately a distinct source;
+        // readers fail closed rather than joining two independent sequences.
+        profile?.statementOrder
+          ? `sha256:${sourceFileHash};profile:${profile.name};order:${profile.statementOrder}`
+          : options.statementOrder
+            ? `sha256:${sourceFileHash};explicit:bank-import;order:${options.statementOrder}`
+            : null,
       );
       importedRowIds.push(Number(result.lastInsertRowid));
       imported += 1;

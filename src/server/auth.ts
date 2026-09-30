@@ -11,6 +11,8 @@
 
 import type { ServerConfig } from "./config";
 import { ApiError } from "./errors";
+import { openWorkspaceControlReadOnlyDb } from "../core/workspace-control";
+import { hasCurrentBetterAuthSession } from "../core/workspace-access";
 
 /**
  * The authenticated principal handed to handlers. Phase 1 only ever yields the
@@ -20,7 +22,17 @@ export type Principal = {
   /** Canonical actor id, e.g. `system:localhost` or `user:<id>`. */
   id: string;
   /** How the principal was established — useful for audit + diagnostics. */
-  via: "localhost-trusted" | "shared-secret";
+  via: "localhost-trusted" | "shared-secret" | "better-auth" | "service-principal";
+  /** Trusted provider identity; never inferred from actor metadata. */
+  userId?: string;
+  /** Present only for a verified, live service principal. */
+  serviceAccountId?: string;
+  /** Better Auth API-key id, safe for security scope/audit but not a secret. */
+  credentialId?: string;
+  /** Present only for a Better Auth principal and safe to include in audit. */
+  sessionId?: string;
+  /** Session creation time is retained for append-only invalidation checks. */
+  sessionCreatedAt?: Date;
 };
 
 export const LOCALHOST_PRINCIPAL: Principal = {
@@ -37,10 +49,58 @@ export const LOCALHOST_PRINCIPAL: Principal = {
  * @param request the incoming request (Phase 2 reads cookies/headers here)
  * @param config  the resolved server config (carries the auth toggle + token)
  */
-export function authMiddleware(
+export async function authMiddleware(
   request: Request,
   config: ServerConfig,
-): Principal {
+): Promise<Principal> {
+  if (config.betterAuthProvider) {
+    const service = await config.betterAuthProvider.verifyServicePrincipal?.(request) ?? { state: "absent" as const };
+    if (service.state === "invalid") throw ApiError.unauthorized("missing or invalid credentials");
+    if (service.state === "valid") {
+      const db = openWorkspaceControlReadOnlyDb(config.workspaceRoot);
+      try {
+        const row = db.query("SELECT 1 FROM rm_workspace_service_principals WHERE user_id = ?").get(service.userId);
+        if (!row) throw ApiError.unauthorized("missing or invalid credentials");
+      } finally {
+        db.close();
+      }
+      return {
+        id: `user:${service.userId}`,
+        userId: service.userId,
+        serviceAccountId: service.userId,
+        credentialId: service.credentialId,
+        via: "service-principal",
+      };
+    }
+    const session = await config.betterAuthProvider.getSession(request);
+    const userId = session?.user?.id?.trim() ?? "";
+    const sessionId = session?.session?.id?.trim() ?? "";
+    const createdAt = parseSessionCreatedAt(session?.session?.createdAt);
+    if (!userId || !sessionId || !createdAt) {
+      throw ApiError.unauthorized("missing or invalid credentials");
+    }
+
+    // Cookie cache is disabled. Exact Better Auth session-row membership is
+    // the authorization boundary: both emergency invalidation and verified
+    // first-MFA enrollment delete rows atomically, avoiding same-second
+    // timestamp ambiguity and stale provider-response bypasses.
+    const db = openWorkspaceControlReadOnlyDb(config.workspaceRoot);
+    try {
+      if (!hasCurrentBetterAuthSession(db, userId, sessionId)) {
+        throw ApiError.unauthorized("missing or invalid credentials");
+      }
+    } finally {
+      db.close();
+    }
+    return {
+      id: `user:${userId}`,
+      userId,
+      via: "better-auth",
+      sessionId,
+      sessionCreatedAt: createdAt,
+    };
+  }
+
   if (!config.authRequired) {
     // Phase 1: localhost-trusted. Pass-through.
     return LOCALHOST_PRINCIPAL;
@@ -62,6 +122,12 @@ export function authMiddleware(
   return { id: "system:cockpit", via: "shared-secret" };
 }
 
+function parseSessionCreatedAt(value: Date | string | undefined): Date | null {
+  const parsed = value instanceof Date ? value : new Date(typeof value === "string" ? value : "");
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
+/** SQLite CURRENT_TIMESTAMP is UTC but has no trailing `Z`. */
 /** Constant-time string compare so token checks don't leak length/prefix. */
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;

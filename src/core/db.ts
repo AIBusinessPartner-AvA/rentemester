@@ -5,7 +5,7 @@ import { mkdirSync } from "node:fs";
 import { ensureNullableVatPeriodColumn } from "./companies-schema";
 import { backfillRetentionDeadlines } from "./retention";
 import { seedNativeAccountRoles } from "./account-roles";
-import { assertSchemaCompatibility, recordSchemaBaseline } from "./schema-version";
+import { applySchemaMigrations, assertSchemaCompatibility, recordSchemaBaseline, schemaHistoryIsCurrent } from "./schema-version";
 
 function hasColumn(db: Database, table: string, column: string) {
   const cols = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -242,6 +242,28 @@ export type OpenDbOptions = {
   journalMode?: "WAL" | "DELETE";
 };
 
+function makeCloseDeterministic(db: Database): void {
+  const close = Database.prototype.close;
+  let closed = false;
+  Object.defineProperty(db, "close", {
+    value: function (this: Database, throwOnError = false) {
+      if (closed) return;
+      (this as Database & { clearQueryCache(): void }).clearQueryCache();
+      // Finish this connection's WAL work while the handle is still alive.
+      // PASSIVE never waits for another writer, so concurrent CLI processes
+      // retain their normal serialization without a strict-close deadlock.
+      try {
+        this.run("PRAGMA wal_checkpoint(PASSIVE)");
+      } catch {
+        // An exceptional caller may still be unwinding a transaction. Native
+        // close performs the rollback; checkpointing must not mask its error.
+      }
+      close.call(this, throwOnError);
+      closed = true;
+    },
+  });
+}
+
 export function openDb(path: string, options: OpenDbOptions = {}) {
   // Compatibility is a read-only preflight. In particular, do not change the
   // persistent journal mode or create WAL sidecars before rejecting a database
@@ -251,6 +273,7 @@ export function openDb(path: string, options: OpenDbOptions = {}) {
     try {
       assertSchemaCompatibility(preflight);
     } finally {
+      (preflight as Database & { clearQueryCache(): void }).clearQueryCache();
       preflight.close();
     }
   }
@@ -260,10 +283,12 @@ export function openDb(path: string, options: OpenDbOptions = {}) {
   // processes open the same company ledger at once (the agent-demo pipeline,
   // parallel test runs on a saturated CI host). 5s was too tight under load;
   // 30s lets the single writer finish rather than erroring "database is locked".
-  db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;");
+  db.run("PRAGMA foreign_keys = ON");
+  db.run("PRAGMA busy_timeout = 30000");
   db.exec(options.journalMode === "DELETE"
     ? "PRAGMA journal_mode = DELETE;"
     : "PRAGMA journal_mode = WAL;");
+  makeCloseDeterministic(db);
   return db;
 }
 
@@ -287,29 +312,36 @@ function restoreSchemaTriggers(db: Database, schema: string) {
       db.run(`DROP TRIGGER IF EXISTS ${name}`);
       db.exec(canonical);
     }
-  }, { immediate: true })();
+  }).immediate();
 }
 
-// Financial guards delegate deterministic money/shape checks to canonical SQL
-// views. CREATE VIEW IF NOT EXISTS would otherwise leave a stale or weakened
-// view in place forever, so migrations restore those definitions with the same
-// atomic drop+create discipline as protective triggers.
+// Kept as a baseline-migration compatibility seam. schema.sql creates views
+// that are missing from older ledgers, but a present view is never replaced by
+// routine migration: drift is inspected and repaired only through the
+// explicit, audited system repair-schema-views command.
 function restoreSchemaViews(db: Database, schema: string) {
-  const viewStatements = schema.match(/CREATE VIEW[\s\S]*?;/gi) ?? [];
-  db.transaction(() => {
-    for (const statement of viewStatements) {
-      const nameMatch = /CREATE VIEW(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)/i.exec(statement);
-      if (!nameMatch) continue;
-      const name = nameMatch[1];
-      const canonical = statement.replace(/CREATE VIEW\s+IF\s+NOT\s+EXISTS/i, "CREATE VIEW");
-      db.run(`DROP VIEW IF EXISTS ${name}`);
-      db.exec(canonical);
-    }
-  }, { immediate: true })();
+  void db;
+  void schema;
 }
 
 export function migrate(db: Database) {
   assertSchemaCompatibility(db);
+  const queryOnly = Number(Object.values(
+    db.query("PRAGMA query_only").get() as Record<string, unknown>,
+  )[0]) === 1;
+  if (queryOnly) {
+    if (!schemaHistoryIsCurrent(db)) {
+      throw new Error("ledger schema migration is required before read-only access");
+    }
+    return;
+  }
+  // A current, checksummed ledger is an inspection target: routine opens must
+  // never recreate a missing canonical view and thereby hide drift. Pending
+  // and fresh ledgers still evaluate the complete baseline schema.
+  const currentBeforeSchema = schemaHistoryIsCurrent(db);
+  const missingCurrentViews = currentBeforeSchema
+    ? (readFileSync(join(import.meta.dir, "../../src/core/schema.sql"), "utf8").match(/CREATE VIEW(?:\s+IF\s+NOT\s+EXISTS)?\s+[A-Za-z_][A-Za-z0-9_]*/gi) ?? []).map((statement) => /CREATE VIEW(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][A-Za-z0-9_]*)/i.exec(statement)![1]!).filter((name) => !db.query("SELECT 1 FROM sqlite_master WHERE type='view' AND name=?").get(name))
+    : [];
   // BASELINE_MIGRATION_V1_NORMALIZATION_START
   // The canonical schema now defines INSERT triggers that reference the
   // journal evidence columns. CREATE TABLE IF NOT EXISTS does not add those
@@ -482,7 +514,12 @@ export function migrate(db: Database) {
   seedNativeAccountRoles(db);
   backfillRetentionDeadlines(db);
   // BASELINE_MIGRATION_V1_NORMALIZATION_END
+  // schema.sql uses CREATE VIEW IF NOT EXISTS. Preserve the pre-open absence
+  // on an already-current ledger so drift remains visible until explicit
+  // repair; fresh and pending ledgers retain the schema-created views.
+  for (const view of missingCurrentViews) db.exec(`DROP VIEW IF EXISTS ${view}`);
   recordSchemaBaseline(db);
+  applySchemaMigrations(db);
   // #539 follows the immutable v1 normalisation. These guards apply equally
   // to freshly-created and legacy ledgers and are lossless on repeated opens.
   if (!hasColumn(db, "bank_accounts", "bic")) db.exec("ALTER TABLE bank_accounts ADD COLUMN bic TEXT;");

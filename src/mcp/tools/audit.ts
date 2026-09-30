@@ -12,7 +12,7 @@ import { z } from "zod";
 import { verifyAuditChain } from "../../core/ledger";
 import { listAuditLog } from "../../core/audit-log";
 import { envelopeShape, successEnvelope, wrapCoreResult } from "../envelope";
-import { withCompanyDb } from "../tool-runtime";
+import { withCompanyDb, withCompanyReadOnlyDb } from "../tool-runtime";
 import {
   applyPagination,
   paginationFields,
@@ -43,11 +43,11 @@ export function registerAuditTools(server: McpServer): void {
         openWorldHint: false,
       },
     },
-    withCompanyDb<{ company: string }>(server, ({ db }) => {
+    withCompanyReadOnlyDb<{ company: string }>(({ db, args }) => {
       // `withCompanyDb` already resolves + existsSync-guards `company` and
       // returns a *path-redacted* error envelope on a bad/missing directory,
       // so the absolute host path is never disclosed to the caller (#228).
-      return wrapCoreResult(verifyAuditChain(db));
+      return wrapCoreResult(verifyAuditChain(db, { companyRoot: args.company }));
     }),
   );
 
@@ -110,7 +110,7 @@ export function registerAuditTools(server: McpServer): void {
         openWorldHint: false,
       },
     },
-    withCompanyDb<{
+    withCompanyReadOnlyDb<{
       company: string;
       fromDate?: string;
       toDate?: string;
@@ -118,7 +118,7 @@ export function registerAuditTools(server: McpServer): void {
       actorLike?: string;
       limit?: number;
       offset?: number;
-    }>(server, ({ db, args }) => {
+    }>(({ db, args }) => {
       const result = listAuditLog(db, {
         fromDate: args.fromDate,
         toDate: args.toDate,
@@ -133,7 +133,6 @@ export function registerAuditTools(server: McpServer): void {
       });
       return successEnvelope({
         rows: pageRows,
-        total: result.total,
         ...meta,
       });
     }),

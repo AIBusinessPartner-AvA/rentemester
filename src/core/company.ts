@@ -1,9 +1,12 @@
+import { runSql } from "./sqlite";
 import type { Database } from "bun:sqlite";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureCompanyDirs } from "./paths";
 import { openDb, migrate } from "./db";
+import { openCurrentLedgerReadOnly } from "./ledger-inspection";
 import { seedAccounts } from "./ledger";
+import { seedNativeAccountRoles } from "./account-roles";
 import { insertAuditLog } from "./actor";
 import {
   lookupCvrCompany,
@@ -84,7 +87,12 @@ const DEFAULT_COMPANY_SETTINGS: CompanySettings = {
   auditWaived: null,
   cvrSyncedAt: null,
   paymentTermsDays: DEFAULT_PAYMENT_TERMS_DAYS,
-  vatPeriodType: DEFAULT_VAT_PERIOD_TYPE,
+  // Keep the module's eager default independent of the close/VAT graph.
+  // `periods.ts` imports the close-readiness graph, which eventually reads
+  // company settings.  The value is the same canonical default exported from
+  // that module; using the literal here prevents an ESM initialization cycle
+  // from observing its export before initialization.
+  vatPeriodType: "quarter",
 };
 
 /**
@@ -361,6 +369,9 @@ export function initialiseCompanyVolume(
   try {
     migrate(db);
     seedAccounts(db);
+    // `migrate` runs before the chart exists in a freshly-created company, so
+    // seed confirmed native control roles only after the chart is present.
+    seedNativeAccountRoles(db);
     const cvr = normalizeCvr(options.cvr);
     const fiscalYearStartMonth =
       normalizeFiscalYearStartMonth(options.fiscalYearStartMonth) ?? 1;
@@ -414,11 +425,15 @@ export function initialiseCompanyVolume(
     if (!existsSync(policy)) {
       writeFileSync(policy, buildDefaultPolicyYaml(options.onboardingActor));
     }
-    db.run(
+    runSql(db,
       "INSERT INTO audit_log (event_type, entity_type, message) VALUES ('init','company','Company volume initialized')",
     );
   } finally {
-    db.close();
+    // Company creation must be physically complete before the caller receives
+    // the new volume; otherwise Bun may remove empty WAL sidecars during the
+    // first later request, making that read appear mutating.
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+    db.close(true);
   }
   return { companyRoot, dbPath: p.db };
 }
@@ -453,7 +468,7 @@ export type CompanyOnboardingSummary = {
  */
 export function summariseCompanyVolume(companyRoot: string): CompanyOnboardingSummary {
   const dbPath = join(companyRoot, "data", "ledger.sqlite");
-  const db = openDb(dbPath);
+  const db = openCurrentLedgerReadOnly(dbPath);
   try {
     const settings = getCompanySettings(db);
     const row = db.query("SELECT COUNT(*) AS n FROM accounts").get() as { n: number };
@@ -530,6 +545,7 @@ export function createCompany(
     name,
     createdAt: new Date().toISOString(),
     archived: false,
+    purpose: "live",
   });
   return { ...init, slug, name };
 }
@@ -688,7 +704,7 @@ export function setCompanyProfile(
       message: "Updated company profile (identity / payment details)",
     });
     return getCompanySettings(db);
-  }, { immediate: true })();
+  }).immediate();
 
   const updatedFields: string[] = [];
   const compare: Array<[string, unknown, unknown]> = [

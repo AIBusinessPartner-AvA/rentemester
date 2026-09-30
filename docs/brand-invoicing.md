@@ -13,8 +13,8 @@ To adskilte ting, som bare ofte bruges sammen:
 
 > **Status:** bygget og i daglig brug hos ét rigtigt selskab siden august 2026 —
 > fakturaer er sendt live til rigtige kunder. De rene, deterministiske dele er
-> dækket af 159 tests: PNG-dekoderen, brand-indlæsningen, afsendelsesvinduet,
-> SMTP2GO-kaldet og mailkompositionen. PDF-renderingen er ikke. Se
+> dækket af 181 tests: PNG-dekoderen, brand-indlæsningen, afsendelsesvinduet,
+> SMTP2GO-kaldet, mailkompositionen og brand-delen af PDF-renderingen. Se
 > [Hvad der mangler](#hvad-der-mangler) før du bygger videre eller åbner en PR
 > mod `main`.
 
@@ -284,16 +284,20 @@ confirm-kontrakt. Den er et værktøj ved siden af, ikke en del af ledgeren.
   schedule-parsing), `src/core/smtp2go.ts` (32 — payload-formen, begge
   kvitteringsregler og selve kaldet mod en fake fetch) og
   `src/core/invoice-mail.ts` (59 — datoer, beløb, flettefelter,
-  signatur-ekstraktion, brand- og kontaktopslag, emne og begge kroppe).
-  Alle fem suiter er muteringstestet — fx: knæk prædiktoren i Paeth-filteret,
+  signatur-ekstraktion, brand- og kontaktopslag, emne og begge kroppe) og
+  brand-tilføjelserne i `src/core/invoice-pdf.ts` (22 — kontakt-footeren,
+  morarente-noten, betalingsbetingelserne og PNG-logoet). Basis-renderingen —
+  paginering, WinAnsi-kodning, betalingsblok, talformat — var dækket i forvejen
+  af `tests/unit/invoice-render-cli.test.ts`.
+  Alle seks suiter er muteringstestet — fx: knæk prædiktoren i Paeth-filteret,
   komponér alfa mod sort, ryk vinduets lukketid en time, fjern weekendspringet,
   drop navnekravet på et brand, bedøm en planlagt afsendelse på `succeeded`, se
   bort fra HTTP-statussen, skriv det rå svar i leveringsloggen, lad rykkeren og
-  fakturaen bytte indledning, eller strip kommentarer EFTER fletning i stedet
-  for før. Hver enkelt mutation fanges af mindst én test.
-  **Ikke dækket:** PDF-renderingen i `src/core/invoice-pdf.ts`, og den del af
-  `scripts/send-invoice-smtp2go.ts` der læser filer og binder modulerne sammen.
-  Selve kompositionen er flyttet ud og testet.
+  fakturaen bytte indledning, strip kommentarer EFTER fletning i stedet for før,
+  fjern guarden på kontakt-footeren, eller lad et ulæseligt logo blive til et
+  tomt billede. Hver enkelt mutation fanges af mindst én test.
+  **Ikke dækket:** den del af `scripts/send-invoice-smtp2go.ts` der læser filer,
+  parser argumenter og binder modulerne sammen. Al logik er flyttet ud af den.
 - **Logo som `cid:`-vedhæftning.** Signaturens logo hentes fra en ekstern URL og
   blokeres af mailklienter der ikke henter billeder.
 - **Ingen helligdagskalender** i afsendelsesvinduet.

@@ -86,7 +86,7 @@ const live = args.live === true;
 const htmlOut = str(args["html-out"]);
 const actor = str(args.actor) ?? "user:anders";
 // Hilsenen i mailen. Uden --attention bruges køberens navn fra fakturaen, og så
-// står der "Kære <firmanavn> ApS" — korrekt på selve fakturaen, men stift i en
+// står der "Hej <firmanavn> ApS" — korrekt på selve fakturaen, men stift i en
 // mail til et menneske. --attention "Tue" retter KUN hilsenen; fakturaens PDF og
 // snapshot er udstedt og urørlige, og modtagerlinjen beholder firmanavnet.
 const attention = str(args.attention);
@@ -264,12 +264,12 @@ if (templatePath && existsSync(templatePath)) {
   const intro = kind === "reminder"
     ? `<p>Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF — kontakt os gerne, hvis betalingen allerede er gennemført.</p>`
     : `<p>Tusind tak, fordi du har valgt at være kunde hos ${vars.brand}.</p><p>Her er din faktura ${vars.fakturanummer} på ${vars["beløb"]}.</p><p>Fakturaen er vedhæftet denne mail som PDF.</p>`;
-  htmlBody = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.5; color: #101820;"><p>Kære ${vars.kontaktnavn}</p>${intro}${signatureHtml}</div>`;
+  htmlBody = `<div style="font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 1.5; color: #101820;"><p>Hej ${vars.kontaktnavn}</p>${intro}${signatureHtml}</div>`;
 }
 
 // Plain-text fallback (few clients need it, but it keeps the mail well-formed).
 const textBody = [
-  `Kære ${vars.kontaktnavn}`,
+  `Hej ${vars.kontaktnavn}`,
   "",
   kind === "reminder"
     ? `Vi kan se at faktura ${vars.fakturanummer} endnu ikke er registreret som betalt. Fakturaen er vedhæftet som PDF.`

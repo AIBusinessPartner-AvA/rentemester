@@ -12,9 +12,11 @@ To adskilte ting, som bare ofte bruges sammen:
    leverer den.
 
 > **Status:** bygget og i daglig brug hos ét rigtigt selskab siden august 2026 —
-> fakturaer er sendt live til rigtige kunder. **Men der er ingen automatiske
-> tests på funktionaliteten endnu.** Se [Hvad der mangler](#hvad-der-mangler)
-> før du bygger videre eller åbner en PR mod `main`.
+> fakturaer er sendt live til rigtige kunder. De rene, deterministiske dele er
+> dækket af tests (68 i alt: PNG-dekoderen, brand-indlæsningen og
+> afsendelsesvinduet). Selve netkaldet til SMTP2GO og PDF-renderingen er det
+> ikke. Se [Hvad der mangler](#hvad-der-mangler) før du bygger videre eller
+> åbner en PR mod `main`.
 
 Relateret: [cli-contract.md](cli-contract.md), [build-loop.md](build-loop.md),
 [efaktura-digisense.md](efaktura-digisense.md) (den certificerede vej til
@@ -178,8 +180,11 @@ bun run scripts/send-invoice-smtp2go.ts \
 modtager, emne, flettefelter og API-nøglen som `***REDACTED***`. Man kan altså
 altid se præcis hvad der ville gå ud, før noget går ud.
 
-**Afsendelsesvindue: hverdage kl. 8–15** (lokal tid). `--live` uden for vinduet
-afvises med besked om næste gyldige tidspunkt. Baggrunden er triviel og rigtig:
+**Afsendelsesvindue: hverdage kl. 8–15** (lokal tid). Reglerne selv bor i
+`src/core/send-window.ts` — rene funktioner der tager deres input eksplicit
+(`parseSchedule` får `now` ind i stedet for at læse uret), så de kan testes uden
+at køre scriptet. `--live` uden for vinduet afvises med besked om næste gyldige
+tidspunkt. Baggrunden er triviel og rigtig:
 en faktura der rammer kundens indbakke søndag kl. 23 ser forkert ud. Dry-run
 advarer men kører, så man kan klargøre når som helst. **Scriptet kender ikke
 danske helligdage** — dem må man selv holde øje med.
@@ -259,14 +264,20 @@ confirm-kontrakt. Den er et værktøj ved siden af, ikke en del af ledgeren.
 
 ## Hvad der mangler
 
-Ærlig liste — dette er ikke PR-klar mod `main` som den står:
+Ærlig liste over hvad der stadig står tilbage:
 
-- **Ingen automatiske tests.** Ca. 1.100 linjer ny kode uden en eneste test.
-  [CONTRIBUTING.md](../CONTRIBUTING.md) kræver fejlende test først. De rene,
-  deterministiske enheder er lige til at teste — `png-image.ts` er en ren
-  funktion af bytes, `brands.ts` er konfigurationsindlæsning, og
-  tidsvindue-/schedule-parsingen i sende-scriptet er ren datologik. Netkaldet
-  til SMTP2GO kræver en fake for at kunne testes.
+- **Testdækningen er delvis.** Dækket er de rene, deterministiske enheder:
+  `src/core/png-image.ts` (23 tests — alle fem scanline-filtre,
+  alfa-komposition mod hvid, og hver enkelt afvisningsgrund),
+  `src/core/brands.ts` (17 tests — opslag, default, og at indlæsningen aldrig
+  kaster uanset hvad der står i filen) og `src/core/send-window.ts` (28 tests
+  — vinduets grænser, weekendspring og schedule-parsing). Alle tre suiter er
+  muteringstestet: knæk prædiktoren i Paeth-filteret, komponér alfa mod sort,
+  ryk vinduets lukketid en time, fjern weekendspringet, eller drop navnekravet
+  på et brand — hver enkelt mutation fanges.
+  **Ikke dækket:** HTTP-kaldet til SMTP2GO (kræver en fake),
+  mailkompositionen i `scripts/send-invoice-smtp2go.ts`, og PDF-renderingen i
+  `src/core/invoice-pdf.ts`.
 - **Logo som `cid:`-vedhæftning.** Signaturens logo hentes fra en ekstern URL og
   blokeres af mailklienter der ikke henter billeder.
 - **Ingen helligdagskalender** i afsendelsesvinduet.

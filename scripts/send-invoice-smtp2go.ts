@@ -200,7 +200,7 @@ if (!existsSync(snapshotPath)) fail(`ingen udstedt faktura: ${snapshotPath}`);
 if (!existsSync(pdfPath)) fail(`ingen faktura-PDF: ${pdfPath}`);
 const snap = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
   seller?: { name?: string; email?: string };
-  buyer?: { name?: string; email?: string };
+  buyer?: { name?: string; email?: string; vatOrCvr?: string };
   issueDate?: string;
   currency?: string;
   totals?: { grossAmount?: number };
@@ -230,9 +230,32 @@ const recipientEmail = recipientOverride ?? str(snap.buyer?.email) ?? fail("inge
 const recipientName = str(snap.buyer?.name);
 const to = recipientName ? `${recipientName} <${recipientEmail}>` : recipientEmail;
 
+// --- config/kontaktpersoner.json (hilsenens fornavn pr. kunde) ---------------
+// Rentemesters kundekartotek har intet kontaktperson-felt, og customers er
+// append-only uden update-kommando. Denne fil ligger derfor ved siden af
+// bogføringen: den er ren præsentation og rører hverken ledger eller
+// revisionsspor. Slås op på køberens CVR, ellers på modtagermailen.
+type KontaktpersonerFile = {
+  kontakter?: Array<{ cvr?: string; email?: string; navn?: string }>;
+};
+const kontaktPath = join(companyRoot, "config", "kontaktpersoner.json");
+const kontaktCfg: KontaktpersonerFile = existsSync(kontaktPath)
+  ? (JSON.parse(readFileSync(kontaktPath, "utf8")) as KontaktpersonerFile)
+  : {};
+const normCvr = (v: string | undefined) => v?.toUpperCase().replace(/[^A-Z0-9]/g, "") || undefined;
+const buyerCvr = normCvr(str(snap.buyer?.vatOrCvr));
+const kontaktpersonNavn = str(
+  kontaktCfg.kontakter?.find((k) => {
+    const byCvr = buyerCvr && normCvr(str(k.cvr)) === buyerCvr;
+    const byMail = str(k.email)?.toLowerCase() === recipientEmail.toLowerCase();
+    return byCvr || byMail;
+  })?.navn,
+);
+
 // --- merge fields ------------------------------------------------------------
 const vars: Record<string, string> = {
-  kontaktnavn: attention ?? recipientName ?? "kunde",
+  // --attention vinder altid; derefter kontaktpersoner.json; til sidst firmanavnet.
+  kontaktnavn: attention ?? kontaktpersonNavn ?? recipientName ?? "kunde",
   brand: fromName,
   fakturanummer: invoiceNumber,
   fakturadato: formatDanishDate(snap.issueDate),

@@ -2,6 +2,8 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
+import { decodePng, type DecodedImage } from "./png-image";
 import { insertAuditLog } from "./actor";
 import { promoteTempFileExclusive, removeIfExists, writeTempFileFor } from "./atomic-file";
 import { snapshotRegisteredDocumentEvidence } from "./document-storage";
@@ -59,14 +61,40 @@ export type IssuedInvoicePdfPayload = InvoicePayload & {
   payment?: InvoicePaymentDetails;
   /**
    * Lightweight brand mark. A short text string is rendered as a styled word
-   * mark in the header. This is a deliberate minimal seam: an image-based logo
-   * can be added later without changing the call sites.
+   * mark in the header. Used when no `logoImage` is present, and as the
+   * fallback when the image cannot be decoded.
    */
   logoText?: string | null;
+  /**
+   * Base64-encoded PNG brand logo, drawn in the header in place of `logoText`.
+   *
+   * The IMAGE BYTES live in the issued snapshot, not a path to a file on disk.
+   * A path would make a re-render depend on a file that can be replaced or
+   * deleted, and an invoice must re-render byte-identically years later — the
+   * same reason `logoText` and `latePaymentNote` are persisted rather than
+   * re-read from config/brands.json.
+   */
+  logoImage?: string | null;
 };
 
 function sha256(buffer: Uint8Array) {
   return createHash("sha256").update(buffer).digest("hex");
+}
+
+/**
+ * Decode the base64 PNG from the snapshot into RGB samples, or `undefined` if
+ * there is none or it cannot be read. Never throws: a broken logo degrades the
+ * header to its text word-mark instead of failing the whole invoice render.
+ */
+function decodeHeaderLogo(logoImage: string | null | undefined): DecodedImage | undefined {
+  const encoded = compact(logoImage);
+  if (!encoded) return undefined;
+  try {
+    const decoded = decodePng(Buffer.from(encoded, "base64"));
+    return decoded.ok ? decoded.image : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +246,13 @@ type TextOp = {
 };
 type RectOp = { kind: "rect"; x: number; y: number; w: number; h: number; gray: number };
 type LineOp = { kind: "line"; x1: number; y1: number; x2: number; y2: number; gray: number; width: number };
-type DrawOp = TextOp | RectOp | LineOp;
+/** Draws the single header logo XObject (/Im0) into a box at (x,y), size w×h. */
+type ImageOp = { kind: "image"; x: number; y: number; w: number; h: number };
+type DrawOp = TextOp | RectOp | LineOp | ImageOp;
+
+/** Header logo box. The image is scaled to fit inside, keeping its aspect. */
+const LOGO_MAX_WIDTH = 170;
+const LOGO_MAX_HEIGHT = 30;
 
 /** Approximate Helvetica advance widths (per 1pt of font size), good enough
  *  for right-alignment and column fitting without embedding font metrics. */
@@ -294,6 +328,11 @@ class PageWriter {
     this.ops.push({ kind: "rect", x, y, w, h, gray });
   }
 
+  /** Place the header logo with (x, y) as its LOWER-left corner, PDF-style. */
+  image(x: number, y: number, w: number, h: number) {
+    this.ops.push({ kind: "image", x, y, w, h });
+  }
+
   hline(y: number, gray = 0, width = 0.75, x1 = MARGIN_X, x2 = CONTENT_RIGHT) {
     this.ops.push({ kind: "line", x1, y1: y, x2, y2: y, gray, width });
   }
@@ -339,8 +378,50 @@ function paymentLines(payment: InvoicePaymentDetails | undefined): string[] {
   return lines;
 }
 
+/**
+ * Payment-terms label (#DLK-branding). Not a §58 mandatory field, but customary
+ * and requested. Derives "Netto N dage" from issue/due dates when both exist;
+ * falls back to just the due date. Deterministic (parses fixed ISO strings, no
+ * clock read).
+ */
+function paymentTermsLabel(issueDate?: string, dueDate?: string): string | null {
+  const due = compact(dueDate);
+  if (!due) return null;
+  const issue = compact(issueDate);
+  if (issue) {
+    const ms = Date.parse(`${due}T00:00:00Z`) - Date.parse(`${issue}T00:00:00Z`);
+    if (Number.isFinite(ms)) {
+      const days = Math.round(ms / 86_400_000);
+      if (days >= 0) return `Betalingsbetingelser: Netto ${days} dage (forfald ${due}).`;
+    }
+  }
+  return `Betalingsbetingelser: forfald ${due}.`;
+}
+
+/**
+ * Brand contact line(s) for the page footer (#DLK-branding). Only produced when
+ * the seller carries contact details (i.e. an invoice issued under a brand), so
+ * unbranded invoices keep their original single-line footer byte-for-byte.
+ */
+function contactFooterLines(payload: IssuedInvoicePdfPayload): string[] {
+  const s = payload.seller;
+  if (!s) return [];
+  const hasContact = compact(s.email) || compact(s.phone) || compact(s.web);
+  if (!hasContact) return [];
+  const line1 = [compact(s.name), compact(s.address)].filter(Boolean).join(" / ");
+  const line2Parts: string[] = [];
+  if (compact(s.vatOrCvr)) line2Parts.push(`CVR ${s.vatOrCvr!.trim()}`);
+  if (compact(s.phone)) line2Parts.push(`Tlf. ${s.phone!.trim()}`);
+  if (compact(s.web)) line2Parts.push(`Web: ${s.web!.trim()}`);
+  if (compact(s.email)) line2Parts.push(`Mail: ${s.email!.trim()}`);
+  const out: string[] = [];
+  if (line1) out.push(line1);
+  if (line2Parts.length) out.push(line2Parts.join(" / "));
+  return out;
+}
+
 /** Lay the whole invoice out across one or more A4 pages. */
-function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
+function layoutInvoice(payload: IssuedInvoicePdfPayload, logo?: DecodedImage): PageWriter[] {
   const currency = (payload.currency ?? "DKK").trim().toUpperCase();
   const pages: PageWriter[] = [];
   let page = new PageWriter();
@@ -354,7 +435,15 @@ function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
   // ----- Header: brand mark (left) + invoice meta box (right) -----
   const sellerName = compact(payload.seller?.name);
   const brand = compact(payload.logoText) ?? sellerName ?? "Faktura";
-  page.textAt(MARGIN_X, PAGE_TOP, brand, { size: 20, font: "F2", gray: 0 });
+  if (logo) {
+    // Fit inside the logo box, preserving aspect. The box sits just above the
+    // text baseline the word-mark would have used, so the rest of the header
+    // layout is unchanged whether the brand has an image logo or not.
+    const scale = Math.min(LOGO_MAX_WIDTH / logo.width, LOGO_MAX_HEIGHT / logo.height);
+    page.image(MARGIN_X, PAGE_TOP - 6, logo.width * scale, logo.height * scale);
+  } else {
+    page.textAt(MARGIN_X, PAGE_TOP, brand, { size: 20, font: "F2", gray: 0 });
+  }
 
   page.textAt(rightAlignX("FAKTURA", 22, CONTENT_RIGHT), PAGE_TOP + 2, "FAKTURA", {
     size: 22,
@@ -518,6 +607,19 @@ function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
     page.y -= 16;
   }
 
+  // ----- Payment terms (betalingsbetingelser, #DLK-branding) -----
+  const termsLabel = paymentTermsLabel(payload.issueDate, payload.dueDate);
+  if (termsLabel) {
+    if (!page.hasRoom(26)) {
+      newPage();
+      page.y = PAGE_TOP;
+    } else {
+      page.advance(16);
+    }
+    page.text(MARGIN_X, termsLabel, { size: 9.5, font: "F2", gray: 0.2 });
+    page.advance(LINE_HEIGHT);
+  }
+
   // ----- Payment details -----
   const payLines = paymentLines(payload.payment);
   if (payLines.length > 0) {
@@ -542,6 +644,24 @@ function layoutInvoice(payload: IssuedInvoicePdfPayload): PageWriter[] {
         gray: 0.45,
       });
       page.advance(LINE_HEIGHT);
+    }
+  }
+
+  // ----- Late-payment (morarente) note (#DLK-branding) -----
+  if (compact(payload.latePaymentNote)) {
+    if (!page.hasRoom(28)) {
+      newPage();
+      page.y = PAGE_TOP;
+    } else {
+      page.advance(14);
+    }
+    for (const wrapped of wrapText(payload.latePaymentNote!.trim(), 8, CONTENT_RIGHT - MARGIN_X)) {
+      if (!page.hasRoom(LINE_HEIGHT)) {
+        newPage();
+        page.y = PAGE_TOP;
+      }
+      page.text(MARGIN_X, wrapped, { size: 8, gray: 0.4 });
+      page.advance(12);
     }
   }
 
@@ -599,16 +719,34 @@ function fmtNum(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(2);
 }
 
-function pageContentStream(page: PageWriter, footer: string) {
+function pageContentStream(page: PageWriter, footer: string, contactLines: string[] = []) {
   const parts: string[] = [];
   // Footer baseline (drawn first so content can never overlap it).
-  parts.push(
-    `BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 22)} Tm (${escapePdfText(footer)}) Tj ET`,
-  );
-  parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 10)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(PAGE_BOTTOM - 10)} l 0.5 w S`);
+  if (contactLines.length > 0) {
+    // Branded footer: centered brand contact line(s) above a hairline, with the
+    // page-number line beneath. (#DLK-branding)
+    let fy = PAGE_BOTTOM - 14;
+    for (const line of contactLines) {
+      const cx = (PAGE_WIDTH - textWidth(line, 7)) / 2;
+      parts.push(`BT /F1 7 Tf 0.4 g 1 0 0 1 ${fmtNum(cx)} ${fmtNum(fy)} Tm (${escapePdfText(line)}) Tj ET`);
+      fy -= 10;
+    }
+    parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(fy - 2)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(fy - 2)} l 0.5 w S`);
+    parts.push(`BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(fy - 14)} Tm (${escapePdfText(footer)}) Tj ET`);
+  } else {
+    parts.push(
+      `BT /F1 7.5 Tf 0.5 g 1 0 0 1 ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 22)} Tm (${escapePdfText(footer)}) Tj ET`,
+    );
+    parts.push(`0.85 g ${fmtNum(MARGIN_X)} ${fmtNum(PAGE_BOTTOM - 10)} m ${fmtNum(CONTENT_RIGHT)} ${fmtNum(PAGE_BOTTOM - 10)} l 0.5 w S`);
+  }
 
   for (const op of page.ops) {
-    if (op.kind === "rect") {
+    if (op.kind === "image") {
+      // PDF draws an image into the unit square, so the CTM carries both size
+      // and position: `w 0 0 h x y cm` maps it to the wanted box. q/Q keeps the
+      // transform from leaking into the ops that follow.
+      parts.push(`q ${fmtNum(op.w)} 0 0 ${fmtNum(op.h)} ${fmtNum(op.x)} ${fmtNum(op.y)} cm /Im0 Do Q`);
+    } else if (op.kind === "rect") {
       parts.push(`${fmtNum(op.gray)} g ${fmtNum(op.x)} ${fmtNum(op.y)} ${fmtNum(op.w)} ${fmtNum(op.h)} re f`);
     } else if (op.kind === "line") {
       parts.push(
@@ -632,7 +770,12 @@ function pageContentStream(page: PageWriter, footer: string) {
  * solely from the invoice's issue date.
  */
 export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
-  const pages = layoutInvoice(payload);
+  // A logo that will not decode must never take the invoice down with it: the
+  // header simply falls back to the text word-mark. The PDF is the customer's
+  // document — a missing logo is cosmetic, a failed render is not.
+  const logo = decodeHeaderLogo(payload.logoImage);
+  const pages = layoutInvoice(payload, logo);
+  const contactFooter = contactFooterLines(payload);
   const issueDate = compact(payload.issueDate) ?? "1970-01-01";
   const pdfDate = `D:${issueDate.replace(/-/g, "")}000000Z`;
   const producer = "Rentemester deterministic invoice renderer";
@@ -645,6 +788,11 @@ export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
   const fontRegularNo = 3 + pageCount * 2;
   const fontBoldNo = fontRegularNo + 1;
   const infoObjectNo = fontBoldNo + 1;
+  // Appended last so adding a logo never renumbers the existing objects.
+  const logoObjectNo = logo ? infoObjectNo + 1 : undefined;
+  const resources =
+    `/Font << /F1 ${fontRegularNo} 0 R /F2 ${fontBoldNo} 0 R >>` +
+    (logoObjectNo ? ` /XObject << /Im0 ${logoObjectNo} 0 R >>` : "");
 
   const objects: string[] = [
     "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -657,10 +805,10 @@ export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
     // rendered as a broken glyph in some PDF viewers ("Faktura 2026-0001 <?>
     // Side 1"). A plain hyphen is safe in every viewer and font.
     const footer = `${title} - Side ${i + 1} af ${pageCount}`;
-    const content = pageContentStream(page, footer);
+    const content = pageContentStream(page, footer, contactFooter);
     objects.push(
       `${pageNo} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}] ` +
-        `/Resources << /Font << /F1 ${fontRegularNo} 0 R /F2 ${fontBoldNo} 0 R >> >> /Contents ${contentNo} 0 R >>\nendobj\n`,
+        `/Resources << ${resources} >> /Contents ${contentNo} 0 R >>\nendobj\n`,
     );
     objects.push(
       `${contentNo} 0 obj\n<< /Length ${Buffer.byteLength(content, "binary")} >>\nstream\n${content}endstream\nendobj\n`,
@@ -676,6 +824,17 @@ export function buildIssuedInvoicePdf(payload: IssuedInvoicePdfPayload) {
     `${infoObjectNo} 0 obj\n<< /Producer (${escapePdfText(producer)}) /Title (${escapePdfText(title)}) ` +
       `/CreationDate (${pdfDate}) /ModDate (${pdfDate}) >>\nendobj\n`,
   );
+  if (logo && logoObjectNo) {
+    // The samples are re-deflated here rather than reusing the PNG's own
+    // stream: PDF has no RGBA colour space, so the alpha had to be composited
+    // away first (see png-image.ts), which invalidates the original IDAT.
+    const compressed = deflateSync(logo.rgb, { level: 9 });
+    objects.push(
+      `${logoObjectNo} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${logo.width} /Height ${logo.height} ` +
+        `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length ${compressed.length} >>\n` +
+        `stream\n${compressed.toString("binary")}\nendstream\nendobj\n`,
+    );
+  }
 
   let pdf = "%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
   const offsets: number[] = [0];

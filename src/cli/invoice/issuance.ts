@@ -6,6 +6,7 @@
  * Split out of `../invoice.ts`. Registration order preserved.
  */
 
+import { readFileSync } from "node:fs";
 import { readJsonCliInput, readJsonObjectCliInput } from "../../cli-dispatch";
 import { companyPaths } from "../../core/paths";
 import { openDb, migrate } from "../../core/db";
@@ -35,6 +36,7 @@ import {
   repairUnlinkedIssuedInvoiceBooking,
 } from "../../core/invoice-booking";
 import { resolveInvoiceMasterData } from "../../core/master-data";
+import { loadBrand } from "../../core/brands";
 import { openCommandDb } from "../../cli-dispatch";
 import type { CommandDispatch } from "../../cli-dispatch";
 import { emitHumanReport, emitHumanWrite } from "../../cli-format";
@@ -175,6 +177,47 @@ export function registerIssuanceCommands(dispatch: CommandDispatch): void {
     if (buyerAddress) buyer.address = buyerAddress;
     if (buyerVat) buyer.vatOrCvr = buyerVat;
 
+    // #DLK-branding: --brand <key> picks a presentation identity from
+    // config/brands.json (name + contact line + header word-mark + morarente
+    // note). Explicit --seller-* flags still win over the brand's defaults.
+    // The invoice NUMBER is untouched — every brand shares one series.
+    const rootForBrand = ctx.companyRoot();
+    const brandArg = ctx.trimToNull(ctx.arg("--brand") ?? null);
+    let brandSeller: { name?: string; address?: string; vatOrCvr?: string; email?: string; phone?: string; web?: string } = {};
+    let brandLogoText: string | undefined;
+    let brandLogoImage: string | undefined;
+    let brandLatePaymentNote: string | undefined;
+    if (brandArg) {
+      const loaded = loadBrand(rootForBrand, brandArg);
+      if (!loaded.ok) {
+        ctx.emitResult({ ok: false, appliedRules: [], errors: [loaded.error] });
+        process.exit(1);
+      }
+      const b = loaded.resolved.brand;
+      brandSeller = {
+        name: b.name,
+        address: b.address,
+        vatOrCvr: b.vatOrCvr,
+        email: b.email,
+        phone: b.phone,
+        web: b.web,
+      };
+      brandLogoText = b.logoText ?? b.name;
+      // Read the logo ONCE, here, and carry the bytes into the snapshot. A
+      // path in the snapshot would make a re-render depend on a file that can
+      // be replaced or deleted years later. An unreadable logo is not fatal:
+      // the header falls back to the text word-mark and the invoice is issued.
+      if (b.logoPath) {
+        try {
+          brandLogoImage = readFileSync(b.logoPath).toString("base64");
+        } catch (error) {
+          console.error(`ADVARSEL: kunne ikke læse brandets logo (${b.logoPath}): ${(error as Error).message}`);
+          console.error("         Fakturaen udstedes med tekst-ordmærket i stedet.");
+        }
+      }
+      brandLatePaymentNote = loaded.resolved.latePaymentNote;
+    }
+
     const payload: InvoicePayload = {
       invoiceType: "full",
       vatTreatment: "standard",
@@ -183,10 +226,16 @@ export function registerIssuanceCommands(dispatch: CommandDispatch): void {
         ? { invoiceNumber: ctx.trimToNull(ctx.arg("--invoice-number") ?? null)! }
         : {}),
       seller: {
-        name: ctx.trimToNull(ctx.arg("--seller-name") ?? null) ?? undefined,
-        address: ctx.trimToNull(ctx.arg("--seller-address") ?? null) ?? undefined,
-        vatOrCvr: ctx.trimToNull(ctx.arg("--seller-vat") ?? null) ?? undefined,
+        name: ctx.trimToNull(ctx.arg("--seller-name") ?? null) ?? brandSeller.name ?? undefined,
+        address: ctx.trimToNull(ctx.arg("--seller-address") ?? null) ?? brandSeller.address ?? undefined,
+        vatOrCvr: ctx.trimToNull(ctx.arg("--seller-vat") ?? null) ?? brandSeller.vatOrCvr ?? undefined,
+        email: brandSeller.email,
+        phone: brandSeller.phone,
+        web: brandSeller.web,
       },
+      ...(brandLogoText ? { logoText: brandLogoText } : {}),
+      ...(brandLogoImage ? { logoImage: brandLogoImage } : {}),
+      ...(brandLatePaymentNote ? { latePaymentNote: brandLatePaymentNote } : {}),
       buyer,
       lines: computed.lines,
       totals: {

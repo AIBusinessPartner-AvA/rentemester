@@ -41,7 +41,7 @@ export const invoiceSpecs: CommandSpec[] = [
   {
     key: "invoice create",
     usage:
-      "invoice create --company <path> --issue-date <YYYY-MM-DD> --line \"beskrivelse|antal|stykpris\" [--line ... adskilt med ;] [--vat-rate <pct>] [--customer-id <n>] [--buyer-name <text>] [--buyer-address <text>] [--buyer-vat <DK...>] [--seller-name <text>] [--seller-address <text>] [--seller-vat <DK...>] [--currency <ISO>] [--due-date <YYYY-MM-DD>] [--invoice-number <no>]",
+      "invoice create --company <path> --issue-date <YYYY-MM-DD> --line \"beskrivelse|antal|stykpris\" [--line ... adskilt med ;] [--vat-rate <pct>] [--customer-id <n>] [--buyer-name <text>] [--buyer-address <text>] [--buyer-vat <DK...>] [--brand <key>] [--seller-name <text>] [--seller-address <text>] [--seller-vat <DK...>] [--currency <ISO>] [--due-date <YYYY-MM-DD>] [--invoice-number <no>]",
     description:
       "Udsteder en kundefaktura uden at du selv skriver JSON eller regner moms. Du angiver kun det nødvendige — kunde og pr. linje beskrivelse, antal og stykpris ekskl. moms — og Rentemester beregner linjetotaler, nettobeløb, momsbeløb og bruttobeløb, validerer og udsteder.",
     allowedFlags: [
@@ -53,6 +53,7 @@ export const invoiceSpecs: CommandSpec[] = [
       "--buyer-name",
       "--buyer-address",
       "--buyer-vat",
+      "--brand",
       "--seller-name",
       "--seller-address",
       "--seller-vat",
@@ -65,6 +66,7 @@ export const invoiceSpecs: CommandSpec[] = [
       "Stykpris er EKSKL. moms i KRONER (decimal). Du regner aldrig selv linjetotal, moms eller brutto.",
       "--vat-rate er momssatsen i PROCENT (fx 25 for 25%; standard 25 hvis udeladt). Bemærk: dette CLI-flag er en procent — payload-feltet totals.vatRate i 'invoice issue' er derimod en brøk (0.25).",
       "Køber: brug enten --customer-id (henter navn/adresse fra kundekartoteket) eller --buyer-name/--buyer-address direkte",
+      "--brand <key> vælger en brand-identitet fra config/brands.json (navn + kontaktlinje i footer + header-mærke + morarente-note). Eksplicitte --seller-* flag vinder over brandets standardværdier. Fakturanummeret påvirkes IKKE — alle brands deler samme fortløbende nummerserie.",
       "Sælger: --seller-name/--seller-address/--seller-vat — påkrævet hvis ikke allerede sat i payloaden",
       "Udelad --invoice-number for automatisk fortløbende nummerering",
     ],

@@ -40,6 +40,12 @@ import {
   nextSendSlot,
   parseSchedule,
 } from "../src/core/send-window";
+import {
+  SMTP2GO_SEND_ENDPOINT,
+  buildSmtp2goPayload,
+  formatDeliveryLogLine,
+  sendViaSmtp2go,
+} from "../src/core/smtp2go";
 
 type Args = Record<string, string | boolean>;
 
@@ -249,21 +255,22 @@ const textBody = [
 if (htmlOut) { writeFileSync(htmlOut, htmlBody); console.log(`HTML-body skrevet til ${htmlOut}`); }
 
 const pdfBase64 = readFileSync(pdfPath).toString("base64");
-const payload = {
-  api_key: apiKey,
+const payload = buildSmtp2goPayload({
+  apiKey,
   sender,
-  to: [to],
+  to,
   subject,
-  html_body: htmlBody,
-  text_body: textBody,
-  attachments: [{ filename: `${invoiceNumber}.pdf`, fileblob: pdfBase64, mimetype: "application/pdf" }],
-  ...(schedule ? { schedule } : {}),
-};
+  htmlBody,
+  textBody,
+  attachmentFilename: `${invoiceNumber}.pdf`,
+  attachmentBase64: pdfBase64,
+  schedule,
+});
 
 // --- dry-run (default) -------------------------------------------------------
 console.log(JSON.stringify({
   mode: live ? "LIVE" : "DRY-RUN",
-  endpoint: "https://api.smtp2go.com/v3/email/send",
+  endpoint: SMTP2GO_SEND_ENDPOINT,
   from: sender, to, subject,
   levering: schedule ? `PLANLAGT ${schedule} (= ${formatLocal(deliveryAt)} lokal tid)` : "straks",
   afsendelsesvindue: windowOk
@@ -278,31 +285,26 @@ console.log(JSON.stringify({
 if (!live) { console.log("\nDRY-RUN: intet sendt. Kør igen med --live for at sende via SMTP2GO."); process.exit(0); }
 
 // --- live send ---------------------------------------------------------------
-const res = await fetch("https://api.smtp2go.com/v3/email/send", {
-  method: "POST",
-  headers: { "Content-Type": "application/json", Accept: "application/json" },
-  body: JSON.stringify(payload),
-}).catch((e) => fail(`netværksfejl mod SMTP2GO: ${(e as Error).message}`));
-const bodyText = await res.text();
-let parsed: unknown; try { parsed = JSON.parse(bodyText); } catch { parsed = bodyText; }
-const data = (parsed as { data?: { succeeded?: number; failed?: number; email_id?: string; schedule_id?: string } })?.data;
-// En planlagt mail er KØSAT, ikke leveret: SMTP2GO svarer med et schedule_id i
-// stedet for succeeded/failed. Kvitteringen skal derfor læses forskelligt.
-const ok = schedule
-  ? res.ok && Boolean(data?.schedule_id)
-  : res.ok && (data?.succeeded ?? 0) >= 1 && (data?.failed ?? 0) === 0;
-const status = ok ? (schedule ? "SCHEDULED" : "OK") : "FAIL";
-const logLine = `${new Date().toISOString()}\t${status}\t${invoiceNumber}\t${kind}\t${to}\tfrom=${fromEmail}\temail_id=${data?.email_id ?? "-"}\tschedule=${schedule ?? "-"}\tschedule_id=${data?.schedule_id ?? "-"}\thttp=${res.status}\n`;
+// Kaldet og fortolkningen af svaret bor i src/core/smtp2go.ts, så reglen om
+// hvornår SMTP2GO reelt har taget ansvar for mailen kan testes mod en fake i
+// stedet for kun at kunne afprøves ved at sende til en rigtig kunde.
+const outcome = await sendViaSmtp2go(payload);
+if (outcome.networkError) fail(`netværksfejl mod SMTP2GO: ${outcome.networkError}`);
+
+const logLine = formatDeliveryLogLine({
+  at: new Date(), outcome, invoiceNumber, kind, to, fromEmail, schedule,
+});
 try { appendFileSync(join(companyRoot, "invoices", "smtp2go-delivery.log"), logLine); } catch { /* non-fatal */ }
-if (ok && schedule) {
-  console.log(`\n🕒 KØSAT — HTTP ${res.status}, schedule_id=${data?.schedule_id ?? "-"}`);
+
+if (outcome.ok && schedule) {
+  console.log(`\n🕒 KØSAT — HTTP ${outcome.httpStatus}, schedule_id=${outcome.scheduleId ?? "-"}`);
   console.log(`   Leveres ${new Date(schedule).toLocaleString("da-DK")} (lokal tid). Endnu IKKE i kundens indbakke.`);
   console.log(`   Fortryd: DELETE https://api.smtp2go.com/v3/email/scheduled med schedule_id ovenfor.`);
 } else {
-  console.log(`\n${ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${res.status}, succeeded=${data?.succeeded ?? "?"}, failed=${data?.failed ?? "?"}`);
+  console.log(`\n${outcome.ok ? "✅ SENDT" : "❌ IKKE SENDT"} — HTTP ${outcome.httpStatus}, succeeded=${outcome.succeeded ?? "?"}, failed=${outcome.failed ?? "?"}`);
 }
-if (!ok) { console.error("SMTP2GO-svar:", typeof parsed === "string" ? parsed.slice(0, 800) : JSON.stringify(parsed, null, 2).slice(0, 800)); process.exit(1); }
-console.log(`Logget i invoices/smtp2go-delivery.log (status=${status}).`);
+if (!outcome.ok) { console.error("SMTP2GO-svar:", outcome.raw.slice(0, 800)); process.exit(1); }
+console.log(`Logget i invoices/smtp2go-delivery.log (status=${outcome.status}).`);
 
 // (b) ONLY after SMTP2GO has taken responsibility for the mail — delivered
 // (HTTP 200 + succeeded), or queued with a schedule_id — do we record the send

@@ -13,8 +13,8 @@ To adskilte ting, som bare ofte bruges sammen:
 
 > **Status:** bygget og i daglig brug hos ét rigtigt selskab siden august 2026 —
 > fakturaer er sendt live til rigtige kunder. De rene, deterministiske dele er
-> dækket af tests (68 i alt: PNG-dekoderen, brand-indlæsningen og
-> afsendelsesvinduet). Selve netkaldet til SMTP2GO og PDF-renderingen er det
+> dækket af tests (100 i alt: PNG-dekoderen, brand-indlæsningen,
+> afsendelsesvinduet og SMTP2GO-kaldet). Mailkompositionen og PDF-renderingen er
 > ikke. Se [Hvad der mangler](#hvad-der-mangler) før du bygger videre eller
 > åbner en PR mod `main`.
 
@@ -196,13 +196,23 @@ senere; grænsen er 3 døgn frem.
 ### Rækkefølgen der gør loggen sand
 
 Rentemesters eget `email_send_log` opdateres **først efter** SMTP2GO har
-bekræftet modtagelse (HTTP 200 + `succeeded`). Det kræver `"dryRun": true` i
-`config/smtp.json`, så kernens indbyggede transport logger i stedet for at
-fejle. Pointen: loggen siger "sendt", når der faktisk er sendt — ikke når vi
-havde tænkt os at sende.
+bekræftet modtagelse. Det kræver `"dryRun": true` i `config/smtp.json`, så
+kernens indbyggede transport logger i stedet for at fejle. Pointen: loggen siger
+"sendt", når der faktisk er sendt — ikke når vi havde tænkt os at sende.
+
+**De to kvitteringer ser forskellige ud, og det er den fælde der bærer
+`src/core/smtp2go.ts`.** En straks-afsendelse kvitteres med `succeeded` og
+`failed`; en planlagt med et `schedule_id` og ingen tællere. Læses den ene med
+den andens regel, melder scriptet fejl på en mail der er fint køsat — eller
+succes på en der aldrig blev det. Det første ville invitere til en dublet, det
+andet ville brænde idempotens-nøglen på en mail kunden aldrig får. Derfor er
+fortolkningen en ren funktion, testet mod en fake fetch, i stedet for en `if` der
+kun kan afprøves ved at sende til en rigtig kunde.
 
 Sporing tre steder: scriptets egen `invoices/smtp2go-delivery.log`, SMTP2GOs
-dashboard via `email_id`, og Rentemesters `email_send_log`.
+dashboard via `email_id`, og Rentemesters `email_send_log`. Leveringsloggen er
+et revisionsspor og indeholder **aldrig** API-nøglen — den hører kun hjemme i
+selve requesten.
 
 ---
 
@@ -266,18 +276,22 @@ confirm-kontrakt. Den er et værktøj ved siden af, ikke en del af ledgeren.
 
 Ærlig liste over hvad der stadig står tilbage:
 
-- **Testdækningen er delvis.** Dækket er de rene, deterministiske enheder:
-  `src/core/png-image.ts` (23 tests — alle fem scanline-filtre,
+- **Testdækningen er delvis.** Dækket er de rene, deterministiske enheder,
+  100 tests i alt: `src/core/png-image.ts` (23 — alle fem scanline-filtre,
   alfa-komposition mod hvid, og hver enkelt afvisningsgrund),
-  `src/core/brands.ts` (17 tests — opslag, default, og at indlæsningen aldrig
-  kaster uanset hvad der står i filen) og `src/core/send-window.ts` (28 tests
-  — vinduets grænser, weekendspring og schedule-parsing). Alle tre suiter er
-  muteringstestet: knæk prædiktoren i Paeth-filteret, komponér alfa mod sort,
-  ryk vinduets lukketid en time, fjern weekendspringet, eller drop navnekravet
-  på et brand — hver enkelt mutation fanges.
-  **Ikke dækket:** HTTP-kaldet til SMTP2GO (kræver en fake),
-  mailkompositionen i `scripts/send-invoice-smtp2go.ts`, og PDF-renderingen i
-  `src/core/invoice-pdf.ts`.
+  `src/core/brands.ts` (17 — opslag, default, og at indlæsningen aldrig kaster
+  uanset hvad der står i filen), `src/core/send-window.ts` (28 — vinduets
+  grænser, weekendspring og schedule-parsing) og `src/core/smtp2go.ts` (32 —
+  payload-formen, begge kvitteringsregler og selve kaldet mod en fake fetch).
+  Alle fire suiter er muteringstestet: knæk prædiktoren i Paeth-filteret,
+  komponér alfa mod sort, ryk vinduets lukketid en time, fjern weekendspringet,
+  drop navnekravet på et brand, bedøm en planlagt afsendelse på `succeeded`, se
+  bort fra HTTP-statussen, eller skriv det rå svar i leveringsloggen — hver
+  enkelt mutation fanges af mindst én test.
+  **Ikke dækket:** mailkompositionen i `scripts/send-invoice-smtp2go.ts`
+  (skabelonudfyldning, brand-opslag, signatur) og PDF-renderingen i
+  `src/core/invoice-pdf.ts`. Begge kræver en større udtrækning end de fire
+  moduler ovenfor.
 - **Logo som `cid:`-vedhæftning.** Signaturens logo hentes fra en ekstern URL og
   blokeres af mailklienter der ikke henter billeder.
 - **Ingen helligdagskalender** i afsendelsesvinduet.
